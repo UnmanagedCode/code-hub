@@ -1,0 +1,82 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from '../server.js';
+import * as appManager from '../src/appManager.js';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
+
+async function boot(root) {
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  await appManager.init();
+  const server = createServer();
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  return { server, base };
+}
+
+const j = async (base, method, path, body) => {
+  const r = await fetch(base + path, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: r.status, body: await r.json() };
+};
+
+test('full lifecycle over HTTP: discover → start → share → out-of-date → stop', async (t) => {
+  const root = await mkRoot();
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  // discover
+  let res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.cloudflaredAvailable, true);
+  const app0 = res.body.apps.find((a) => a.id === 'app');
+  assert.equal(app0.status, 'stopped');
+
+  // start
+  res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 200);
+  assert.ok(res.body.port);
+
+  await waitFor(async () => {
+    const { body } = await j(base, 'GET', '/api/apps');
+    return ['ready', 'running'].includes(body.apps.find((a) => a.id === 'app').status);
+  });
+  res = await j(base, 'GET', '/api/apps');
+  const running = res.body.apps.find((a) => a.id === 'app');
+  assert.ok(running.urls.some((u) => u.startsWith('http://localhost:')));
+  assert.equal(running.outOfDate, false);
+
+  // share
+  res = await j(base, 'POST', '/api/apps/app/share');
+  assert.equal(res.status, 200);
+  assert.match(res.body.url, /trycloudflare\.com$/);
+  assert.match(res.body.qrSvg, /<svg/);
+
+  // out-of-date after a new commit in the source dir
+  gitCommit(dir);
+  await waitFor(async () => {
+    const { body } = await j(base, 'GET', '/api/apps');
+    return body.apps.find((a) => a.id === 'app').outOfDate === true;
+  });
+
+  // stop (also tears down the tunnel)
+  res = await j(base, 'POST', '/api/apps/app/stop');
+  assert.equal(res.status, 200);
+  await waitFor(async () => {
+    const { body } = await j(base, 'GET', '/api/apps');
+    return body.apps.find((a) => a.id === 'app').status === 'stopped';
+  });
+});
+
+test('unknown app id → 404, and share on a stopped app → 409', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() });
+  const { server, base } = await boot(root);
+  t.after(async () => { server.close(); await rmRoot(root); });
+
+  assert.equal((await j(base, 'POST', '/api/apps/nope/start')).status, 404);
+  assert.equal((await j(base, 'POST', '/api/apps/app/share')).status, 409);
+});

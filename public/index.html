@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content" />
+  <meta name="theme-color" content="#0f1117" />
+  <title>code-hub</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <h1>code-hub</h1>
+    <div class="topbar-right">
+      <span id="cf-status" class="pill" title="cloudflared availability"></span>
+      <button id="refresh" title="Refresh">↻</button>
+    </div>
+  </header>
+  <main id="app">
+    <div id="empty" class="empty">Loading apps…</div>
+    <div id="projects"></div>
+  </main>
+
+  <dialog id="qr-dialog">
+    <div class="qr-large" id="qr-large"></div>
+    <a id="qr-open" class="btn-link" target="_blank" rel="noopener">▶ Open</a>
+    <form method="dialog"><menu><button value="close">Close</button></menu></form>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

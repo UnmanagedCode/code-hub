@@ -1,0 +1,14 @@
+{
+  "name": "code-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "NODE_OPTIONS=--max-old-space-size=512 node tests/run.mjs"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "qrcode": "^1.5.4"
+  }
+}
