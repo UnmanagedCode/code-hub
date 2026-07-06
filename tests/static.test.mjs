@@ -14,5 +14,11 @@ test('serves the static frontend', async (t) => {
     const r = await fetch(base + path);
     assert.equal(r.status, 200, `${path} status`);
     assert.match(r.headers.get('content-type') || '', new RegExp(type), `${path} content-type`);
+    assert.match(r.headers.get('cache-control') || '', /no-store/, `${path} cache-control`);
   }
+
+  // index.html carries cache-busting version queries on its local asset refs.
+  const html = await (await fetch(base + '/')).text();
+  assert.match(html, /href="\/styles\.css\?v=\d+"/, 'styles.css cache-bust');
+  assert.match(html, /src="\/app\.js\?v=\d+"/, 'app.js cache-bust');
 });

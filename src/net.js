@@ -16,10 +16,12 @@ export function allocatePort() {
   });
 }
 
-// Every URL that serves an app bound to `port`: loopback names plus each
-// non-internal IPv4 the machine exposes (LAN access from a phone).
+// Every URL that serves an app bound to `port`: the `localhost` loopback name
+// plus each non-internal IPv4 the machine exposes (LAN access from a phone).
+// Only one loopback URL is emitted (localhost) — the 127.0.0.1 form is an
+// equivalent duplicate.
 export function enumerateUrls(port) {
-  const urls = [`http://localhost:${port}`, `http://127.0.0.1:${port}`];
+  const urls = [`http://localhost:${port}`];
   const ifaces = os.networkInterfaces();
   for (const list of Object.values(ifaces)) {
     for (const ni of list ?? []) {

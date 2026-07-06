@@ -14,10 +14,10 @@ test('allocatePort returns a bindable, currently-unused port', async () => {
   });
 });
 
-test('enumerateUrls includes loopback names in the right format', () => {
+test('enumerateUrls emits a single localhost loopback (no 127.0.0.1 dup)', () => {
   const urls = enumerateUrls(1234);
   assert.ok(urls.includes('http://localhost:1234'));
-  assert.ok(urls.includes('http://127.0.0.1:1234'));
+  assert.ok(!urls.includes('http://127.0.0.1:1234'));
   assert.ok(urls.every((u) => /^http:\/\/[^/]+:1234$/.test(u)));
 });
 
