@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { allocatePort, enumerateUrls, waitForPort } from '../src/net.js';
+import { allocatePort, enumerateUrls, routeUrls, waitForPort } from '../src/net.js';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
   const port = await allocatePort();
@@ -19,6 +19,17 @@ test('enumerateUrls includes loopback names in the right format', () => {
   assert.ok(urls.includes('http://localhost:1234'));
   assert.ok(urls.includes('http://127.0.0.1:1234'));
   assert.ok(urls.every((u) => /^http:\/\/[^/]+:1234$/.test(u)));
+});
+
+test('routeUrls for "/" equals the clean base URLs', () => {
+  assert.deepEqual(routeUrls(1234, '/'), enumerateUrls(1234));
+});
+
+test('routeUrls appends a non-root path to every base', () => {
+  const urls = routeUrls(1234, '/terrain-editor.html');
+  assert.ok(urls.includes('http://localhost:1234/terrain-editor.html'));
+  assert.ok(urls.every((u) => u.endsWith('/terrain-editor.html')));
+  assert.equal(urls.length, enumerateUrls(1234).length);
 });
 
 test('waitForPort resolves once something is listening, rejects otherwise', async () => {

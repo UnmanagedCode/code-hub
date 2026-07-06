@@ -5,7 +5,8 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 ## What it does
 
 - **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees).
-- **Starts** an app: runs its `start` command as a child process with a free `PORT` injected, and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone.
+- **Starts** an app: runs its `start` command as a child process with a free `PORT` injected, and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone. Apps can declare multiple named `routes` (e.g. a main page + an editor), each opened separately.
+- **Sorts by recency**: a flat card list sorted by **Last edited** (each app's last git commit date, shown as an "edited X ago" label), Name, or Status.
 - **Owns the lifecycle**: code-hub tracks the child's pid/process-group, so **Stop / Restart** work by killing that group — even if the project's source or worktree has since been deleted.
 - **Out-of-date detection**: records the project's git HEAD at launch; flags a running app when HEAD has since moved and offers a one-tap **Restart**.
 - **Worktree versions**: serves a project's `code-conductor` worktrees (`<project>_worktree_<hash>`) as distinct entries, nested under the parent.
@@ -29,7 +30,11 @@ Place a `.hub.json` at a project's root to make it servable:
   "start": "npm start",     // REQUIRED — a single blocking foreground command
   "name": "My App",         // optional display name (default: directory name)
   "healthPath": "/",        // optional HTTP path polled for readiness
-  "readyWhen": "listening"  // optional regex matched against stdout/stderr
+  "readyWhen": "listening", // optional regex matched against stdout/stderr
+  "routes": [               // optional named URLs the app serves (default: one implicit "/")
+    { "name": "Main",   "path": "/" },
+    { "name": "Editor", "path": "/editor.html" }
+  ]
 }
 ```
 

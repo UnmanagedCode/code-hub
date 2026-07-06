@@ -8,8 +8,9 @@
 | `name` | string | no | Display name (default: directory basename). |
 | `healthPath` | string | no | HTTP path polled for readiness; any HTTP response = ready. |
 | `readyWhen` | string | no | Regex matched against the child's stdout/stderr to detect readiness. |
+| `routes` | array | no | Named URLs the app serves. Non-empty array of `{ name, path }`; `name` a non-empty string, `path` a string starting with `/`. When absent, a single implicit route at `/` is used. |
 
-Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe on `$PORT`. 30s timeout; on timeout the app stays running, flagged readiness-unconfirmed. Validation rejects missing/empty `start`, non-string optionals, and malformed JSON — loudly, naming the offending file. A broken manifest surfaces as a non-startable app (with `error`), not a hidden one.
+Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe on `$PORT`. 30s timeout; on timeout the app stays running, flagged readiness-unconfirmed. Validation rejects missing/empty `start`, non-string optionals, a `routes` value that isn't a non-empty array, and any route entry missing `name` or with a `path` not starting with `/` — loudly, naming the offending file (e.g. `routes[1].path is required and must start with "/"`). A broken manifest surfaces as a non-startable app (with `error`), not a hidden one.
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
 
@@ -41,12 +42,19 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
   "urls": ["http://localhost:41051", "..."],
   "startedSha": "48c5d4d…",    // git HEAD captured at start
   "currentSha": "6d89eda…",    // current git HEAD of the source dir
+  "lastCommitAt": "2026-07-05T18:38:00+01:00", // ISO-8601 date of the source dir's last commit; null if non-git / no commits
   "outOfDate": true,           // startedSha !== currentSha
   "sourceMissing": false,      // running but source dir deleted
+  "routes": [                  // manifest routes, else one implicit `/`; urls filled only when running
+    { "name": "Main game", "path": "/", "urls": ["http://localhost:41051", "..."] },
+    { "name": "Terrain editor", "path": "/terrain-editor.html", "urls": ["http://localhost:41051/terrain-editor.html", "..."] }
+  ],
   "tunnel": { "url": "https://x.trycloudflare.com" },  // or null
   "error": null                // crash tail / manifest error, when present
 }
 ```
+
+`urls` (top level) stays the list of base URLs (loopback + LAN IPs, no path). Each `routes[].urls` is those bases with the route `path` appended (`/` keeps the clean base form); populated only while the app is running.
 
 ### Errors
 

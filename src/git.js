@@ -22,3 +22,9 @@ export async function currentBranch(dir) {
   const b = await run(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
   return b && b !== 'HEAD' ? b : null;
 }
+
+// ISO-8601 committer date of HEAD, or null (not a repo / no commits / git
+// unavailable / dir gone).
+export async function lastCommitAt(dir) {
+  return run(dir, ['log', '-1', '--format=%cI']);
+}

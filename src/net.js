@@ -29,6 +29,13 @@ export function enumerateUrls(port) {
   return urls;
 }
 
+// Every URL serving `routePath` on an app bound to `port`: one per base
+// (loopback + LAN IPs). Root path keeps the clean `http://host:port` form;
+// a non-root path (which always starts with `/`) is appended to each base.
+export function routeUrls(port, routePath) {
+  return enumerateUrls(port).map((b) => (routePath === '/' ? b : b + routePath));
+}
+
 // Resolve once a TCP connection to localhost:port succeeds, or reject after
 // `timeoutMs`. Polls every `intervalMs`.
 export function waitForPort(port, { timeoutMs = 30000, intervalMs = 200 } = {}) {

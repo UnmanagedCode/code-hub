@@ -80,3 +80,35 @@ test('unknown app id → 404, and share on a stopped app → 409', async (t) => 
   assert.equal((await j(base, 'POST', '/api/apps/nope/start')).status, 404);
   assert.equal((await j(base, 'POST', '/api/apps/app/share')).status, 409);
 });
+
+test('App shape carries per-route URLs and lastCommitAt', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'multi', {
+    start: fakeAppCmd(),
+    routes: [{ name: 'Main', path: '/' }, { name: 'Editor', path: '/edit.html' }],
+  }, { git: true });
+  await mkProject(root, 'plain', { start: fakeAppCmd() }, { git: true }); // no routes → implicit single '/'
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('multi').catch(() => {}); server.close(); await rmRoot(root); });
+
+  // A git-tracked app reports its last commit date, even while stopped.
+  let { body } = await j(base, 'GET', '/api/apps');
+  assert.match(body.apps.find((a) => a.id === 'multi').lastCommitAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  // A manifest without routes exposes a single implicit '/' route.
+  const plain = body.apps.find((a) => a.id === 'plain');
+  assert.equal(plain.routes.length, 1);
+  assert.equal(plain.routes[0].path, '/');
+
+  // Start the multi-route app and check per-route URL enumeration.
+  await j(base, 'POST', '/api/apps/multi/start');
+  await waitFor(async () => {
+    const r = await j(base, 'GET', '/api/apps');
+    return ['ready', 'running'].includes(r.body.apps.find((a) => a.id === 'multi').status);
+  });
+  ({ body } = await j(base, 'GET', '/api/apps'));
+  const multi = body.apps.find((a) => a.id === 'multi');
+  assert.deepEqual(multi.routes.map((r) => r.name), ['Main', 'Editor']);
+  assert.ok(multi.routes[0].urls.includes(`http://localhost:${multi.port}`));
+  assert.ok(multi.routes[1].urls.includes(`http://localhost:${multi.port}/edit.html`));
+});

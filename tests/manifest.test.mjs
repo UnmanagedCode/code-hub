@@ -8,6 +8,26 @@ test('accepts a minimal manifest with defaults', () => {
   assert.equal(m.name, null);
   assert.equal(m.healthPath, null);
   assert.equal(m.readyWhen, null);
+  assert.equal(m.routes, null);
+});
+
+test('accepts and normalizes a routes array', () => {
+  const m = parseManifest('{"start":"x","routes":[{"name":"Main","path":"/"},{"name":"Editor","path":"/edit.html","extra":1}]}');
+  assert.deepEqual(m.routes, [
+    { name: 'Main', path: '/' },
+    { name: 'Editor', path: '/edit.html' }, // unknown per-route keys dropped
+  ]);
+});
+
+test('rejects a bad routes field, naming the file', () => {
+  const F = 'proj/.hub.json';
+  assert.throws(() => parseManifest('{"start":"x","routes":[]}', F), /proj\/\.hub\.json: "routes" must be a non-empty array/);
+  assert.throws(() => parseManifest('{"start":"x","routes":"/"}', F), /"routes" must be a non-empty array/);
+  assert.throws(() => parseManifest('{"start":"x","routes":["/"]}', F), /routes\[0\] must be an object/);
+  assert.throws(() => parseManifest('{"start":"x","routes":[{"path":"/"}]}', F), /routes\[0\]\.name is required/);
+  assert.throws(() => parseManifest('{"start":"x","routes":[{"name":"","path":"/"}]}', F), /routes\[0\]\.name is required/);
+  assert.throws(() => parseManifest('{"start":"x","routes":[{"name":"A"}]}', F), /routes\[0\]\.path is required and must start with "\/"/);
+  assert.throws(() => parseManifest('{"start":"x","routes":[{"name":"A","path":"edit.html"}]}', F), /routes\[0\]\.path is required and must start with "\/"/);
 });
 
 test('keeps optional string fields', () => {

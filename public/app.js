@@ -1,5 +1,5 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
-// renders a mobile-first list of servable apps grouped by project.
+// renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -17,7 +17,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {} }; // share: id → {url,qrSvg} | 'loading' | {error}
+const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited' }; // share: id → {url,qrSvg} | 'loading' | {error}
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -33,6 +33,7 @@ async function refresh() {
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
     render();
+    document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
     document.getElementById('empty').textContent = `Failed to load: ${e.message}`;
   }
@@ -47,10 +48,63 @@ async function action(id, run) {
 }
 
 function shortSha(sha) { return sha ? sha.slice(0, 7) : ''; }
+function statusWord(s) { return s === 'ready' ? 'running' : s; }
 
-function urlsBlock(app) {
-  return el('div', { class: 'urls' },
-    ...app.urls.map((u) => el('a', { class: 'btn-link', href: u, target: '_blank', rel: 'noopener' }, `▶ ${u}`)));
+// Deterministic neon hue per app id → stable, distinct left accent bar.
+function hueFor(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+
+// "34m ago" style relative label; '' for null/unparseable.
+function relativeTime(iso) {
+  if (!iso) return '';
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const s = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24); if (d < 30) return `${d}d ago`;
+  const mo = Math.round(d / 30); if (mo < 12) return `${mo}mo ago`;
+  return `${Math.round(mo / 12)}y ago`;
+}
+
+function statusRank(s) {
+  if (s === 'running' || s === 'ready') return 0;
+  if (s === 'starting') return 1;
+  if (s === 'crashed') return 2;
+  return 3; // stopped
+}
+
+function sortApps(apps) {
+  const byName = (a, b) => (a.name || a.id).localeCompare(b.name || b.id);
+  const list = [...apps];
+  if (state.sort === 'name') list.sort(byName);
+  else if (state.sort === 'status') list.sort((a, b) => statusRank(a.status) - statusRank(b.status) || byName(a, b));
+  else list.sort((a, b) => { // 'edited': lastCommitAt desc, nulls last
+    const ta = a.lastCommitAt ? Date.parse(a.lastCommitAt) : -Infinity;
+    const tb = b.lastCommitAt ? Date.parse(b.lastCommitAt) : -Infinity;
+    return tb - ta || byName(a, b);
+  });
+  return list;
+}
+
+function routesBlock(app) {
+  if (!['ready', 'running'].includes(app.status) || !app.routes?.length) return null;
+  const wrap = el('div', { class: 'routes' });
+  const single = app.routes.length === 1;
+  for (const r of app.routes) {
+    const [primary, ...rest] = r.urls;
+    const row = el('div', { class: 'route' });
+    if (!single) row.appendChild(el('span', { class: 'route-name', title: r.path }, r.name));
+    if (primary) row.appendChild(el('a', { class: 'open', href: primary, target: '_blank', rel: 'noopener' }, 'Open ▶'));
+    if (rest.length) row.appendChild(el('div', { class: 'lan-links' },
+      ...rest.map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
+    wrap.appendChild(row);
+  }
+  return wrap;
 }
 
 function sharePanel(app) {
@@ -91,19 +145,18 @@ function controls(app) {
   const row = el('div', { class: 'controls' });
 
   if (!running) {
-    row.appendChild(el('button', { class: 'primary', disabled: isBusy || !!app.error && !app.sourceMissing || app.sourceMissing,
+    row.appendChild(el('button', { class: 'start', disabled: isBusy || (!!app.error && !app.sourceMissing) || app.sourceMissing,
       onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
   } else {
     row.appendChild(el('button', { class: 'danger', disabled: isBusy,
       onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
-    row.appendChild(el('button', { disabled: isBusy || app.sourceMissing,
+    row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
       onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
-    const shareBtn = el('button', {
+    row.appendChild(el('button', {
       disabled: isBusy || !state.cloudflaredAvailable || !!app.tunnel,
       title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
       onclick: () => shareApp(app),
-    }, app.tunnel ? 'Shared' : 'Share');
-    row.appendChild(shareBtn);
+    }, app.tunnel ? 'Shared' : 'Share'));
   }
   return row;
 }
@@ -121,23 +174,31 @@ async function shareApp(app) {
 }
 
 function card(app) {
-  const c = el('div', { class: `card${app.isWorktree ? ' wt' : ''}` });
+  const c = el('div', { class: 'card' });
+  c.style.setProperty('--accent-bar', `hsl(${hueFor(app.id)} 80% 62%)`);
+
   c.appendChild(el('div', { class: 'card-head' },
     el('span', { class: `dot ${app.status}`, title: app.status }),
     el('span', { class: 'card-title' }, app.name),
+    el('div', { class: 'status-side' },
+      el('span', { class: `status-word ${app.status}` }, statusWord(app.status)),
+      app.port ? el('span', { class: 'port' }, `:${app.port}`) : null,
+    ),
   ));
 
   const meta = el('div', { class: 'meta' });
   if (app.isWorktree && app.branch) meta.appendChild(el('span', { class: 'badge wt' }, app.branch));
+  if (app.id !== app.name) meta.appendChild(el('span', { class: 'desc' }, app.id));
   if (app.currentSha) meta.appendChild(el('span', {}, shortSha(app.currentSha)));
-  if (app.outOfDate) meta.appendChild(el('span', { class: 'badge stale' }, 'out of date'));
+  if (app.outOfDate) meta.appendChild(el('span', { class: 'badge stale' }, 'outdated'));
+  if (app.lastCommitAt) meta.appendChild(el('span', { class: 'edited', title: new Date(app.lastCommitAt).toLocaleString() }, `edited ${relativeTime(app.lastCommitAt)}`));
   if (app.sourceMissing) meta.appendChild(el('span', { class: 'badge gone' }, 'source removed'));
-  if (app.port) meta.appendChild(el('span', {}, `:${app.port}`));
   if (meta.childNodes.length) c.appendChild(meta);
 
   if (app.error) c.appendChild(el('div', { class: 'err' }, app.error));
-  if (app.urls && ['ready', 'running'].includes(app.status)) c.appendChild(urlsBlock(app));
   c.appendChild(controls(app));
+  const routes = routesBlock(app);
+  if (routes) c.appendChild(routes);
   const sp = sharePanel(app);
   if (sp) c.appendChild(sp);
   return c;
@@ -150,24 +211,14 @@ function render() {
   cf.textContent = state.cloudflaredAvailable ? 'cloudflared ✓' : 'no cloudflared';
   cf.className = `pill ${state.cloudflaredAvailable ? 'ok' : 'off'}`;
 
-  if (!state.apps.length) { emptyEl.textContent = 'No apps found. Add a .hub.json to a sibling project.'; root.innerHTML = ''; return; }
+  if (!state.apps.length) { emptyEl.textContent = 'No apps found. Add a .hub.json to a sibling project.'; emptyEl.style.display = ''; root.innerHTML = ''; return; }
   emptyEl.style.display = 'none';
 
-  // Group by project; main checkout first, then its worktrees.
-  const groups = new Map();
-  for (const a of state.apps) {
-    if (!groups.has(a.project)) groups.set(a.project, []);
-    groups.get(a.project).push(a);
-  }
   root.innerHTML = '';
-  for (const [project, apps] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
-    apps.sort((a, b) => (a.isWorktree ? 1 : 0) - (b.isWorktree ? 1 : 0) || a.id.localeCompare(b.id));
-    const det = el('details', { class: 'project', open: true }, el('summary', {}, project));
-    for (const a of apps) det.appendChild(card(a));
-    root.appendChild(det);
-  }
+  for (const a of sortApps(state.apps)) root.appendChild(card(a));
 }
 
 document.getElementById('refresh').addEventListener('click', refresh);
+document.getElementById('sort').addEventListener('change', (e) => { state.sort = e.target.value; render(); });
 refresh();
 setInterval(refresh, 2000); // reflect readiness / tunnel progress

@@ -2,9 +2,9 @@ import { discoverApps } from './projects.js';
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
-import { allocatePort, enumerateUrls } from './net.js';
+import { allocatePort, enumerateUrls, routeUrls } from './net.js';
 import { qrSvg } from './qr.js';
-import { headSha, currentBranch } from './git.js';
+import { headSha, currentBranch, lastCommitAt } from './git.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -52,6 +52,16 @@ export async function list() {
 
     const currentSha = sourceMissing ? null : await headSha(base.path);
     const branch = base.isWorktree ? (sourceMissing ? (rec?.branch ?? null) : await currentBranch(base.path)) : null;
+    const commitAt = sourceMissing ? null : await lastCommitAt(base.path);
+
+    // Named routes from the manifest, else a single implicit route at `/`
+    // (backward compatible). URLs are enumerated live from the running port.
+    const routeDefs = base.manifest?.routes ?? [{ name: base.manifest?.name ?? base.id, path: '/' }];
+    const routes = routeDefs.map((r) => ({
+      name: r.name, path: r.path,
+      urls: port ? routeUrls(port, r.path) : [],
+    }));
+
     return {
       id: base.id,
       project: base.project,
@@ -62,8 +72,10 @@ export async function list() {
       status,
       port, urls, startedSha,
       currentSha,
+      lastCommitAt: commitAt,
       outOfDate: !!(startedSha && currentSha && startedSha !== currentSha),
       sourceMissing,
+      routes,
       tunnel: tunnelInfo,
       error,
     };

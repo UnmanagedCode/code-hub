@@ -9,14 +9,14 @@ Node + Express backend, vanilla ES-module frontend, no build step. `"type": "mod
 | `server.js` | Bootstrap: build Express app, mount `/api` + `express.static('public')`, `listenWithRetry` (EADDRINUSE poll), run startup reconciliation once. Port `PORT` (7000), host `HOST` (127.0.0.1). |
 | `src/projects.js` | Discovery. `projectsRoot()` = `PROJECTS_ROOT` ?? parent-of-repo. Scans siblings for `.hub.json`; classifies `<project>_worktree_<hash>` dirs as worktrees. Reads + validates the manifest. |
 | `src/state.js` | Persists running-apps to `<projectsRoot>/.code-hub/state.json` (atomic tmp→rename). `reconcile()` probes each pid (`kill -0`): adopts live, drops dead, clears dead tunnels. Corrupt state file is moved aside. |
-| `src/net.js` | Free-port allocation, URL enumeration (loopback + non-internal IPv4), TCP readiness probe. |
-| `src/git.js` | `headSha` / `currentBranch` via `execFile` (manual promisify — Termux Node lacks `promisify.custom` on `execFile`). |
+| `src/net.js` | Free-port allocation, URL enumeration (`enumerateUrls` = loopback + non-internal IPv4 base URLs; `routeUrls` = those bases with a route path appended), TCP readiness probe. |
+| `src/git.js` | `headSha` / `currentBranch` / `lastCommitAt` (`git log -1 --format=%cI`) via `execFile` (manual promisify — Termux Node lacks `promisify.custom` on `execFile`). |
 | `src/runner.js` | Process lifecycle. Spawns `bash -lc <start>` **detached** (own group, pgid === pid) with `PORT`. Readiness orchestration, per-app 16KB output ring for crash tails, `stop` = SIGTERM→SIGKILL on the process group. |
 | `src/tunnel.js` | cloudflared detection (`--version`, bin from `CODEHUB_CLOUDFLARED_BIN`) + quick-tunnel spawn, capturing the `*.trycloudflare.com` URL (30s timeout). |
 | `src/qr.js` | `qrcode` → inline SVG string (async). |
 | `src/appManager.js` | **Single source of truth.** Composes discovery ∪ running-state; exposes `init/list/start/stop/restart/share/unshare`; keeps `state.js` in sync. |
 | `src/routes.js` | Thin Express router over `appManager`. |
-| `public/` | `index.html`, `styles.css`, `app.js` (`el()` helper + 2s poll), `manifest.webmanifest`, `icon.svg`. |
+| `public/` | `index.html`, `styles.css`, `app.js` (`el()` helper, 2s poll, flat client-side sort, per-app hue accent bar, relative "edited" labels), `manifest.webmanifest`, `icon.svg`. |
 
 ## Process & state lifecycle
 
@@ -26,6 +26,7 @@ Node + Express backend, vanilla ES-module frontend, no build step. `"type": "mod
 - **Startup reconciliation** (`appManager.init` → `state.reconcile`): live pids are **adopted** (shown `running`; we can't recapture their stdout, so no in-memory runtime — readiness is assumed), dead pids dropped, dead tunnels cleared. Detached children intentionally outlive a code-hub restart.
 - **Readiness / status**: for apps started this process, `runner.runtime(id)` supplies `starting`/`ready`/`crashed`; adopted apps have no runtime and read as `running`. `list()` lazily prunes records whose pid has since died.
 - **Out-of-date**: `outOfDate = startedSha && currentSha && startedSha !== currentSha`, computed live per `list()`.
+- **Routes & last-edited**: `list()` also computes, per app, `lastCommitAt` (source dir's last commit date) and `routes` — the manifest's `routes` (or a single implicit `/` when absent), each with `urls` enumerated live from the running port via `routeUrls`. The top-level `urls` stays the base-URL list persisted at start.
 
 ## Testing
 

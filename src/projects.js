@@ -60,11 +60,30 @@ export function parseManifest(raw, file = MANIFEST_FILENAME) {
       throw new Error(`${file}: "${key}" must be a string`);
     }
   }
+  let routes = null;
+  if (obj.routes != null) {
+    if (!Array.isArray(obj.routes) || obj.routes.length === 0) {
+      throw new Error(`${file}: "routes" must be a non-empty array`);
+    }
+    routes = obj.routes.map((rt, i) => {
+      if (!rt || typeof rt !== 'object' || Array.isArray(rt)) {
+        throw new Error(`${file}: routes[${i}] must be an object`);
+      }
+      if (typeof rt.name !== 'string' || rt.name.trim() === '') {
+        throw new Error(`${file}: routes[${i}].name is required and must be a non-empty string`);
+      }
+      if (typeof rt.path !== 'string' || !rt.path.startsWith('/')) {
+        throw new Error(`${file}: routes[${i}].path is required and must start with "/"`);
+      }
+      return { name: rt.name, path: rt.path };
+    });
+  }
   return {
     start: obj.start,
     name: obj.name ?? null,
     healthPath: obj.healthPath ?? null,
     readyWhen: obj.readyWhen ?? null,
+    routes,
   };
 }
 

@@ -11,15 +11,28 @@
 </head>
 <body>
   <header id="topbar">
-    <h1>code-hub</h1>
-    <div class="topbar-right">
-      <span id="cf-status" class="pill" title="cloudflared availability"></span>
+    <div class="title-block">
+      <h1>code-hub</h1>
+      <p class="subtitle">launcher for everything under <span class="path-chip">~/cc-projects/</span></p>
+    </div>
+    <span id="cf-status" class="pill" title="cloudflared availability"></span>
+  </header>
+
+  <main id="app">
+    <div class="toolbar">
+      <label class="sort">
+        <span>Sort</span>
+        <select id="sort">
+          <option value="edited">Last edited</option>
+          <option value="name">Name</option>
+          <option value="status">Status</option>
+        </select>
+      </label>
       <button id="refresh" title="Refresh">↻</button>
     </div>
-  </header>
-  <main id="app">
     <div id="empty" class="empty">Loading apps…</div>
     <div id="projects"></div>
+    <footer id="footer"><span id="updated"></span></footer>
   </main>
 
   <dialog id="qr-dialog">
