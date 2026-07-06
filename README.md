@@ -9,8 +9,8 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 - **Sorts by recency**: a flat card list sorted by **Last edited** (each app's last git commit date, shown as an "edited X ago" label), Name, or Status.
 - **Owns the lifecycle**: code-hub tracks the child's pid/process-group, so **Stop / Restart** work by killing that group — even if the project's source or worktree has since been deleted.
 - **Out-of-date detection**: records the project's git HEAD at launch; flags a running app when HEAD has since moved and offers a one-tap **Restart**.
-- **Worktree versions**: serves a project's `code-conductor` worktrees (`<project>_worktree_<hash>`) as distinct entries, nested under the parent.
-- **Share via cloudflared**: exposes a running app through a cloudflared quick tunnel and renders a **QR code** of the public `*.trycloudflare.com` URL. Degrades gracefully with a clear message when `cloudflared` isn't installed.
+- **Worktree versions**: serves a project's `code-conductor` worktrees (`<project>_worktree_<hash>`) — nested under the parent project's card behind an **expandable "N worktrees ▾" toggle** (collapsed by default), each independently launchable.
+- **Share via cloudflared, password-protected**: exposes a running app through a cloudflared quick tunnel **behind HTTP Basic Auth** — a local auth proxy (WebSocket-aware, so socket.io apps work) sits between cloudflared and the app, using username `hub` + a strong password freshly generated per share. Shows the URL, credentials, and a **QR code** encoding the credentialed URL for scan-to-auth. Degrades gracefully when `cloudflared` isn't installed.
 
 ## Quick start
 
@@ -55,7 +55,7 @@ Place a `.hub.json` at a project's root to make it servable:
 
 - **Single-user, local, no auth, no DB.** code-hub runs the `start` command of any discovered `.hub.json` — treat the workspace as trusted code you own. Don't expose the code-hub UI itself to untrusted networks.
 - code-hub only **reads** other projects and **runs their `start` command**; it never edits them.
-- Sharing publishes a running app to a public cloudflared URL — anyone with the link can reach it while the tunnel is up.
+- Sharing publishes a running app to a public cloudflared URL, but **gated by HTTP Basic Auth** (username `hub` + a per-share random password); the link alone is not enough. TLS is terminated by Cloudflare, so credentials are encrypted in transit. Credentials are in-memory only and a share does not survive a code-hub restart (re-share for a fresh URL).
 
 ## Testing
 

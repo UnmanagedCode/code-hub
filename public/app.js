@@ -17,7 +17,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited' }; // share: id → {url,qrSvg} | 'loading' | {error}
+const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited', expanded: new Set() }; // share: id → {url,...} | 'loading' | {error}; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -112,6 +112,14 @@ function routesBlock(app) {
   return wrap;
 }
 
+function credRow(label, value) {
+  return el('div', { class: 'cred' },
+    el('span', { class: 'cred-label' }, label),
+    el('span', { class: 'cred-val' }, value),
+    el('button', { class: 'cred-copy', title: `Copy ${label}`, onclick: () => navigator.clipboard?.writeText(value) }, 'Copy'),
+  );
+}
+
 function sharePanel(app) {
   const s = state.share[app.id];
   if (s === 'loading') return el('div', { class: 'share' }, el('span', { class: 'spinner' }, 'Creating tunnel…'));
@@ -119,16 +127,34 @@ function sharePanel(app) {
   if (s && s.error) return el('div', { class: 'share' }, el('div', { class: 'err' }, s.error));
   if (!shared) return null;
 
+  // Credentials (username + password) come only from the one-time share
+  // response held in state.share; the QR/Open use the credentialed authUrl so
+  // scanning/opening auto-authenticates. Fall back to the plain URL otherwise.
+  const openUrl = (s && s.authUrl) || shared.url;
   const panel = el('div', { class: 'share' });
   panel.appendChild(el('div', { class: 'share-url' }, shared.url));
+
+  if (s && s.username && s.password) {
+    panel.appendChild(el('div', { class: 'creds' },
+      credRow('user', s.username),
+      credRow('pass', s.password),
+    ));
+  } else if (shared.username) {
+    // Tunnel active but password not in memory (e.g. after a UI reload).
+    panel.appendChild(el('div', { class: 'creds' },
+      credRow('user', shared.username),
+      el('div', { class: 'cred-note' }, 'Re-share to reveal the password.'),
+    ));
+  }
+
   if (s && s.qrSvg) {
     const qr = el('div', { class: 'qr', title: 'Tap to enlarge', html: s.qrSvg,
-      onclick: () => openQr(s.qrSvg, shared.url) });
+      onclick: () => openQr(s.qrSvg, openUrl) });
     panel.appendChild(qr);
   }
   panel.appendChild(el('div', { class: 'share-actions' },
-    el('a', { class: 'btn-link', href: shared.url, target: '_blank', rel: 'noopener' }, '▶ Open'),
-    el('button', { onclick: () => { navigator.clipboard?.writeText(shared.url); } }, 'Copy'),
+    el('a', { class: 'btn-link', href: openUrl, target: '_blank', rel: 'noopener' }, '▶ Open'),
+    el('button', { onclick: () => { navigator.clipboard?.writeText(openUrl); } }, 'Copy'),
     el('button', { class: 'danger', onclick: () => action(app.id, async () => {
       await api('DELETE', `/api/apps/${encodeURIComponent(app.id)}/share`);
       delete state.share[app.id];
@@ -178,8 +204,8 @@ async function shareApp(app) {
   await refresh();
 }
 
-function card(app) {
-  const c = el('div', { class: 'card' });
+function card(app, { subcard = false, worktrees = [] } = {}) {
+  const c = el('div', { class: subcard ? 'card subcard' : 'card' });
   c.style.setProperty('--accent-bar', `hsl(${hueFor(app.id)} 80% 62%)`);
 
   c.appendChild(el('div', { class: 'card-head' },
@@ -206,6 +232,37 @@ function card(app) {
   if (routes) c.appendChild(routes);
   const sp = sharePanel(app);
   if (sp) c.appendChild(sp);
+  if (worktrees.length) appendWorktrees(c, app.project, worktrees);
+  return c;
+}
+
+// Attach the collapsed-by-default worktree toggle + nested subcard list to a
+// parent card. Expansion state lives in state.expanded (survives the 2s poll).
+function appendWorktrees(c, project, worktrees) {
+  if (state.expanded.has(project)) c.classList.add('expanded');
+  const n = worktrees.length;
+  c.appendChild(el('button', { class: 'wt-toggle',
+    onclick: () => {
+      if (state.expanded.has(project)) state.expanded.delete(project);
+      else state.expanded.add(project);
+      render();
+    },
+  }, `${n} worktree${n > 1 ? 's' : ''} `, el('span', { class: 'chev' }, '▾')));
+  const list = el('div', { class: 'wt-list' });
+  for (const w of worktrees) list.appendChild(card(w, { subcard: true }));
+  c.appendChild(list);
+}
+
+// A header-only parent for worktrees whose main checkout isn't servable
+// (no .hub.json / not discovered), so those worktrees are never hidden.
+function orphanParent(project, worktrees) {
+  const c = el('div', { class: 'card' });
+  c.style.setProperty('--accent-bar', `hsl(${hueFor(project)} 80% 62%)`);
+  c.appendChild(el('div', { class: 'card-head' },
+    el('span', { class: 'card-title' }, project),
+    el('div', { class: 'status-side' }, el('span', {}, 'no main checkout')),
+  ));
+  appendWorktrees(c, project, worktrees);
   return c;
 }
 
@@ -219,8 +276,26 @@ function render() {
   if (!state.apps.length) { emptyEl.textContent = 'No apps found. Add a .hub.json to a sibling project.'; emptyEl.style.display = ''; root.innerHTML = ''; return; }
   emptyEl.style.display = 'none';
 
+  // Worktrees nest under their parent project rather than showing as
+  // top-level cards. Sort applies to the top-level (main) cards only.
+  const mains = state.apps.filter((a) => !a.isWorktree);
+  const wtByProject = new Map();
+  for (const w of state.apps) {
+    if (!w.isWorktree) continue;
+    if (!wtByProject.has(w.project)) wtByProject.set(w.project, []);
+    wtByProject.get(w.project).push(w);
+  }
+  for (const list of wtByProject.values()) list.sort((a, b) => (a.branch || a.id).localeCompare(b.branch || b.id));
+
   root.innerHTML = '';
-  for (const a of sortApps(state.apps)) root.appendChild(card(a));
+  const seen = new Set();
+  for (const m of sortApps(mains)) {
+    seen.add(m.project);
+    root.appendChild(card(m, { worktrees: wtByProject.get(m.project) || [] }));
+  }
+  for (const [project, list] of wtByProject) {
+    if (!seen.has(project)) root.appendChild(orphanParent(project, list));
+  }
 }
 
 document.getElementById('refresh').addEventListener('click', refresh);

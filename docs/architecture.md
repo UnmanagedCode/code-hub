@@ -12,11 +12,12 @@ Node + Express backend, vanilla ES-module frontend, no build step. `"type": "mod
 | `src/net.js` | Free-port allocation, URL enumeration (`enumerateUrls` = loopback + non-internal IPv4 base URLs; `routeUrls` = those bases with a route path appended), TCP readiness probe. |
 | `src/git.js` | `headSha` / `currentBranch` / `lastCommitAt` (`git log -1 --format=%cI`) via `execFile` (manual promisify — Termux Node lacks `promisify.custom` on `execFile`). |
 | `src/runner.js` | Process lifecycle. Spawns `bash -lc <start>` **detached** (own group, pgid === pid) with `PORT`. Readiness orchestration, per-app 16KB output ring for crash tails, `stop` = SIGTERM→SIGKILL on the process group. |
-| `src/tunnel.js` | cloudflared detection (`--version`, bin from `CODEHUB_CLOUDFLARED_BIN`) + quick-tunnel spawn, capturing the `*.trycloudflare.com` URL (30s timeout). |
+| `src/tunnel.js` | cloudflared detection (`--version`, bin from `CODEHUB_CLOUDFLARED_BIN`) + quick-tunnel spawn, capturing the `*.trycloudflare.com` URL (30s timeout). Now targets the **auth proxy** port, not the app port. |
+| `src/authproxy.js` | In-process HTTP reverse proxy enforcing Basic Auth (`hub` + per-share CSPRNG password) on both requests **and WS upgrades** (`upgrade` → raw `net` socket pipe, `req.rawHeaders` replayed), forwarding to `localhost:<appPort>`. `startAuthProxy(targetPort)` → `{ port, username, password, close() }`. Loopback-only; hand-rolled (no proxy dep). |
 | `src/qr.js` | `qrcode` → inline SVG string (async). |
-| `src/appManager.js` | **Single source of truth.** Composes discovery ∪ running-state; exposes `init/list/start/stop/restart/share/unshare`; keeps `state.js` in sync. |
+| `src/appManager.js` | **Single source of truth.** Composes discovery ∪ running-state; exposes `init/list/start/stop/restart/share/unshare`; keeps `state.js` in sync. Holds the in-memory `proxies` map + `teardownShare`. |
 | `src/routes.js` | Thin Express router over `appManager`. |
-| `public/` | `index.html`, `styles.css`, `app.js` (`el()` helper, 2s poll, flat client-side sort, per-app hue accent bar, relative "edited" labels), `manifest.webmanifest`, `icon.svg`. |
+| `public/` | `index.html`, `styles.css`, `app.js` (`el()` helper, 2s poll, flat client-side sort, per-app hue accent bar, relative "edited" labels, **client-side worktree grouping** into expandable subcards), `manifest.webmanifest`, `icon.svg`. |
 
 ## Process & state lifecycle
 
@@ -27,13 +28,16 @@ Node + Express backend, vanilla ES-module frontend, no build step. `"type": "mod
 - **Readiness / status**: for apps started this process, `runner.runtime(id)` supplies `starting`/`ready`/`crashed`; adopted apps have no runtime and read as `running`. `list()` lazily prunes records whose pid has since died.
 - **Out-of-date**: `outOfDate = startedSha && currentSha && startedSha !== currentSha`, computed live per `list()`.
 - **Routes & last-edited**: `list()` also computes, per app, `lastCommitAt` (source dir's last commit date) and `routes` — the manifest's `routes` (or a single implicit `/` when absent), each with `urls` enumerated live from the running port via `routeUrls`. The top-level `urls` stays the base-URL list persisted at start.
+- **Share auth lifecycle**: `share` starts an `authproxy` (in-memory handle in the `proxies` map, keyed by app id; password held only there), points cloudflared at the proxy port, and persists `tunnel = { url, pid, username, proxyPort }` (never the password). `teardownShare` closes the proxy + kills the tunnel on `unshare`/`stop`/`restart`. Because the proxy is in-process it **cannot** survive a code-hub restart, so `appManager.init` (after `state.reconcile`) tears down every persisted tunnel and clears it — the share simply needs recreating (a broken tunnel is never left running).
+- **Worktree grouping is client-side**: the payload stays a flat `apps` array carrying `project`/`isWorktree`/`branch`; `public/app.js` `render()` nests worktrees under their parent's card (expand state in a `state.expanded` set, re-applied across polls).
 
 ## Testing
 
 - Runner: `tests/run.mjs` drives `node:test` via its API (the device's node wrapper rejects `--test`); `*.test.mjs` files, process-isolated, concurrency = min(4, cores/2), 60s/file ceiling. `npm test`.
 - Fakes injected via env, no network: `tests/fixtures/fake-app.mjs` (binds `$PORT`, prints a ready line, handles SIGTERM; `FAKE_APP_MODE=crash` exits immediately) and `tests/fixtures/fake-cloudflared.mjs` (prints a canned trycloudflare URL; injected via `CODEHUB_CLOUDFLARED_BIN`).
 - Isolation: each test `mkdtemp`s a fresh `PROJECTS_ROOT`; short poll intervals with caps (no long real sleeps); assertions on killed/ready outcomes (`kill -0`).
-- One real-dependency smoke test (`tests/smoke.real.test.mjs`) is gated behind `RUN_REAL_CLOUDFLARED=1`.
+- `tests/authproxy.test.mjs` exercises the auth gate + HTTP forward + WS-upgrade pipe against an in-test raw upstream (no ws dependency): a raw `net` handshake proves 401 without/with-wrong creds and 101 + byte echo with correct creds.
+- Real-dependency smoke tests (`tests/smoke.real.test.mjs`) are gated behind `RUN_REAL_CLOUDFLARED=1`: a raw quick-tunnel check, plus an end-to-end auth check (real tunnel → auth proxy returns 401 anonymous, 200 credentialed).
 
 ## Conventions & future changes
 

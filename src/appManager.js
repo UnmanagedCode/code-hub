@@ -5,15 +5,38 @@ import * as tunnel from './tunnel.js';
 import { allocatePort, enumerateUrls, routeUrls } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
+import { startAuthProxy } from './authproxy.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
 // "what is running"; routes.js is a thin layer over it.
 let store = { apps: {} };
 
+// Live auth-proxy handles, keyed by app id. In-memory only: the password and
+// the proxy server never survive a code-hub restart (see init teardown).
+const proxies = new Map();
+
 export async function init() {
   store = await state.load();
   await state.reconcile(store); // drop dead pids / tunnels; adopt live ones
+  // A persisted tunnel from before a restart points at an auth proxy that no
+  // longer exists (in-process, gone with the old code-hub). Tear the orphaned
+  // cloudflared tunnel down so it can't serve a broken URL — the share simply
+  // needs re-creating (the UI's Share button reappears).
+  let mutated = false;
+  for (const rec of Object.values(store.apps)) {
+    if (rec.tunnel) { tunnel.stopTunnel(rec.tunnel.pid); rec.tunnel = null; mutated = true; }
+  }
+  if (mutated) await persist();
+}
+
+// Tear down a share: close the auth proxy (if any) and kill the cloudflared
+// tunnel. Leaves rec.tunnel null. Safe to call when nothing is shared.
+function teardownShare(id, rec) {
+  const proxy = proxies.get(id);
+  if (proxy) { proxy.close(); proxies.delete(id); }
+  if (rec?.tunnel) tunnel.stopTunnel(rec.tunnel.pid);
+  if (rec) rec.tunnel = null;
 }
 
 async function persist() {
@@ -37,7 +60,7 @@ export async function list() {
 
     if (rec) {
       port = rec.port; urls = rec.urls; startedSha = rec.startedSha;
-      tunnelInfo = rec.tunnel ? { url: rec.tunnel.url } : null;
+      tunnelInfo = rec.tunnel ? { url: rec.tunnel.url, username: rec.tunnel.username ?? null, proxyPort: rec.tunnel.proxyPort ?? null } : null;
       const rt = runner.runtime(base.id);
       if (rt && (rt.status === 'crashed' || rt.status === 'exited')) {
         status = 'crashed'; error = rt.error;
@@ -123,7 +146,7 @@ export async function start(id) {
 export async function stop(id) {
   const rec = store.apps[id];
   if (!rec) { const e = new Error(`'${id}' is not running`); e.statusCode = 404; throw e; }
-  if (rec.tunnel) tunnel.stopTunnel(rec.tunnel.pid);
+  teardownShare(id, rec);
   runner.stop({ id, pgid: rec.pgid });
   delete store.apps[id];
   await persist();
@@ -135,6 +158,10 @@ export async function restart(id) {
   return start(id);
 }
 
+// Share a running app behind a Basic-Auth reverse proxy: cloudflared points at
+// the auth proxy (not the app), so the public URL requires credentials. The
+// password is freshly generated per share, kept in memory only, and returned
+// once (encoded into the QR's credentialed URL + shown as plaintext fallback).
 export async function share(id) {
   const rec = store.apps[id];
   if (!rec || !state.pidAlive(rec.pid)) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
@@ -142,15 +169,26 @@ export async function share(id) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
   }
-  if (rec.tunnel) tunnel.stopTunnel(rec.tunnel.pid); // replace a stale tunnel
-  const { url, pid } = await tunnel.startTunnel(rec.port);
-  rec.tunnel = { url, pid };
+  teardownShare(id, rec); // replace any existing share
+
+  const proxy = await startAuthProxy(rec.port);
+  let url, pid;
+  try {
+    ({ url, pid } = await tunnel.startTunnel(proxy.port));
+  } catch (e) {
+    proxy.close(); // don't leak the proxy if the tunnel failed to come up
+    throw e;
+  }
+  proxies.set(id, proxy);
+  rec.tunnel = { url, pid, username: proxy.username, proxyPort: proxy.port };
   await persist();
-  return { url, qrSvg: await qrSvg(url) };
+
+  const authUrl = url.replace('https://', `https://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`);
+  return { url, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
 }
 
 export async function unshare(id) {
   const rec = store.apps[id];
-  if (rec?.tunnel) { tunnel.stopTunnel(rec.tunnel.pid); rec.tunnel = null; await persist(); }
+  if (rec?.tunnel || proxies.has(id)) { teardownShare(id, rec); await persist(); }
   return { id, tunnel: null };
 }

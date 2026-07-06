@@ -22,10 +22,12 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
 | `POST /api/apps/:id/start` | — | running record |
 | `POST /api/apps/:id/stop` | — | `{ id, status: "stopped" }` |
 | `POST /api/apps/:id/restart` | — | running record |
-| `POST /api/apps/:id/share` | — | `{ url, qrSvg }` (or `501` if cloudflared absent) |
+| `POST /api/apps/:id/share` | — | `{ url, authUrl, username, password, qrSvg }` (or `501` if cloudflared absent) |
 | `DELETE /api/apps/:id/share` | — | `{ id, tunnel: null }` |
 
 `id` is the served directory basename (unique across the projects root; a worktree's id is its `<project>_worktree_<hash>` dir name).
+
+**Shares are Basic-Auth protected.** `share` stands up a local reverse proxy (fresh free port, loopback-only) enforcing HTTP Basic Auth — username `hub` + a CSPRNG password generated per share — and points cloudflared at the proxy instead of the app. The proxy forwards authenticated HTTP **and WebSocket upgrades** to `http://localhost:<appPort>`. Response fields: `url` (clean public URL), `authUrl` = `https://<user>:<pass>@<host>` (**the QR encodes this** for scan-to-auth), `username`, `password` (returned once — **in-memory only, never persisted or logged**), `qrSvg`. Torn down on `unshare`/`stop`/`restart`. A share does **not** survive a code-hub restart: on startup any orphaned tunnel is torn down (its in-process proxy is gone) and the app needs re-sharing.
 
 ### `App` shape (from `GET /api/apps`)
 
@@ -49,7 +51,7 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
     { "name": "Main game", "path": "/", "urls": ["http://localhost:41051", "..."] },
     { "name": "Terrain editor", "path": "/terrain-editor.html", "urls": ["http://localhost:41051/terrain-editor.html", "..."] }
   ],
-  "tunnel": { "url": "https://x.trycloudflare.com" },  // or null
+  "tunnel": { "url": "https://x.trycloudflare.com", "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here
   "error": null                // crash tail / manifest error, when present
 }
 ```

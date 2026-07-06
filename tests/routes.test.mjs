@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
+import { storeRoot } from '../src/projects.js';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive } from './helpers.mjs';
+
+const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
 async function boot(root) {
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
@@ -111,4 +117,69 @@ test('App shape carries per-route URLs and lastCommitAt', async (t) => {
   assert.deepEqual(multi.routes.map((r) => r.name), ['Main', 'Editor']);
   assert.ok(multi.routes[0].urls.includes(`http://localhost:${multi.port}`));
   assert.ok(multi.routes[1].urls.includes(`http://localhost:${multi.port}/edit.html`));
+});
+
+test('share stands up a Basic-Auth proxy; unshare tears it down', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.username, 'hub');
+  assert.ok(res.body.password.length >= 20);
+  assert.match(res.body.authUrl, /^https:\/\/hub:.+@.+trycloudflare\.com/);
+  assert.match(res.body.qrSvg, /<svg/);
+
+  // list() exposes username + proxyPort, never the password.
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.username, 'hub');
+  assert.ok(app.tunnel.proxyPort > 0);
+  assert.equal(app.tunnel.password, undefined);
+
+  // The proxy (which cloudflared points at) enforces auth and forwards to the app.
+  const pp = app.tunnel.proxyPort;
+  const noauth = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(noauth.status, 401);
+  assert.match(noauth.headers.get('www-authenticate') || '', /Basic/);
+  const authed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
+
+  // unshare closes the proxy (port no longer accepts connections).
+  await j(base, 'DELETE', '/api/apps/app/share');
+  await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
+});
+
+test('init tears down a share orphaned by a code-hub restart (needs-reshare)', async (t) => {
+  const root = await mkRoot();
+  // Two detached, own-group children: one stands in for the app process (stays
+  // alive → app survives reconcile), one for the orphaned cloudflared tunnel.
+  const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  const tunChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(async () => {
+    for (const c of [appChild, tunChild]) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
+    await rmRoot(root);
+  });
+
+  const store = { apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: appChild.pid, pgid: appChild.pid, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { url: 'https://x.trycloudflare.com', pid: tunChild.pid, username: 'hub', proxyPort: 5001 },
+  } } };
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify(store));
+
+  await appManager.init(); // simulates a fresh code-hub after restart
+
+  const { apps } = await appManager.list();
+  const demo = apps.find((a) => a.id === 'demo');
+  assert.ok(demo, 'app with a live pid is kept');
+  assert.equal(demo.tunnel, null, 'orphaned tunnel is cleared → Share reappears');
+  await waitFor(() => !pidAlive(tunChild.pid)); // orphaned cloudflared killed
+  assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
 });
