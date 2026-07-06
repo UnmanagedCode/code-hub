@@ -128,8 +128,9 @@ export async function start(id) {
     const e = new Error(`'${id}' is already running`); e.statusCode = 409; throw e;
   }
   const app = await findDiscovered(id);
-  const port = await allocatePort();
+  let port = await allocatePort();
   const proc = await runner.start(app, port);
+  port = proc.port; // runner.start() may have retried onto a different port
   store.apps[id] = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
