@@ -3,8 +3,10 @@ import os from 'node:os';
 
 // Allocate a free TCP port by binding to 0 and reading the assigned port,
 // then closing. There is a small TOCTOU window between close and the child
-// binding it — the readiness probe confirms the bind, so a lost race just
-// surfaces as "readiness unconfirmed" rather than silent breakage.
+// binding it: another process (a concurrently launching app, a health
+// probe, cloudflared, etc.) can grab the same ephemeral port first, in
+// which case the child's listen() fails with EADDRINUSE and it exits hard.
+// runner.js retries on a freshly allocated port when it detects that.
 export function allocatePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();

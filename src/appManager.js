@@ -129,7 +129,7 @@ export async function start(id) {
   }
   const app = await findDiscovered(id);
   const port = await allocatePort();
-  const proc = runner.start(app, port);
+  const proc = await runner.start(app, port);
   store.apps[id] = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,

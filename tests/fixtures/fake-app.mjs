@@ -3,12 +3,19 @@
 // start command" contract code-hub expects.
 //
 // FAKE_APP_MODE:
-//   (default) → bind $PORT, print "listening on <port>", serve 200 OK, block.
-//   crash     → exit(1) immediately without binding (simulates a broken app).
+//   (default)   → bind $PORT, print "listening on <port>", serve 200 OK, block.
+//   crash       → exit(1) immediately without binding (simulates a broken app).
+//   addrinuse   → exit(1) immediately as if $PORT were already bound (simulates
+//                 a port race that never clears, regardless of the real port state).
 import http from 'node:http';
 
 if (process.env.FAKE_APP_MODE === 'crash') {
   console.error('boom: could not start');
+  process.exit(1);
+}
+
+if (process.env.FAKE_APP_MODE === 'addrinuse') {
+  console.error(`Error: listen EADDRINUSE: address already in use :::${process.env.PORT}`);
   process.exit(1);
 }
 
