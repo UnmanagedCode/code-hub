@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
-import { waitForPort } from './net.js';
+import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
 const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring
+const EADDRINUSE_RETRIES = 3;
+const SPAWN_SETTLE_MS = 400; // window to catch a fast EADDRINUSE crash before committing to this attempt's port
 
 // In-memory runtime for children spawned by THIS code-hub process. Apps
 // adopted after a restart have no entry here (we can't recapture their
@@ -23,11 +25,15 @@ function appendOutput(c, chunk) {
   if (c.output.length > OUTPUT_CAP) c.output = c.output.slice(-OUTPUT_CAP);
 }
 
+function settle(c, status, error = null) {
+  if (c.status !== 'starting') return;
+  c.status = status;
+  c.error = error;
+}
+
 // Spawn the manifest's blocking start command in its OWN process group
 // (detached ⇒ child is group leader ⇒ pgid === pid), with PORT injected.
-// Returns the record fields to persist; readiness runs in the background and
-// updates the in-memory runtime status.
-export function start(app, port) {
+function spawnChild(app, port) {
   const proc = spawn('bash', ['-lc', app.manifest.start], {
     cwd: app.path,
     env: { ...process.env, PORT: String(port) },
@@ -35,33 +41,65 @@ export function start(app, port) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '' };
-  children.set(app.id, c);
 
   const onData = (d) => appendOutput(c, d.toString());
   proc.stdout.on('data', onData);
   proc.stderr.on('data', onData);
 
-  let settled = false;
-  const settle = (status, error = null) => {
-    if (settled) return;
-    settled = true;
-    c.status = status;
-    c.error = error;
-  };
-
   proc.on('exit', (code, signal) => {
     // Exit before readiness = crash; after = the app stopped on its own.
-    if (!settled) settle('crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
+    if (c.status === 'starting') settle(c, 'crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
     else if (c.status === 'ready') c.status = 'exited';
   });
-  proc.on('error', (e) => settle('crashed', e.message));
+  proc.on('error', (e) => settle(c, 'crashed', e.message));
 
-  detectReady(app, port, c).then(
-    () => settle('ready'),
-    (e) => { if (!settled) settle('crashed', e.message); },
-  );
+  return c;
+}
 
-  return { pid: proc.pid, pgid: proc.pid, port, startedAt: new Date().toISOString() };
+// Resolve once the child settles (crashes) or `ms` elapses, whichever first.
+// Only used to decide whether an early failure was an EADDRINUSE race worth
+// retrying on a new port — full readiness detection (below) is unaffected.
+function raceSettle(c, ms) {
+  const deadline = Date.now() + ms;
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (c.status !== 'starting' || Date.now() >= deadline) return resolve();
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
+// Returns the record fields to persist; readiness runs in the background and
+// updates the in-memory runtime status. If the freshly spawned child dies
+// almost immediately with EADDRINUSE — the free port `allocatePort()` handed
+// out got claimed by something else before this bind — retry on a new port
+// a bounded number of times before giving up.
+export async function start(app, port) {
+  for (let attempt = 1; ; attempt++) {
+    const c = spawnChild(app, port);
+    children.set(app.id, c);
+
+    await raceSettle(c, SPAWN_SETTLE_MS);
+
+    const isPortRace = c.status === 'crashed' && /EADDRINUSE/.test(c.error ?? '');
+    if (isPortRace && attempt <= EADDRINUSE_RETRIES) {
+      console.error(`[runner] ${app.id}: port ${port} was claimed before bind (attempt ${attempt}/${EADDRINUSE_RETRIES}) — retrying on a new port`);
+      port = await allocatePort();
+      continue;
+    }
+    if (isPortRace) {
+      console.error(`[runner] ${app.id}: still hitting EADDRINUSE after ${EADDRINUSE_RETRIES} retries — giving up`);
+    }
+
+    if (c.status === 'starting') {
+      detectReady(app, port, c).then(
+        () => settle(c, 'ready'),
+        (e) => settle(c, 'crashed', e.message),
+      );
+    }
+    return { pid: c.proc.pid, pgid: c.proc.pid, port, startedAt: new Date().toISOString() };
+  }
 }
 
 function detectReady(app, port, c) {
