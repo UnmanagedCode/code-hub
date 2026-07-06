@@ -98,15 +98,21 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
   font-family: ui-monospace, monospace; max-height: 120px; overflow: auto; }
 
 /* Routes */
-.routes { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
-.route { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.route-name { flex: 1 1 auto; min-width: 0; font-size: 13px;
+.routes { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.route { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.route-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.route-name { font-size: 13px; font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.route .open { min-height: 44px; padding: 6px 14px; flex: 0 0 auto;
+.route-url { color: var(--muted); text-decoration: none; display: block;
+  font-family: ui-monospace, monospace; font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.route-url:hover { color: var(--accent); text-decoration: underline; }
+.route .open { height: 42px; padding: 0 16px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center; line-height: 1;
   background: var(--accent); color: #0a0c12; border: 1px solid var(--accent);
   border-radius: 6px; font-weight: 600; text-decoration: none; }
 .route .open:hover { background: #8cb9ff; border-color: #8cb9ff; }
-.lan-links { display: flex; flex-wrap: wrap; gap: 4px 12px; flex-basis: 100%; }
+.lan-links { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 2px; }
 .lan-links a {
   color: var(--muted); text-decoration: none;
   font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all;
@@ -114,8 +120,9 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .lan-links a:hover { color: var(--accent); text-decoration: underline; }
 
 /* Controls */
-.controls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-.controls button { min-height: 44px; flex: 1 1 auto; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.controls button { height: 42px; padding: 0 12px; flex: 1 1 0; min-width: 0;
+  display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
 .controls .start { color: var(--green); border-color: var(--green); }
 .controls .start:hover:not(:disabled) { background: rgba(74,222,128,.12); }
 .controls .danger { color: var(--pink); border-color: var(--pink); }
@@ -131,7 +138,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .qr { margin: 8px auto; width: 180px; height: 180px; cursor: pointer; }
 .qr svg { width: 100%; height: 100%; display: block; border-radius: 4px; }
 .share-actions { display: flex; gap: 6px; margin-top: 6px; }
-.share-actions button, .share-actions .btn-link { flex: 1; min-height: 40px; }
+.share-actions button, .share-actions .btn-link { flex: 1 1 0; height: 40px; padding: 0 10px; }
 .spinner { font-size: 12px; color: var(--muted); }
 .btn-link {
   display: inline-flex; align-items: center; justify-content: center;

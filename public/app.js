@@ -97,11 +97,16 @@ function routesBlock(app) {
   const single = app.routes.length === 1;
   for (const r of app.routes) {
     const [primary, ...rest] = r.urls;
-    const row = el('div', { class: 'route' });
-    if (!single) row.appendChild(el('span', { class: 'route-name', title: r.path }, r.name));
-    if (primary) row.appendChild(el('a', { class: 'open', href: primary, target: '_blank', rel: 'noopener' }, 'Open ▶'));
-    if (rest.length) row.appendChild(el('div', { class: 'lan-links' },
+    // Left block: route name (omitted for a single implicit route) with its
+    // primary URL directly beneath, plus any LAN-IP URLs as small links.
+    const info = el('div', { class: 'route-info' });
+    if (!single) info.appendChild(el('span', { class: 'route-name', title: r.path }, r.name));
+    if (primary) info.appendChild(el('a', { class: 'route-url', href: primary, target: '_blank', rel: 'noopener' }, primary));
+    if (rest.length) info.appendChild(el('div', { class: 'lan-links' },
       ...rest.map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
+    // Right: compact Open button, vertically centered against the block.
+    const row = el('div', { class: 'route' }, info,
+      primary ? el('a', { class: 'open', href: primary, target: '_blank', rel: 'noopener' }, 'Open ▶') : null);
     wrap.appendChild(row);
   }
   return wrap;
