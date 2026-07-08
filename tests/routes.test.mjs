@@ -34,8 +34,13 @@ test('full lifecycle over HTTP: discover → start → share → out-of-date →
   const { server, base } = await boot(root);
   t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
 
+  // health
+  let res = await j(base, 'GET', '/api/health');
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { ok: true });
+
   // discover
-  let res = await j(base, 'GET', '/api/apps');
+  res = await j(base, 'GET', '/api/apps');
   assert.equal(res.status, 200);
   assert.equal(res.body.cloudflaredAvailable, true);
   const app0 = res.body.apps.find((a) => a.id === 'app');

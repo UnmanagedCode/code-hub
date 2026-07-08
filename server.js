@@ -15,7 +15,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // guarantees the freshest CSS/JS reaches the phone.
 function renderIndex() {
   const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
-  return html.replace(/\b(href|src)="(\/[^"?]+)"/g, (m, attr, ref) => {
+  return html.replace(/\b(href|src)="([^"?]+)"/g, (m, attr, ref) => {
     try {
       const v = Math.floor(fs.statSync(path.join(PUBLIC_DIR, ref)).mtimeMs);
       return `${attr}="${ref}?v=${v}"`;

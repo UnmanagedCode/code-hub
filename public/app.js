@@ -29,7 +29,7 @@ async function api(method, path, opts = {}) {
 
 async function refresh() {
   try {
-    const data = await api('GET', '/api/apps');
+    const data = await api('GET', 'api/apps');
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
     render();
@@ -156,7 +156,7 @@ function sharePanel(app) {
     el('a', { class: 'btn-link', href: openUrl, target: '_blank', rel: 'noopener' }, '▶ Open'),
     el('button', { onclick: () => { navigator.clipboard?.writeText(openUrl); } }, 'Copy'),
     el('button', { class: 'danger', onclick: () => action(app.id, async () => {
-      await api('DELETE', `/api/apps/${encodeURIComponent(app.id)}/share`);
+      await api('DELETE', `api/apps/${encodeURIComponent(app.id)}/share`);
       delete state.share[app.id];
     }) }, 'Unshare'),
   ));
@@ -177,12 +177,12 @@ function controls(app) {
 
   if (!running) {
     row.appendChild(el('button', { class: 'start', disabled: isBusy || (!!app.error && !app.sourceMissing) || app.sourceMissing,
-      onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
+      onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
   } else {
     row.appendChild(el('button', { class: 'danger', disabled: isBusy,
-      onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
+      onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
     row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
-      onclick: () => action(app.id, () => api('POST', `/api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
+      onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
     row.appendChild(el('button', {
       disabled: isBusy || !state.cloudflaredAvailable || !!app.tunnel,
       title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
@@ -196,7 +196,7 @@ async function shareApp(app) {
   state.share[app.id] = 'loading';
   render();
   try {
-    const res = await api('POST', `/api/apps/${encodeURIComponent(app.id)}/share`);
+    const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`);
     state.share[app.id] = res;
   } catch (e) {
     state.share[app.id] = { error: e.message };
