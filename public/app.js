@@ -179,10 +179,12 @@ function controls(app) {
     row.appendChild(el('button', { class: 'start', disabled: isBusy || (!!app.error && !app.sourceMissing) || app.sourceMissing,
       onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
   } else {
-    row.appendChild(el('button', { class: 'danger', disabled: isBusy,
-      onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
-    row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
-      onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
+    if (!app.alwaysOn) {
+      row.appendChild(el('button', { class: 'danger', disabled: isBusy,
+        onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
+      row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
+        onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
+    }
     row.appendChild(el('button', {
       disabled: isBusy || !state.cloudflaredAvailable || !!app.tunnel,
       title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
@@ -219,6 +221,7 @@ function card(app, { subcard = false, worktrees = [] } = {}) {
 
   const meta = el('div', { class: 'meta' });
   if (app.isWorktree && app.branch) meta.appendChild(el('span', { class: 'badge wt' }, app.branch));
+  if (app.alwaysOn) meta.appendChild(el('span', { class: 'badge always-on' }, 'always on'));
   if (app.id !== app.name) meta.appendChild(el('span', { class: 'desc' }, app.id));
   if (app.currentSha) meta.appendChild(el('span', {}, shortSha(app.currentSha)));
   if (app.outOfDate) meta.appendChild(el('span', { class: 'badge stale' }, 'outdated'));

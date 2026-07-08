@@ -53,11 +53,14 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
     { "name": "Terrain editor", "path": "/terrain-editor.html", "urls": ["http://localhost:41051/terrain-editor.html", "..."] }
   ],
   "tunnel": { "url": "https://x.trycloudflare.com", "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here
-  "error": null                // crash tail / manifest error, when present
+  "error": null,                // crash tail / manifest error, when present
+  "alwaysOn": false             // true only for the host code-conductor when code-hub runs embedded as its plugin
 }
 ```
 
 `urls` (top level) stays the list of base URLs (loopback + LAN IPs, no path). Each `routes[].urls` is those bases with the route `path` appended (`/` keeps the clean base form); populated only while the app is running.
+
+**`alwaysOn`.** When code-hub runs embedded as a code-conductor plugin (`CONDUCTOR_PLUGIN_ID` + `CONDUCTOR_URL` env vars present — see `docs/architecture.md`), the main `code-conductor` checkout is reported `alwaysOn: true, status: "running"` with no real pid to track, and `POST /api/apps/code-conductor/start`, `.../stop`, and `.../restart` all reply `409`. `POST .../share` still works — it targets the port parsed from `CONDUCTOR_URL`. This never applies to `code-conductor_worktree_*` dirs (always ordinary apps) or when running standalone.
 
 ### Errors
 
