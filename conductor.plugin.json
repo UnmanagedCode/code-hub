@@ -1,0 +1,50 @@
+{
+  "id": "code-hub",
+  "name": "Code Hub",
+  "version": "0.1.0",
+  "pluginApi": 1,
+  "backend": {
+    "start": "npm start",
+    "healthPath": "/api/health"
+  },
+  "frontend": {
+    "path": "/",
+    "navLabel": "Hub"
+  },
+  "mcp": {
+    "endpoint": "/api/mcp",
+    "scope": "project",
+    "tools": [
+      {
+        "name": "list_apps",
+        "description": "List all discoverable apps and their current status.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "start_app",
+        "description": "Start an app by id.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1 }
+          },
+          "required": ["id"]
+        }
+      },
+      {
+        "name": "stop_app",
+        "description": "Stop a running app by id.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1 }
+          },
+          "required": ["id"]
+        }
+      }
+    ]
+  }
+}

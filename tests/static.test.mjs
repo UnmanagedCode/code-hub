@@ -18,7 +18,13 @@ test('serves the static frontend', async (t) => {
   }
 
   // index.html carries cache-busting version queries on its local asset refs.
+  // Refs are relative (no leading slash) so the page works both standalone
+  // and mounted under a code-conductor plugin prefix.
   const html = await (await fetch(base + '/')).text();
-  assert.match(html, /href="\/styles\.css\?v=\d+"/, 'styles.css cache-bust');
-  assert.match(html, /src="\/app\.js\?v=\d+"/, 'app.js cache-bust');
+  assert.match(html, /href="styles\.css\?v=\d+"/, 'styles.css cache-bust');
+  assert.match(html, /src="app\.js\?v=\d+"/, 'app.js cache-bust');
+
+  // pluginBridge.js stays absolute (served by the conductor, not code-hub)
+  // and isn't cache-busted since it isn't a local file.
+  assert.match(html, /src="\/pluginBridge\.js" defer/, 'pluginBridge.js tag stays absolute');
 });

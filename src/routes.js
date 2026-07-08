@@ -1,5 +1,6 @@
 import express from 'express';
 import * as appManager from './appManager.js';
+import * as mcp from './mcp.js';
 
 // Thin HTTP layer over appManager. Error convention matches code-conductor:
 // a thrown error with an optional `statusCode` becomes `{ error }`.
@@ -12,12 +13,30 @@ export function buildRoutes() {
     catch (e) { res.status(e.statusCode || 500).json({ error: e.message }); }
   };
 
+  r.get('/health', wrap(() => ({ ok: true })));
+
   r.get('/apps', wrap(() => appManager.list()));
   r.post('/apps/:id/start', wrap((req) => appManager.start(req.params.id)));
   r.post('/apps/:id/stop', wrap((req) => appManager.stop(req.params.id)));
   r.post('/apps/:id/restart', wrap((req) => appManager.restart(req.params.id)));
   r.post('/apps/:id/share', wrap((req) => appManager.share(req.params.id)));
   r.delete('/apps/:id/share', wrap((req) => appManager.unshare(req.params.id)));
+
+  // MCP tool-call bridge for code-conductor: unlike wrap()'s statusCode
+  // convention, tool-level outcomes (unknown tool, bad args, already-running)
+  // are normal MCP results, not transport failures -- see docs/protocol.md.
+  r.post('/mcp', async (req, res) => {
+    const { status, body } = await mcp.handle(req.body);
+    res.status(status).json(body);
+  });
+
+  // Malformed JSON body -> 400 {error}, not Express's default HTML page.
+  r.use((err, req, res, next) => {
+    if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+      return res.status(400).json({ error: 'invalid request body' });
+    }
+    next(err);
+  });
 
   return r;
 }

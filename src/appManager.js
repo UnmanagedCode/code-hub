@@ -6,6 +6,7 @@ import { allocatePort, enumerateUrls, routeUrls } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
+import { isEmbedded, isHostConductorId, hostConductorPort, HOST_CONDUCTOR_ID } from './hostConductor.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -26,6 +27,28 @@ export async function init() {
   let mutated = false;
   for (const rec of Object.values(store.apps)) {
     if (rec.tunnel) { tunnel.stopTunnel(rec.tunnel.pid); rec.tunnel = null; mutated = true; }
+  }
+  // Embedded as a code-conductor plugin: the host conductor is already
+  // running (started by something else), so synthesize a record for it with
+  // no pid/pgid to track — list()/start()/stop()/share() special-case this
+  // id to treat it as always-on instead of an ordinary app. It has no real
+  // pid, so state.reconcile() prunes it again on the next boot; we simply
+  // re-synthesize it here every time, same as any other share not
+  // surviving a restart.
+  if (isEmbedded()) {
+    const discovered = await discoverApps();
+    const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
+    const port = hostConductorPort();
+    if (app && port) {
+      store.apps[HOST_CONDUCTOR_ID] = {
+        id: HOST_CONDUCTOR_ID, project: app.project, path: app.path,
+        isWorktree: false, branch: null,
+        pid: null, pgid: null, port,
+        urls: enumerateUrls(port),
+        startedSha: null, startedAt: null, tunnel: null,
+      };
+      mutated = true;
+    }
   }
   if (mutated) await persist();
 }
@@ -61,15 +84,19 @@ export async function list() {
     if (rec) {
       port = rec.port; urls = rec.urls; startedSha = rec.startedSha;
       tunnelInfo = rec.tunnel ? { url: rec.tunnel.url, username: rec.tunnel.username ?? null, proxyPort: rec.tunnel.proxyPort ?? null } : null;
-      const rt = runner.runtime(base.id);
-      if (rt && (rt.status === 'crashed' || rt.status === 'exited')) {
-        status = 'crashed'; error = rt.error;
-      } else if (state.pidAlive(rec.pid)) {
-        status = rt ? rt.status : 'running'; // no runtime ⇒ adopted after restart
+      if (isHostConductorId(base.id)) {
+        status = 'running'; // host code-conductor: always on, no pid/runtime to track
       } else {
-        // Died without our runtime noticing (e.g. after a code-hub restart).
-        delete store.apps[base.id]; mutated = true;
-        status = 'stopped'; port = urls = startedSha = undefined; tunnelInfo = null;
+        const rt = runner.runtime(base.id);
+        if (rt && (rt.status === 'crashed' || rt.status === 'exited')) {
+          status = 'crashed'; error = rt.error;
+        } else if (state.pidAlive(rec.pid)) {
+          status = rt ? rt.status : 'running'; // no runtime ⇒ adopted after restart
+        } else {
+          // Died without our runtime noticing (e.g. after a code-hub restart).
+          delete store.apps[base.id]; mutated = true;
+          status = 'stopped'; port = urls = startedSha = undefined; tunnelInfo = null;
+        }
       }
     }
 
@@ -101,6 +128,7 @@ export async function list() {
       routes,
       tunnel: tunnelInfo,
       error,
+      alwaysOn: isHostConductorId(base.id) && !!rec,
     };
   };
 
@@ -123,6 +151,9 @@ async function findDiscovered(id) {
 }
 
 export async function start(id) {
+  if (isHostConductorId(id)) {
+    const e = new Error(`'${id}' is the host code-conductor and cannot be started`); e.statusCode = 409; throw e;
+  }
   const existing = store.apps[id];
   if (existing && state.pidAlive(existing.pid)) {
     const e = new Error(`'${id}' is already running`); e.statusCode = 409; throw e;
@@ -145,6 +176,9 @@ export async function start(id) {
 }
 
 export async function stop(id) {
+  if (isHostConductorId(id)) {
+    const e = new Error(`'${id}' is managed by the host code-conductor and cannot be stopped`); e.statusCode = 409; throw e;
+  }
   const rec = store.apps[id];
   if (!rec) { const e = new Error(`'${id}' is not running`); e.statusCode = 404; throw e; }
   teardownShare(id, rec);
@@ -165,7 +199,8 @@ export async function restart(id) {
 // once (encoded into the QR's credentialed URL + shown as plaintext fallback).
 export async function share(id) {
   const rec = store.apps[id];
-  if (!rec || !state.pidAlive(rec.pid)) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
+  const alwaysOn = isHostConductorId(id);
+  if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
   if (!(await tunnel.available())) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;

@@ -57,6 +57,10 @@ Place a `.hub.json` at a project's root to make it servable:
 - code-hub only **reads** other projects and **runs their `start` command**; it never edits them.
 - Sharing publishes a running app to a public cloudflared URL, but **gated by HTTP Basic Auth** (username `hub` + a per-share random password); the link alone is not enough. TLS is terminated by Cloudflare, so credentials are encrypted in transit. Credentials are in-memory only and a share does not survive a code-hub restart (re-share for a fresh URL).
 
+## Running under code-conductor
+
+code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
+
 ## Testing
 
 ```sh
