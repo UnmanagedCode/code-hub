@@ -66,10 +66,13 @@ async function persist() {
   await state.save(store);
 }
 
-// Embed Basic-Auth creds into a share URL, whatever its scheme (tunnel is
-// https, LAN is plain http).
-function withCreds(url, username, password) {
-  return url.replace(/^https?:\/\//, (m) => `${m}${encodeURIComponent(username)}:${encodeURIComponent(password)}@`);
+// Append the share token as a query param so opening/scanning the link
+// exchanges it for an httpOnly cookie server-side (see authproxy.js) — no
+// credentials ever appear in the URL or QR. Handles a URL that may already
+// carry a query string.
+function withToken(url, token) {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}__hubauth=${encodeURIComponent(token)}`;
 }
 
 // Merge discoverable apps (main checkouts + worktrees with a `.hub.json`)
@@ -199,14 +202,16 @@ export async function restart(id) {
   return start(id);
 }
 
-// Share a running app behind a Basic-Auth reverse proxy. Two modes:
+// Share a running app behind a local auth proxy. Two modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
-//   so the public *.trycloudflare.com URL requires credentials.
+//   so the public *.trycloudflare.com URL goes through it.
 // - 'lan': the auth proxy itself binds 0.0.0.0 instead of loopback, so other
 //   devices on the local network can reach it directly — no cloudflared.
-// Either way the password is freshly generated per share, kept in memory
-// only, and returned once (encoded into the QR's credentialed URL + shown as
-// plaintext fallback).
+// Either way, a fresh token + password are generated per share, kept in
+// memory only. The QR/authUrl carries the token (opening it exchanges the
+// token for an httpOnly session cookie server-side — no credentials ever
+// appear in the URL); username/password remain available as a Basic-Auth
+// fallback for curl/API clients and are shown once as plaintext.
 export async function share(id, { mode = 'tunnel' } = {}) {
   if (mode !== 'tunnel' && mode !== 'lan') {
     const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
@@ -224,7 +229,7 @@ export async function share(id, { mode = 'tunnel' } = {}) {
     const url = urls[0] ?? `http://localhost:${proxy.port}`; // no LAN interface found
     rec.tunnel = { kind: 'lan', url, urls, pid: null, username: proxy.username, proxyPort: proxy.port };
     await persist();
-    const authUrl = withCreds(url, proxy.username, proxy.password);
+    const authUrl = withToken(url, proxy.token);
     return { kind: 'lan', url, urls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
   }
 
@@ -246,7 +251,7 @@ export async function share(id, { mode = 'tunnel' } = {}) {
   rec.tunnel = { kind: 'tunnel', url, pid, username: proxy.username, proxyPort: proxy.port };
   await persist();
 
-  const authUrl = withCreds(url, proxy.username, proxy.password);
+  const authUrl = withToken(url, proxy.token);
   return { kind: 'tunnel', url, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
 }
 

@@ -139,8 +139,9 @@ function sharePanel(app) {
   if (!shared) return null;
 
   // Credentials (username + password) come only from the one-time share
-  // response held in state.share; the QR/Open use the credentialed authUrl so
-  // scanning/opening auto-authenticates. Fall back to the plain URL otherwise.
+  // response held in state.share; the QR/Open use the token-bearing authUrl —
+  // scanning/opening it exchanges the token for a session cookie server-side,
+  // no credentials ever appear in the URL. Fall back to the plain URL otherwise.
   const openUrl = (s && s.authUrl) || shared.url;
   const kind = (s && s.kind) || shared.kind || 'tunnel';
   const panel = el('div', { class: 'share' });

@@ -20,7 +20,7 @@ const basic = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString
 
 // Raw WS-upgrade handshake over a bare TCP socket. Resolves with the status
 // line and, on a 101, whether the payload we sent was echoed back.
-function rawUpgrade(port, authHeader, payload = 'PING') {
+function rawUpgrade(port, authHeader, payload = 'PING', cookieHeader = null) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(port, '127.0.0.1', () => {
       const lines = [
@@ -29,6 +29,7 @@ function rawUpgrade(port, authHeader, payload = 'PING') {
         'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version: 13',
       ];
       if (authHeader) lines.push(`Authorization: ${authHeader}`);
+      if (cookieHeader) lines.push(`Cookie: ${cookieHeader}`);
       sock.write(lines.join('\r\n') + '\r\n\r\n');
     });
     let buf = '', sent = false;
@@ -82,6 +83,48 @@ test('gates and forwards WebSocket upgrades', async (t) => {
   assert.equal(good.echoed, true); // bytes round-tripped through the authed tunnel
 });
 
+test('token in the query sets a cookie and redirects, stripping only __hubauth', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port);
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const res = await fetch(
+    `http://127.0.0.1:${proxy.port}/some/path?__hubauth=${proxy.token}&keep=1`,
+    { redirect: 'manual' },
+  );
+  assert.equal(res.status, 302);
+  const setCookie = res.headers.get('set-cookie') || '';
+  assert.match(setCookie, /^hub_auth=[^;]+; Path=\/; HttpOnly; SameSite=Lax$/);
+  assert.equal(res.headers.get('location'), '/some/path?keep=1');
+});
+
+test('cookie obtained via token exchange authenticates subsequent HTTP requests', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port);
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const exchange = await fetch(`http://127.0.0.1:${proxy.port}/?__hubauth=${proxy.token}`, { redirect: 'manual' });
+  const cookie = (exchange.headers.get('set-cookie') || '').split(';')[0]; // "hub_auth=<secret>"
+  assert.match(cookie, /^hub_auth=.+/);
+
+  const ok = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { cookie } }); // no Authorization
+  assert.equal(ok.status, 200);
+  assert.equal(await ok.text(), 'ok');
+});
+
+test('cookie obtained via token exchange authenticates a WS upgrade', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port);
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const exchange = await fetch(`http://127.0.0.1:${proxy.port}/?__hubauth=${proxy.token}`, { redirect: 'manual' });
+  const cookie = (exchange.headers.get('set-cookie') || '').split(';')[0];
+
+  const good = await rawUpgrade(proxy.port, null, 'PING', cookie);
+  assert.match(good.statusLine, /101/);
+  assert.equal(good.echoed, true); // bytes round-tripped through the cookie-authed tunnel
+});
+
 test('close() stops the proxy listening', async (t) => {
   const up = await upstream();
   const proxy = await startAuthProxy(up.port);
@@ -103,7 +146,7 @@ test('binds to a custom host (0.0.0.0) while still reachable via 127.0.0.1', asy
   assert.equal(await ok.text(), 'ok');
 });
 
-test('generates a strong random password per share', async (t) => {
+test('generates a strong random password and token per share', async (t) => {
   const up = await upstream();
   const p1 = await startAuthProxy(up.port);
   const p2 = await startAuthProxy(up.port);
@@ -111,4 +154,6 @@ test('generates a strong random password per share', async (t) => {
   assert.equal(p1.username, 'hub');
   assert.ok(p1.password.length >= 20);
   assert.notEqual(p1.password, p2.password);
+  assert.ok(p1.token.length >= 20);
+  assert.notEqual(p1.token, p2.token);
 });
