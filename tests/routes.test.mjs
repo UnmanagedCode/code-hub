@@ -137,7 +137,7 @@ test('share stands up a Basic-Auth proxy; unshare tears it down', async (t) => {
   assert.equal(res.status, 200);
   assert.equal(res.body.username, 'hub');
   assert.ok(res.body.password.length >= 20);
-  assert.match(res.body.authUrl, /^https:\/\/hub:.+@.+trycloudflare\.com/);
+  assert.match(res.body.authUrl, /^https:\/\/.+\.trycloudflare\.com\?__hubauth=[\w-]+$/);
   assert.match(res.body.qrSvg, /<svg/);
 
   // list() exposes username + proxyPort, never the password.
@@ -173,7 +173,7 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
   assert.equal(res.status, 200);
   assert.equal(res.body.kind, 'lan');
-  assert.match(res.body.authUrl, /^http:\/\//);
+  assert.match(res.body.authUrl, /^http:\/\/.+\?__hubauth=[\w-]+$/);
   assert.equal(res.body.username, 'hub');
   assert.ok(Array.isArray(res.body.urls));
 
