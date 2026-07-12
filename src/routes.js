@@ -19,7 +19,7 @@ export function buildRoutes() {
   r.post('/apps/:id/start', wrap((req) => appManager.start(req.params.id)));
   r.post('/apps/:id/stop', wrap((req) => appManager.stop(req.params.id)));
   r.post('/apps/:id/restart', wrap((req) => appManager.restart(req.params.id)));
-  r.post('/apps/:id/share', wrap((req) => appManager.share(req.params.id)));
+  r.post('/apps/:id/share', wrap((req) => appManager.share(req.params.id, { mode: req.body?.mode })));
   r.delete('/apps/:id/share', wrap((req) => appManager.unshare(req.params.id)));
 
   // MCP tool-call bridge for code-conductor: unlike wrap()'s statusCode

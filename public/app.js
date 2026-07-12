@@ -17,7 +17,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited', expanded: new Set() }; // share: id → {url,...} | 'loading' | {error}; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -122,7 +122,18 @@ function credRow(label, value) {
 
 function sharePanel(app) {
   const s = state.share[app.id];
-  if (s === 'loading') return el('div', { class: 'share' }, el('span', { class: 'spinner' }, 'Creating tunnel…'));
+  if (s && s.choosing) {
+    return el('div', { class: 'share' }, el('div', { class: 'share-actions' },
+      el('button', { onclick: () => doShare(app, 'lan') }, 'Share on LAN'),
+      el('button', {
+        disabled: !state.cloudflaredAvailable,
+        title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
+        onclick: () => doShare(app, 'tunnel'),
+      }, 'Share via Tunnel'),
+      el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
+    ));
+  }
+  if (s === 'loading') return el('div', { class: 'share' }, el('span', { class: 'spinner' }, 'Sharing…'));
   const shared = app.tunnel || (s && s.url ? s : null);
   if (s && s.error) return el('div', { class: 'share' }, el('div', { class: 'err' }, s.error));
   if (!shared) return null;
@@ -131,8 +142,16 @@ function sharePanel(app) {
   // response held in state.share; the QR/Open use the credentialed authUrl so
   // scanning/opening auto-authenticates. Fall back to the plain URL otherwise.
   const openUrl = (s && s.authUrl) || shared.url;
+  const kind = (s && s.kind) || shared.kind || 'tunnel';
   const panel = el('div', { class: 'share' });
   panel.appendChild(el('div', { class: 'share-url' }, shared.url));
+  panel.appendChild(el('div', { class: 'cred-note' },
+    kind === 'lan' ? 'via LAN (plain HTTP — credentials are not encrypted in transit)' : 'via public tunnel'));
+
+  if (shared.urls && shared.urls.length > 1) {
+    panel.appendChild(el('div', { class: 'lan-links' },
+      ...shared.urls.slice(1).map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
+  }
 
   if (s && s.username && s.password) {
     panel.appendChild(el('div', { class: 'creds' },
@@ -140,7 +159,7 @@ function sharePanel(app) {
       credRow('pass', s.password),
     ));
   } else if (shared.username) {
-    // Tunnel active but password not in memory (e.g. after a UI reload).
+    // Share active but password not in memory (e.g. after a UI reload).
     panel.appendChild(el('div', { class: 'creds' },
       credRow('user', shared.username),
       el('div', { class: 'cred-note' }, 'Re-share to reveal the password.'),
@@ -186,19 +205,21 @@ function controls(app) {
         onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
     }
     row.appendChild(el('button', {
-      disabled: isBusy || !state.cloudflaredAvailable || !!app.tunnel,
-      title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
-      onclick: () => shareApp(app),
+      disabled: isBusy || !!app.tunnel,
+      onclick: () => { state.share[app.id] = { choosing: true }; render(); },
     }, app.tunnel ? 'Shared' : 'Share'));
   }
   return row;
 }
 
-async function shareApp(app) {
+async function doShare(app, mode) {
   state.share[app.id] = 'loading';
   render();
   try {
-    const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`);
+    const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`, {
+      body: JSON.stringify({ mode }),
+      headers: { 'content-type': 'application/json' },
+    });
     state.share[app.id] = res;
   } catch (e) {
     state.share[app.id] = { error: e.message };

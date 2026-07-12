@@ -23,12 +23,16 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
 | `POST /api/apps/:id/start` | — | running record |
 | `POST /api/apps/:id/stop` | — | `{ id, status: "stopped" }` |
 | `POST /api/apps/:id/restart` | — | running record |
-| `POST /api/apps/:id/share` | — | `{ url, authUrl, username, password, qrSvg }` (or `501` if cloudflared absent) |
+| `POST /api/apps/:id/share` | `{ mode?: "tunnel"\|"lan" }` (default `"tunnel"`) | `{ kind, url, urls?, authUrl, username, password, qrSvg }` (`400` bad mode, `409` not running, `501` `tunnel` mode when cloudflared absent) |
 | `DELETE /api/apps/:id/share` | — | `{ id, tunnel: null }` |
 
 `id` is the served directory basename (unique across the projects root; a worktree's id is its `<project>_worktree_<hash>` dir name).
 
-**Shares are Basic-Auth protected.** `share` stands up a local reverse proxy (fresh free port, loopback-only) enforcing HTTP Basic Auth — username `hub` + a CSPRNG password generated per share — and points cloudflared at the proxy instead of the app. The proxy forwards authenticated HTTP **and WebSocket upgrades** to `http://localhost:<appPort>`. Response fields: `url` (clean public URL), `authUrl` = `https://<user>:<pass>@<host>` (**the QR encodes this** for scan-to-auth), `username`, `password` (returned once — **in-memory only, never persisted or logged**), `qrSvg`. Torn down on `unshare`/`stop`/`restart`. A share does **not** survive a code-hub restart: on startup any orphaned tunnel is torn down (its in-process proxy is gone) and the app needs re-sharing.
+**Shares are Basic-Auth protected, in either mode.** `share` stands up a local reverse proxy (fresh free port) enforcing HTTP Basic Auth — username `hub` + a CSPRNG password generated per share — that forwards authenticated HTTP **and WebSocket upgrades** to `http://localhost:<appPort>`.
+- `mode: "tunnel"` (default): the proxy binds loopback-only and cloudflared points at it, publishing `https://<sub>.trycloudflare.com`. `501` if `cloudflared` isn't installed.
+- `mode: "lan"`: the proxy binds `0.0.0.0` instead — no cloudflared involved. `url` is the machine's first non-loopback LAN IPv4 URL (falls back to a `localhost` URL if the host has no LAN interface); `urls` lists every LAN IPv4 URL found (secondary devices can try an alternate if the primary is unreachable, e.g. a Docker bridge address). **Plain HTTP — no TLS**, so credentials cross the LAN in cleartext.
+
+Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), `urls` (LAN mode only — all candidate URLs), `authUrl` = `<scheme>://<user>:<pass>@<host>` (**the QR encodes this** for scan-to-auth), `username`, `password` (returned once — **in-memory only, never persisted or logged**), `qrSvg`. Torn down on `unshare`/`stop`/`restart`. A share does **not** survive a code-hub restart, in either mode: on startup any orphaned share record is cleared (its in-process proxy is gone) and the app needs re-sharing.
 
 ### `App` shape (from `GET /api/apps`)
 
@@ -52,7 +56,7 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
     { "name": "Main game", "path": "/", "urls": ["http://localhost:41051", "..."] },
     { "name": "Terrain editor", "path": "/terrain-editor.html", "urls": ["http://localhost:41051/terrain-editor.html", "..."] }
   ],
-  "tunnel": { "url": "https://x.trycloudflare.com", "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here
+  "tunnel": { "kind": "tunnel", "url": "https://x.trycloudflare.com", "urls": null, "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here. kind: "lan" → urls lists all LAN IPv4 URLs
   "error": null,                // crash tail / manifest error, when present
   "alwaysOn": false             // true only for the host code-conductor when code-hub runs embedded as its plugin
 }
@@ -64,7 +68,7 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
 
 ### Errors
 
-Non-2xx responses are `{ error: string }`. Status codes: `400` (bad manifest), `404` (unknown/not-running app), `409` (already running / not running for share), `501` (cloudflared not installed), `500` (unexpected). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
+Non-2xx responses are `{ error: string }`. Status codes: `400` (bad manifest, or an invalid `share` `mode`), `404` (unknown/not-running app), `409` (already running / not running for share), `501` (`tunnel`-mode share when cloudflared is absent), `500` (unexpected). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
 
 ## MCP API (`POST /api/mcp`)
 

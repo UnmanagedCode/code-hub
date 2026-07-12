@@ -160,6 +160,80 @@ test('share stands up a Basic-Auth proxy; unshare tears it down', async (t) => {
   await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
 });
 
+test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  process.env.CODEHUB_CLOUDFLARED_BIN = '/nonexistent/cloudflared'; // prove no cloudflared dependency
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin; });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.kind, 'lan');
+  assert.match(res.body.authUrl, /^http:\/\//);
+  assert.equal(res.body.username, 'hub');
+  assert.ok(Array.isArray(res.body.urls));
+
+  // list() exposes kind/urls, never the password.
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.kind, 'lan');
+  assert.ok(Array.isArray(app.tunnel.urls));
+  assert.equal(app.tunnel.password, undefined);
+
+  // The proxy (bound 0.0.0.0) is reachable + auth-gated over loopback.
+  const pp = app.tunnel.proxyPort;
+  const noauth = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(noauth.status, 401);
+  const authed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+
+  // unshare tears down a LAN share same as a tunnel share.
+  await j(base, 'DELETE', '/api/apps/app/share');
+  await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
+});
+
+test('share with an invalid mode → 400', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'bogus' });
+  assert.equal(res.status, 400);
+});
+
+test('init tears down a LAN share orphaned by a code-hub restart (pid: null)', async (t) => {
+  const root = await mkRoot();
+  // Stand-in for the app process only — a LAN share has no cloudflared child.
+  const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(async () => {
+    try { process.kill(-appChild.pid, 'SIGKILL'); } catch { /* gone */ }
+    await rmRoot(root);
+  });
+
+  const store = { apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: appChild.pid, pgid: appChild.pid, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { kind: 'lan', url: 'http://192.0.2.1:5001', pid: null, username: 'hub', proxyPort: 5001, urls: ['http://192.0.2.1:5001'] },
+  } } };
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify(store));
+
+  await appManager.init(); // simulates a fresh code-hub after restart
+
+  const { apps } = await appManager.list();
+  const demo = apps.find((a) => a.id === 'demo');
+  assert.ok(demo, 'app with a live pid is kept');
+  assert.equal(demo.tunnel, null, 'LAN share is cleared → Share reappears');
+  assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
+});
+
 test('init tears down a share orphaned by a code-hub restart (needs-reshare)', async (t) => {
   const root = await mkRoot();
   // Two detached, own-group children: one stands in for the app process (stays

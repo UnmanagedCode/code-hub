@@ -66,6 +66,12 @@ async function persist() {
   await state.save(store);
 }
 
+// Embed Basic-Auth creds into a share URL, whatever its scheme (tunnel is
+// https, LAN is plain http).
+function withCreds(url, username, password) {
+  return url.replace(/^https?:\/\//, (m) => `${m}${encodeURIComponent(username)}:${encodeURIComponent(password)}@`);
+}
+
 // Merge discoverable apps (main checkouts + worktrees with a `.hub.json`)
 // with running records. A running app whose source dir has since been removed
 // still appears, flagged sourceMissing, so it can be stopped.
@@ -83,7 +89,7 @@ export async function list() {
 
     if (rec) {
       port = rec.port; urls = rec.urls; startedSha = rec.startedSha;
-      tunnelInfo = rec.tunnel ? { url: rec.tunnel.url, username: rec.tunnel.username ?? null, proxyPort: rec.tunnel.proxyPort ?? null } : null;
+      tunnelInfo = rec.tunnel ? { url: rec.tunnel.url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null, username: rec.tunnel.username ?? null, proxyPort: rec.tunnel.proxyPort ?? null } : null;
       if (isHostConductorId(base.id)) {
         status = 'running'; // host code-conductor: always on, no pid/runtime to track
       } else {
@@ -193,14 +199,35 @@ export async function restart(id) {
   return start(id);
 }
 
-// Share a running app behind a Basic-Auth reverse proxy: cloudflared points at
-// the auth proxy (not the app), so the public URL requires credentials. The
-// password is freshly generated per share, kept in memory only, and returned
-// once (encoded into the QR's credentialed URL + shown as plaintext fallback).
-export async function share(id) {
+// Share a running app behind a Basic-Auth reverse proxy. Two modes:
+// - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
+//   so the public *.trycloudflare.com URL requires credentials.
+// - 'lan': the auth proxy itself binds 0.0.0.0 instead of loopback, so other
+//   devices on the local network can reach it directly — no cloudflared.
+// Either way the password is freshly generated per share, kept in memory
+// only, and returned once (encoded into the QR's credentialed URL + shown as
+// plaintext fallback).
+export async function share(id, { mode = 'tunnel' } = {}) {
+  if (mode !== 'tunnel' && mode !== 'lan') {
+    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
+  }
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
   if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
+
+  if (mode === 'lan') {
+    teardownShare(id, rec); // replace any existing share
+    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0' });
+    proxies.set(id, proxy);
+    // Drop the loopback entry — it's not reachable from another device.
+    const urls = enumerateUrls(proxy.port).filter((u) => !u.startsWith('http://localhost:'));
+    const url = urls[0] ?? `http://localhost:${proxy.port}`; // no LAN interface found
+    rec.tunnel = { kind: 'lan', url, urls, pid: null, username: proxy.username, proxyPort: proxy.port };
+    await persist();
+    const authUrl = withCreds(url, proxy.username, proxy.password);
+    return { kind: 'lan', url, urls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+  }
+
   if (!(await tunnel.available())) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
@@ -216,11 +243,11 @@ export async function share(id) {
     throw e;
   }
   proxies.set(id, proxy);
-  rec.tunnel = { url, pid, username: proxy.username, proxyPort: proxy.port };
+  rec.tunnel = { kind: 'tunnel', url, pid, username: proxy.username, proxyPort: proxy.port };
   await persist();
 
-  const authUrl = url.replace('https://', `https://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@`);
-  return { url, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+  const authUrl = withCreds(url, proxy.username, proxy.password);
+  return { kind: 'tunnel', url, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
 }
 
 export async function unshare(id) {
