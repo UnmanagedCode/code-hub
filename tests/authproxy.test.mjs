@@ -90,6 +90,19 @@ test('close() stops the proxy listening', async (t) => {
   await assert.rejects(fetch(`http://127.0.0.1:${proxy.port}/`));
 });
 
+test('binds to a custom host (0.0.0.0) while still reachable via 127.0.0.1', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { host: '0.0.0.0' });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const bad = await fetch(`http://127.0.0.1:${proxy.port}/`);
+  assert.equal(bad.status, 401);
+
+  const ok = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { authorization: basic(proxy.username, proxy.password) } });
+  assert.equal(ok.status, 200);
+  assert.equal(await ok.text(), 'ok');
+});
+
 test('generates a strong random password per share', async (t) => {
   const up = await upstream();
   const p1 = await startAuthProxy(up.port);

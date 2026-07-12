@@ -45,7 +45,9 @@ function rawHeaderLines(rawHeaders) {
 // Start an auth proxy in front of `targetPort`. Resolves once it is listening.
 // Returns { port, username, password, close() }. Credentials are generated
 // with a CSPRNG per call and held in memory only (never logged/persisted).
-export function startAuthProxy(targetPort, { username = 'hub' } = {}) {
+// `host` defaults to loopback-only (cloudflared share); a LAN share passes
+// '0.0.0.0' so other devices on the network can reach the proxy directly.
+export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1' } = {}) {
   const password = crypto.randomBytes(18).toString('base64url');
   const expected = `${username}:${password}`;
   const sockets = new Set();
@@ -95,7 +97,7 @@ export function startAuthProxy(targetPort, { username = 'hub' } = {}) {
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, host, () => {
       server.removeListener('error', reject);
       resolve({
         port: server.address().port,
