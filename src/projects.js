@@ -152,15 +152,58 @@ export async function writeRegistry(obj) {
   await fs.rename(tmp, file);
 }
 
+// Resolve one dir's manifest via the standard precedence: its own
+// `.hub.json`, else its own in-memory registration, else its own disk
+// registration. `name` is the registration lookup key (normally the dir's
+// own basename; discoverApps() also calls this with a worktree's PARENT
+// name/dir, so error labels correctly name the parent, not the worktree).
+// Returns exactly one of:
+//   { manifest, source, error: null }              found and valid
+//   { manifest: null, source, error }               found but broken
+//   { manifest: null, source: null, error: null }   nothing at this dir
+async function resolveManifestSource(name, dir, registry) {
+  try {
+    const manifest = await readManifest(dir);
+    if (manifest) return { manifest, source: 'manifest', error: null };
+  } catch (error) {
+    return { manifest: null, source: 'manifest', error };
+  }
+  if (inMemoryRegistrations.has(name)) {
+    try {
+      const manifest = validateManifestObject(inMemoryRegistrations.get(name), `in-memory#${name}`);
+      return { manifest, source: 'memory', error: null };
+    } catch (error) {
+      return { manifest: null, source: 'memory', error };
+    }
+  }
+  if (registry[name]) {
+    try {
+      const manifest = validateManifestObject(registry[name], `${REGISTRY_FILENAME}#${name}`);
+      return { manifest, source: 'registry', error: null };
+    } catch (error) {
+      return { manifest: null, source: 'registry', error };
+    }
+  }
+  return { manifest: null, source: null, error: null };
+}
+
 // Scan the projects root for servable apps. A directory is servable when it
 // contains a `.hub.json`, has a machine-local entry in registrations.json, or
 // has a process-lifetime in-memory registration (each only consulted when the
 // dir has no `.hub.json` at all — a real manifest, even a broken one, always
 // wins; in-memory wins over disk on id collision). Main checkouts and
 // worktree dirs both surface; worktrees carry `{ isWorktree: true, project,
-// branch }` so the UI can nest them under their parent. `id` is the directory
-// basename (unique across the root). Dot-prefixed dirs (the store itself) are
-// skipped. Each app carries `source: 'manifest' | 'registry' | 'memory'`.
+// branch }` so the UI can nest them under their parent. A worktree with none
+// of its own (no `.hub.json`, no own registration) inherits its PARENT
+// project's manifest/source instead of being hidden — needed for worktrees
+// of a project whose manifest is only an in-memory or disk registration
+// (e.g. the host code-conductor when embedded), since git carries a tracked
+// `.hub.json` into every worktree checkout but a registration never does. A
+// missing or broken parent manifest is never inherited and never surfaces as
+// an error on the worktree — it's just skipped, same as having no manifest
+// at all. `id` is the directory basename (unique across the root).
+// Dot-prefixed dirs (the store itself) are skipped. Each app carries
+// `source: 'manifest' | 'registry' | 'memory'`.
 export async function discoverApps() {
   const root = projectsRoot();
   let entries;
@@ -172,45 +215,48 @@ export async function discoverApps() {
   }
   const dirNames = new Set(entries.filter((e) => e.isDirectory()).map((e) => e.name));
   const registry = await readRegistry();
+
+  // Memoizes each distinct dir name's resolution at most once, whether it's
+  // reached as a dir's own row or as a sibling worktree's parent fallback.
+  const resolved = new Map();
+  const resolve = async (name) => {
+    if (!resolved.has(name)) {
+      resolved.set(name, await resolveManifestSource(name, path.join(root, name), registry));
+    }
+    return resolved.get(name);
+  };
+
   const out = [];
   for (const e of entries) {
     if (!e.isDirectory() || e.name.startsWith('.')) continue;
     const dir = path.join(root, e.name);
-    let manifest;
-    let source = 'manifest';
-    try {
-      manifest = await readManifest(dir);
-    } catch (err) {
-      // Surface the broken manifest as a non-startable app rather than
-      // hiding the whole project — fail loudly, not silently.
-      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message, source });
+
+    const res = await resolve(e.name);
+    if (res.error) {
+      // Surface the broken manifest/registration as a non-startable app
+      // rather than hiding the whole project — fail loudly, not silently.
+      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: res.error.message, source: res.source });
       continue;
     }
-    if (!manifest) {
-      let regEntry, regFile;
-      if (inMemoryRegistrations.has(e.name)) {
-        regEntry = inMemoryRegistrations.get(e.name);
-        source = 'memory';
-        regFile = `in-memory#${e.name}`;
-      } else if (registry[e.name]) {
-        regEntry = registry[e.name];
-        source = 'registry';
-        regFile = `${REGISTRY_FILENAME}#${e.name}`;
-      } else {
-        continue;
-      }
-      try {
-        manifest = validateManifestObject(regEntry, regFile);
-      } catch (err) {
-        out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message, source });
-        continue;
-      }
-    }
+
+    let manifest = res.manifest;
+    let source = res.source;
     const wt = WORKTREE_RE.exec(e.name);
     // Only treat as a worktree when a matching parent project dir exists,
     // so a legitimately-named project isn't misclassified.
-    if (wt && dirNames.has(wt[1])) {
-      out.push({ id: e.name, project: wt[1], path: dir, isWorktree: true, branch: null, manifest, manifestError: null, source });
+    const parentName = (wt && dirNames.has(wt[1])) ? wt[1] : null;
+
+    if (!manifest && parentName) {
+      const parentRes = await resolve(parentName);
+      if (parentRes.manifest) {
+        manifest = parentRes.manifest;
+        source = parentRes.source;
+      }
+    }
+    if (!manifest) continue;
+
+    if (parentName) {
+      out.push({ id: e.name, project: parentName, path: dir, isWorktree: true, branch: null, manifest, manifestError: null, source });
     } else {
       out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest, manifestError: null, source });
     }
