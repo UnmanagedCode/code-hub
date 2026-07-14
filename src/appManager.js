@@ -280,8 +280,8 @@ async function hasManifestFile(dir) {
 // that already has a `.hub.json` — even a broken one — needs no registration
 // and is rejected outright; it always wins over any registry entry.
 export async function registerApp({ id, start, name, healthPath, readyWhen, routes } = {}) {
-  if (typeof id !== 'string' || id.length === 0 || id.startsWith('.')) {
-    const e = new Error('id is required and must be a non-empty, non-dot-prefixed directory name'); e.statusCode = 400; throw e;
+  if (typeof id !== 'string' || id.length === 0 || id.startsWith('.') || path.basename(id) !== id) {
+    const e = new Error('id is required and must be a plain, non-dot-prefixed directory basename (no path separators)'); e.statusCode = 400; throw e;
   }
   const dir = path.join(projectsRoot(), id);
   let stat;

@@ -26,6 +26,21 @@ test('registerApp: rejects a missing id', async (t) => {
   await assert.rejects(() => appManager.registerApp({ start: 'x' }), /id is required/);
 });
 
+test('registerApp: rejects an id containing a path separator', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'foo', null);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'foo/bar', start: 'npm start' }),
+    /plain, non-dot-prefixed directory basename/,
+  );
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'foo/', start: 'npm start' }),
+    /plain, non-dot-prefixed directory basename/,
+  );
+});
+
 test('registerApp: rejects an id that is not an existing directory', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
