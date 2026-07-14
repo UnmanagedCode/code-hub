@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
+import { unregisterInMemory } from '../src/projects.js';
 import { mkRoot, rmRoot, mkProject, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
 
 async function bootFakeConductor() {
@@ -38,6 +39,7 @@ test('embedded: host code-conductor is always-on (share works, start/stop blocke
   t.after(async () => {
     delete process.env.CONDUCTOR_PLUGIN_ID;
     delete process.env.CONDUCTOR_URL;
+    unregisterInMemory('code-conductor');
     await appManager.stop('code-conductor_worktree_ab12cd').catch(() => {});
     server.close();
     conductorSrv.close();
@@ -108,4 +110,33 @@ test('standalone (no CONDUCTOR_* env vars): a project literally named code-condu
 
   res = await j(base, 'POST', '/api/apps/code-conductor/stop');
   assert.equal(res.status, 200);
+});
+
+test('embedded, no .hub.json on the conductor dir: init() still surfaces it via an in-memory registration, not sourceMissing', async (t) => {
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  await mkProject(root, 'code-conductor', null); // no .hub.json — the deleted-manifest scenario
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.status, 'running');
+  assert.equal(main.alwaysOn, true);
+  assert.equal(main.port, conductorPort);
+  assert.equal(main.sourceMissing, false);
+  assert.equal(main.error, null);
 });

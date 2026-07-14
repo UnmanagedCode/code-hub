@@ -99,6 +99,23 @@ export function registryFile() {
   return path.join(storeRoot(), REGISTRY_FILENAME);
 }
 
+// Process-lifetime-only registrations (id -> manifest body), never persisted.
+// Used to synthesize a manifest for a dir that has no `.hub.json` and no disk
+// registration — currently just the host code-conductor when embedded (see
+// appManager.js init()). Kept fully separate from readRegistry()/writeRegistry()
+// so it can never leak into registrations.json.
+const inMemoryRegistrations = new Map();
+
+export function registerInMemory(id, body) {
+  const manifest = validateManifestObject(body, `in-memory#${id}`);
+  inMemoryRegistrations.set(id, body);
+  return manifest;
+}
+
+export function unregisterInMemory(id) {
+  inMemoryRegistrations.delete(id);
+}
+
 // Machine-local registrations: an id -> manifest-body map for sibling dirs
 // that have no `.hub.json` of their own. Never overrides a real manifest —
 // see discoverApps() below. Whole-file corruption warns and is treated as an
@@ -136,13 +153,14 @@ export async function writeRegistry(obj) {
 }
 
 // Scan the projects root for servable apps. A directory is servable when it
-// contains a `.hub.json`, or has a machine-local entry in registrations.json
-// (only consulted when the dir has no `.hub.json` at all — a real manifest,
-// even a broken one, always wins). Main checkouts and worktree dirs both
-// surface; worktrees carry `{ isWorktree: true, project, branch }` so the UI
-// can nest them under their parent. `id` is the directory basename (unique
-// across the root). Dot-prefixed dirs (the store itself) are skipped. Each
-// app carries `source: 'manifest' | 'registry'`.
+// contains a `.hub.json`, has a machine-local entry in registrations.json, or
+// has a process-lifetime in-memory registration (each only consulted when the
+// dir has no `.hub.json` at all — a real manifest, even a broken one, always
+// wins; in-memory wins over disk on id collision). Main checkouts and
+// worktree dirs both surface; worktrees carry `{ isWorktree: true, project,
+// branch }` so the UI can nest them under their parent. `id` is the directory
+// basename (unique across the root). Dot-prefixed dirs (the store itself) are
+// skipped. Each app carries `source: 'manifest' | 'registry' | 'memory'`.
 export async function discoverApps() {
   const root = projectsRoot();
   let entries;
@@ -169,11 +187,20 @@ export async function discoverApps() {
       continue;
     }
     if (!manifest) {
-      const regEntry = registry[e.name];
-      if (!regEntry) continue;
-      source = 'registry';
+      let regEntry, regFile;
+      if (inMemoryRegistrations.has(e.name)) {
+        regEntry = inMemoryRegistrations.get(e.name);
+        source = 'memory';
+        regFile = `in-memory#${e.name}`;
+      } else if (registry[e.name]) {
+        regEntry = registry[e.name];
+        source = 'registry';
+        regFile = `${REGISTRY_FILENAME}#${e.name}`;
+      } else {
+        continue;
+      }
       try {
-        manifest = validateManifestObject(regEntry, `${REGISTRY_FILENAME}#${e.name}`);
+        manifest = validateManifestObject(regEntry, regFile);
       } catch (err) {
         out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message, source });
         continue;
@@ -188,7 +215,8 @@ export async function discoverApps() {
       out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest, manifestError: null, source });
     }
   }
-  for (const key of Object.keys(registry)) {
+  const regKeys = new Set([...Object.keys(registry), ...inMemoryRegistrations.keys()]);
+  for (const key of regKeys) {
     if (!dirNames.has(key)) {
       console.warn(`[code-hub] ${REGISTRY_FILENAME}: '${key}' has no matching directory under the projects root, ignoring`);
     }

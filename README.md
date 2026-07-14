@@ -66,6 +66,8 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 
 code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`/`register_app`/`unregister_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
 
+When embedded, code-hub registers the host `code-conductor` checkout itself via an **internal, process-lifetime-only registration** (never persisted, not exposed via `register_app`) so it shows up as an always-on app without needing a `.hub.json` of its own. Running code-hub standalone (no `CONDUCTOR_*` env vars), `code-conductor` doesn't show up at all unless separately given a `.hub.json` or a machine-local registration.
+
 ## Testing
 
 ```sh

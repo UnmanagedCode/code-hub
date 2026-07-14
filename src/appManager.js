@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
   discoverApps, projectsRoot, MANIFEST_FILENAME,
-  validateManifestObject, readRegistry, writeRegistry,
+  validateManifestObject, readRegistry, writeRegistry, registerInMemory,
 } from './projects.js';
 import * as state from './state.js';
 import * as runner from './runner.js';
@@ -39,8 +39,11 @@ export async function init() {
   // id to treat it as always-on instead of an ordinary app. It has no real
   // pid, so state.reconcile() prunes it again on the next boot; we simply
   // re-synthesize it here every time, same as any other share not
-  // surviving a restart.
+  // surviving a restart. The conductor carries no `.hub.json` of its own, so
+  // register it in-memory (never persisted) before discovering — this is
+  // what makes discoverApps() find it at all.
   if (isEmbedded()) {
+    registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
     const discovered = await discoverApps();
     const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
     const port = hostConductorPort();
