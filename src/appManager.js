@@ -146,6 +146,7 @@ export async function list() {
       tunnel: tunnelInfo,
       error,
       alwaysOn: isHostConductorId(base.id) && !!rec,
+      source: base.source,
     };
   };
 

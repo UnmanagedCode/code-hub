@@ -4,7 +4,7 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 
 ## What it does
 
-- **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees). A sibling dir with no `.hub.json` can still be made startable via **machine-local registration** — see below.
+- **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees). A sibling dir with no `.hub.json` can still be made startable via **machine-local registration** — see below. A worktree with no manifest/registration of its own inherits its parent project's, so worktrees of a registration-only project (e.g. the embedded host `code-conductor`) still show up.
 - **Starts** an app: runs its `start` command as a child process with a free `PORT` injected, and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone. Apps can declare multiple named `routes` (e.g. a main page + an editor), each opened separately.
 - **Sorts by recency**: a flat card list sorted by **Last edited** (each app's last git commit date, shown as an "edited X ago" label), Name, or Status.
 - **Owns the lifecycle**: code-hub tracks the child's pid/process-group, so **Stop / Restart** work by killing that group — even if the project's source or worktree has since been deleted.

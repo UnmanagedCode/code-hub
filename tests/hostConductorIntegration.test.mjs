@@ -140,3 +140,34 @@ test('embedded, no .hub.json on the conductor dir: init() still surfaces it via 
   assert.equal(main.sourceMissing, false);
   assert.equal(main.error, null);
 });
+
+test('embedded, worktree with no .hub.json of its own inherits the host conductor\'s in-memory manifest', async (t) => {
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  await mkProject(root, 'code-conductor', null); // no .hub.json — init() registers it in-memory
+  await mkProject(root, 'code-conductor_worktree_ab12cd', null); // no .hub.json, no own registration
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  assert.ok(wt, 'worktree should be surfaced via parent in-memory-manifest inheritance');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'code-conductor');
+  assert.equal(wt.source, 'memory');
+  assert.equal(wt.alwaysOn, false);
+  assert.equal(wt.status, 'stopped');
+  assert.equal(wt.error, null);
+});

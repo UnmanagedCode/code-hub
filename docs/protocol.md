@@ -24,6 +24,10 @@ Robustness, mirroring `.hub.json`/`state.json` conventions: whole-file JSON that
 
 Same schema/validation as `registrations.json`, but held in a module-level `Map` (`registerInMemory`/`unregisterInMemory` in `src/projects.js`) instead of on disk — it is never read from or written to `registrations.json`. Precedence for a dir with no `.hub.json`: in-memory wins over a disk registry entry for the same id; a real `.hub.json` still wins over either. Apps sourced this way carry `source: "memory"`. Not exposed via `register_app`/`unregister_app` — those tools remain disk-only. Currently used for exactly one purpose: `appManager.init()` registers the host `code-conductor` checkout this way when code-hub runs embedded (see `docs/architecture.md`), since the conductor carries no `.hub.json` of its own.
 
+## Worktree manifest inheritance
+
+A worktree dir (`<project>_worktree_<hash>`, with a sibling `<project>` dir) is resolved with the same precedence as any other dir — its own `.hub.json`, then its own in-memory registration, then its own disk registration — all keyed by the worktree's own full directory name. Only when none of those exist for the worktree itself does it fall back to its **parent** project's manifest, resolved with that same precedence (parent's `.hub.json` → parent's in-memory registration → parent's disk registration), inheriting the parent's `source`. This is what lets worktrees of an in-memory-registered project (e.g. the host `code-conductor` when code-hub runs embedded, see `docs/architecture.md`) surface at all, since such a project has no `.hub.json` for git to carry into the worktree checkout. If the parent itself has no manifest source, or its own manifest source is broken, the worktree is not inherited into and is skipped entirely — a broken parent manifest never surfaces as an error on the worktree, and never fails discovery.
+
 ## HTTP API (`/api`, JSON)
 
 | Method + path | Body | Response |
@@ -69,13 +73,13 @@ Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), 
   "tunnel": { "kind": "tunnel", "url": "https://x.trycloudflare.com", "urls": null, "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here. kind: "lan" → urls lists all LAN IPv4 URLs
   "error": null,                // crash tail / manifest error, when present
   "alwaysOn": false,            // true only for the host code-conductor when code-hub runs embedded as its plugin
-  "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), or "memory" (in-memory registration)
+  "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), or "memory" (in-memory registration) — for a worktree with none of its own, reflects where its PARENT's manifest came from (see "Worktree manifest inheritance" above)
 }
 ```
 
 `urls` (top level) stays the list of base URLs (loopback + LAN IPs, no path). Each `routes[].urls` is those bases with the route `path` appended (`/` keeps the clean base form); populated only while the app is running.
 
-**`alwaysOn`.** When code-hub runs embedded as a code-conductor plugin (`CONDUCTOR_PLUGIN_ID` + `CONDUCTOR_URL` env vars present — see `docs/architecture.md`), the main `code-conductor` checkout is reported `alwaysOn: true, status: "running"` with no real pid to track, and `POST /api/apps/code-conductor/start`, `.../stop`, and `.../restart` all reply `409`. `POST .../share` still works — it targets the port parsed from `CONDUCTOR_URL`. This never applies to `code-conductor_worktree_*` dirs (always ordinary apps) or when running standalone.
+**`alwaysOn`.** When code-hub runs embedded as a code-conductor plugin (`CONDUCTOR_PLUGIN_ID` + `CONDUCTOR_URL` env vars present — see `docs/architecture.md`), the main `code-conductor` checkout is reported `alwaysOn: true, status: "running"` with no real pid to track, and `POST /api/apps/code-conductor/start`, `.../stop`, and `.../restart` all reply `409`. `POST .../share` still works — it targets the port parsed from `CONDUCTOR_URL`. This never applies to `code-conductor_worktree_*` dirs (always ordinary apps) or when running standalone — though such a worktree may now surface via manifest inheritance from the parent even when it carries no `.hub.json`/registration of its own (see "Worktree manifest inheritance").
 
 ### Errors
 

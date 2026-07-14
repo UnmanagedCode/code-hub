@@ -214,3 +214,129 @@ test('an in-memory registration key with no matching directory warns as orphaned
   const apps = await discoverApps();
   assert.ok(!apps.find((a) => a.id === 'ghost-mem'));
 });
+
+test('a worktree with no manifest of its own inherits its parent\'s .hub.json', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'from-parent-manifest' });
+  await mkProject(root, 'alpha_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'alpha_worktree_ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'alpha');
+  assert.equal(wt.source, 'manifest');
+  assert.equal(wt.manifest.start, 'from-parent-manifest');
+  assert.equal(wt.manifestError, null);
+});
+
+test('a worktree with no manifest of its own inherits its parent\'s in-memory registration', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('conductor'); return rmRoot(root); });
+  await mkProject(root, 'conductor', null);
+  await mkProject(root, 'conductor_worktree_ab12cd', null);
+  registerInMemory('conductor', { start: 'npm start', name: 'Conductor' });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'conductor_worktree_ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'conductor');
+  assert.equal(wt.source, 'memory');
+  assert.equal(wt.manifest.start, 'npm start');
+});
+
+test('a worktree with no manifest of its own inherits its parent\'s disk registration', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'beta', null);
+  await mkProject(root, 'beta_worktree_ab12cd', null);
+  await writeRegistrations(root, { beta: { start: 'from-registry' } });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'beta_worktree_ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'beta');
+  assert.equal(wt.source, 'registry');
+  assert.equal(wt.manifest.start, 'from-registry');
+});
+
+test('a worktree\'s own .hub.json still wins over inheriting the parent\'s manifest', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('gamma'); return rmRoot(root); });
+  await mkProject(root, 'gamma', null);
+  registerInMemory('gamma', { start: 'from-parent-memory' });
+  await mkProject(root, 'gamma_worktree_ab12cd', { start: 'own-worktree-manifest' });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'gamma_worktree_ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.source, 'manifest');
+  assert.equal(wt.manifest.start, 'own-worktree-manifest');
+});
+
+test('a worktree\'s own disk registration still wins over the parent\'s manifest', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'delta', { start: 'parent-manifest' });
+  await mkProject(root, 'delta_worktree_ab12cd', null);
+  await writeRegistrations(root, { 'delta_worktree_ab12cd': { start: 'own-worktree-registry' } });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'delta_worktree_ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'delta');
+  assert.equal(wt.source, 'registry');
+  assert.equal(wt.manifest.start, 'own-worktree-registry');
+});
+
+test('neither the worktree nor its parent has any manifest source: the worktree is skipped entirely', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'epsilon', null);
+  await mkProject(root, 'epsilon_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  assert.ok(!apps.find((a) => a.id === 'epsilon_worktree_ab12cd'));
+});
+
+test('a broken parent .hub.json is not inherited; the worktree is skipped, not crashed', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = path.join(root, 'zeta');
+  await fs.mkdir(dir);
+  await fs.writeFile(path.join(dir, '.hub.json'), '{ not json');
+  await mkProject(root, 'zeta_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  const parent = apps.find((a) => a.id === 'zeta');
+  assert.ok(parent);
+  assert.match(parent.manifestError, /invalid JSON/);
+  assert.ok(!apps.find((a) => a.id === 'zeta_worktree_ab12cd'));
+});
+
+test('a broken parent disk registration is not inherited either', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'eta', null);
+  await writeRegistrations(root, { eta: { name: 'missing start' } });
+  await mkProject(root, 'eta_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  const parent = apps.find((a) => a.id === 'eta');
+  assert.ok(parent);
+  assert.match(parent.manifestError, /"start" is required/);
+  assert.ok(!apps.find((a) => a.id === 'eta_worktree_ab12cd'));
+});
+
+test('a <x>_worktree_<hash>-shaped dir with no sibling <x> dir is not eligible for fallback, just skipped', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'orphan_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  assert.ok(!apps.find((a) => a.id === 'orphan_worktree_ab12cd'));
+});
