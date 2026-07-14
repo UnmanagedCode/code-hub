@@ -14,6 +14,12 @@ Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
 
+## Machine-local registration: `registrations.json` (`<projectsRoot>/.code-hub/registrations.json`)
+
+A JSON object keyed by directory basename (`id`), each value the same shape as a `.hub.json` body above (validated with the identical schema — `start` required, `name`/`healthPath`/`readyWhen`/`routes` optional). Fills in a manifest for a sibling dir that has **no** `.hub.json` of its own; a real `.hub.json`, even a broken one, always wins over a registration for the same id. Managed via the `register_app`/`unregister_app` MCP tools below, or by hand-editing the file directly (needed for `routes`, since it isn't expressible in `register_app`'s tool schema).
+
+Robustness, mirroring `.hub.json`/`state.json` conventions: whole-file JSON that fails to parse, or isn't a JSON object, is logged (`console.warn`) and treated as an empty registry — it never hides real `.hub.json` apps. A per-entry validation failure (e.g. missing `start`) surfaces that one app as non-startable with `manifestError`, exactly like a broken `.hub.json` does. A registry entry naming a directory that doesn't exist under the projects root is logged and skipped — no phantom app.
+
 ## HTTP API (`/api`, JSON)
 
 | Method + path | Body | Response |
@@ -58,7 +64,8 @@ Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), 
   ],
   "tunnel": { "kind": "tunnel", "url": "https://x.trycloudflare.com", "urls": null, "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here. kind: "lan" → urls lists all LAN IPv4 URLs
   "error": null,                // crash tail / manifest error, when present
-  "alwaysOn": false             // true only for the host code-conductor when code-hub runs embedded as its plugin
+  "alwaysOn": false,            // true only for the host code-conductor when code-hub runs embedded as its plugin
+  "source": "manifest"          // "manifest" (has a .hub.json) or "registry" (from registrations.json)
 }
 ```
 
@@ -94,3 +101,5 @@ The split is deliberate: only a malformed *request envelope* is a transport fail
 | `list_apps` | none | same as `GET /api/apps` |
 | `start_app` | `{ id: string }` | same as `POST /api/apps/:id/start` |
 | `stop_app` | `{ id: string }` | same as `POST /api/apps/:id/stop` |
+| `register_app` | `{ id: string, start: string, name?, healthPath?, readyWhen? }` | the registered app, in the same shape as an entry in `list_apps`'s `apps` (`source: "registry"`). `400` if `id` isn't an existing dir under the projects root, `409` if that dir already has a `.hub.json`, `400` on a schema violation (e.g. empty `start`). `routes` isn't in this tool's declared schema (array-of-object properties aren't expressible in the shallow-JSON-Schema `pluginApi` v1 constraint) but is still accepted/validated if passed in `arguments` — the schema simply doesn't advertise it; hand-edit `registrations.json` for multi-route registrations. |
+| `unregister_app` | `{ id: string }` | `{ id, registered: false }`. `404` if `id` has no registry entry. No effect on a project with its own `.hub.json` (it was never in the registry). |

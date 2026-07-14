@@ -14,6 +14,7 @@ const DEFAULT_PROJECTS_ROOT = path.resolve(
 
 export const MANIFEST_FILENAME = '.hub.json';
 export const STORE_DIRNAME = '.code-hub';
+export const REGISTRY_FILENAME = 'registrations.json';
 
 // A worktree dir is a sibling named `<project>_worktree_<hexid>` — the
 // layout code-conductor creates (see ../code-conductor/src/worktrees.js).
@@ -49,6 +50,13 @@ export function parseManifest(raw, file = MANIFEST_FILENAME) {
   } catch (e) {
     throw new Error(`${file}: invalid JSON (${e.message})`);
   }
+  return validateManifestObject(obj, file);
+}
+
+// Same schema as `.hub.json`, applied to an already-parsed object. Shared by
+// `parseManifest` (file on disk) and the registrations.json overlay below, so
+// the two never drift.
+export function validateManifestObject(obj, file = MANIFEST_FILENAME) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
     throw new Error(`${file}: must be a JSON object`);
   }
@@ -87,11 +95,54 @@ export function parseManifest(raw, file = MANIFEST_FILENAME) {
   };
 }
 
+export function registryFile() {
+  return path.join(storeRoot(), REGISTRY_FILENAME);
+}
+
+// Machine-local registrations: an id -> manifest-body map for sibling dirs
+// that have no `.hub.json` of their own. Never overrides a real manifest —
+// see discoverApps() below. Whole-file corruption warns and is treated as an
+// empty registry, so it never hides the real .hub.json apps.
+export async function readRegistry() {
+  const file = registryFile();
+  let raw;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw e;
+  }
+  let obj;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    console.warn(`[code-hub] ${file}: invalid JSON, ignoring registrations (${e.message})`);
+    return {};
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    console.warn(`[code-hub] ${file}: must be a JSON object, ignoring registrations`);
+    return {};
+  }
+  return obj;
+}
+
+export async function writeRegistry(obj) {
+  const dir = storeRoot();
+  await fs.mkdir(dir, { recursive: true });
+  const file = registryFile();
+  const tmp = path.join(dir, `.${process.pid}.registrations.tmp`);
+  await fs.writeFile(tmp, JSON.stringify(obj, null, 2));
+  await fs.rename(tmp, file);
+}
+
 // Scan the projects root for servable apps. A directory is servable when it
-// contains a `.hub.json`. Main checkouts and worktree dirs both surface;
-// worktrees carry `{ isWorktree: true, project, branch }` so the UI can nest
-// them under their parent. `id` is the directory basename (unique across the
-// root). Dot-prefixed dirs (the store itself) are skipped.
+// contains a `.hub.json`, or has a machine-local entry in registrations.json
+// (only consulted when the dir has no `.hub.json` at all — a real manifest,
+// even a broken one, always wins). Main checkouts and worktree dirs both
+// surface; worktrees carry `{ isWorktree: true, project, branch }` so the UI
+// can nest them under their parent. `id` is the directory basename (unique
+// across the root). Dot-prefixed dirs (the store itself) are skipped. Each
+// app carries `source: 'manifest' | 'registry'`.
 export async function discoverApps() {
   const root = projectsRoot();
   let entries;
@@ -102,27 +153,44 @@ export async function discoverApps() {
     throw e;
   }
   const dirNames = new Set(entries.filter((e) => e.isDirectory()).map((e) => e.name));
+  const registry = await readRegistry();
   const out = [];
   for (const e of entries) {
     if (!e.isDirectory() || e.name.startsWith('.')) continue;
     const dir = path.join(root, e.name);
     let manifest;
+    let source = 'manifest';
     try {
       manifest = await readManifest(dir);
     } catch (err) {
       // Surface the broken manifest as a non-startable app rather than
       // hiding the whole project — fail loudly, not silently.
-      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message });
+      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message, source });
       continue;
     }
-    if (!manifest) continue;
+    if (!manifest) {
+      const regEntry = registry[e.name];
+      if (!regEntry) continue;
+      source = 'registry';
+      try {
+        manifest = validateManifestObject(regEntry, `${REGISTRY_FILENAME}#${e.name}`);
+      } catch (err) {
+        out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: null, manifestError: err.message, source });
+        continue;
+      }
+    }
     const wt = WORKTREE_RE.exec(e.name);
     // Only treat as a worktree when a matching parent project dir exists,
     // so a legitimately-named project isn't misclassified.
     if (wt && dirNames.has(wt[1])) {
-      out.push({ id: e.name, project: wt[1], path: dir, isWorktree: true, branch: null, manifest, manifestError: null });
+      out.push({ id: e.name, project: wt[1], path: dir, isWorktree: true, branch: null, manifest, manifestError: null, source });
     } else {
-      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest, manifestError: null });
+      out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest, manifestError: null, source });
+    }
+  }
+  for (const key of Object.keys(registry)) {
+    if (!dirNames.has(key)) {
+      console.warn(`[code-hub] ${REGISTRY_FILENAME}: '${key}' has no matching directory under the projects root, ignoring`);
     }
   }
   out.sort((a, b) => a.id.localeCompare(b.id));

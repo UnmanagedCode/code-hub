@@ -4,7 +4,7 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 
 ## What it does
 
-- **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees).
+- **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees). A sibling dir with no `.hub.json` can still be made startable via **machine-local registration** — see below.
 - **Starts** an app: runs its `start` command as a child process with a free `PORT` injected, and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone. Apps can declare multiple named `routes` (e.g. a main page + an editor), each opened separately.
 - **Sorts by recency**: a flat card list sorted by **Last edited** (each app's last git commit date, shown as an "edited X ago" label), Name, or Status.
 - **Owns the lifecycle**: code-hub tracks the child's pid/process-group, so **Stop / Restart** work by killing that group — even if the project's source or worktree has since been deleted.
@@ -41,6 +41,10 @@ Place a `.hub.json` at a project's root to make it servable:
 - `start` must **bind `$PORT`** (injected by code-hub — a free port) and **stay up until killed**. code-hub launches it via `bash -lc` in its own process group; there is no separate stop command — code-hub stops the app by killing that group (SIGTERM, then SIGKILL after a 3s grace period).
 - **Readiness**: `readyWhen` (stdout/stderr regex) → else `healthPath` (any HTTP response) → else a default TCP connect probe on `$PORT`. Bounded to 30s; on timeout the app stays running but is flagged readiness-unconfirmed.
 
+## Machine-local registration (no `.hub.json` needed)
+
+For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it instead: `<projectsRoot>/.code-hub/registrations.json` is a hand-editable JSON object keyed by directory basename (the same `id` a real `.hub.json` would use), each value the same shape as a `.hub.json` body (`start` required; `name`/`healthPath`/`readyWhen`/`routes` optional). It's consulted only for a dir that has **no** `.hub.json` of its own — a real manifest, even a broken one, always wins over a registration. Two MCP tools manage it: `register_app` (`{ id, start, name?, healthPath?, readyWhen? }` — `routes` isn't expressible in the tool's schema, add it by hand-editing the file directly) and `unregister_app` (`{ id }`). Apps sourced from the registry are otherwise identical to manifest-based ones (worktree classification, discovery, start/stop all behave the same). See `docs/protocol.md` for the full schema and precedence rules.
+
 ## Key defaults
 
 | Setting | Default | Override |
@@ -50,6 +54,7 @@ Place a `.hub.json` at a project's root to make it servable:
 | Projects root | parent dir of this repo | `PROJECTS_ROOT` |
 | cloudflared binary | `cloudflared` (from `PATH`) | `CODEHUB_CLOUDFLARED_BIN` |
 | Runtime state | `<projectsRoot>/.code-hub/state.json` | — |
+| Machine-local registrations | `<projectsRoot>/.code-hub/registrations.json` | — |
 
 ## Trust model & limitations
 
@@ -59,7 +64,7 @@ Place a `.hub.json` at a project's root to make it servable:
 
 ## Running under code-conductor
 
-code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
+code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`/`register_app`/`unregister_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
 
 ## Testing
 

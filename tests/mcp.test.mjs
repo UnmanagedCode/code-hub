@@ -86,6 +86,39 @@ test('tool-level failure (starting an unknown app id) → 200 {error}', async (t
   assert.ok(res.body.error);
 });
 
+test('register_app then unregister_app: happy path', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'tool', null);
+  const { server, base } = await boot();
+  t.after(async () => { server.close(); await rmRoot(root); });
+
+  let res = await mcp(base, 'register_app', { id: 'tool', start: 'npm start', name: 'Tool' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.result.source, 'registry');
+  assert.equal(res.body.result.manifest.start, 'npm start');
+
+  res = await mcp(base, 'list_apps', {});
+  assert.ok(res.body.result.apps.some((a) => a.id === 'tool'));
+
+  res = await mcp(base, 'unregister_app', { id: 'tool' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.result, { id: 'tool', registered: false });
+
+  res = await mcp(base, 'list_apps', {});
+  assert.ok(!res.body.result.apps.some((a) => a.id === 'tool'));
+});
+
+test('register_app: rejecting a dir that already has a .hub.json → 200 {error}', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'has-manifest', { start: 'x' });
+  const { server, base } = await boot();
+  t.after(async () => { server.close(); await rmRoot(root); });
+
+  const res = await mcp(base, 'register_app', { id: 'has-manifest', start: 'npm start' });
+  assert.equal(res.status, 200);
+  assert.match(res.body.error, /already has a \.hub\.json/);
+});
+
 test('missing tool field → 400 (malformed envelope)', async (t) => {
   const root = await mkRoot();
   const { server, base } = await boot();

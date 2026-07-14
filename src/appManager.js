@@ -1,4 +1,9 @@
-import { discoverApps } from './projects.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import {
+  discoverApps, projectsRoot, MANIFEST_FILENAME,
+  validateManifestObject, readRegistry, writeRegistry,
+} from './projects.js';
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
@@ -259,4 +264,49 @@ export async function unshare(id) {
   const rec = store.apps[id];
   if (rec?.tunnel || proxies.has(id)) { teardownShare(id, rec); await persist(); }
   return { id, tunnel: null };
+}
+
+async function hasManifestFile(dir) {
+  try {
+    await fs.access(path.join(dir, MANIFEST_FILENAME));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Register a sibling dir that has no `.hub.json` of its own as a startable
+// app, by writing an entry into registrations.json (see projects.js). A dir
+// that already has a `.hub.json` — even a broken one — needs no registration
+// and is rejected outright; it always wins over any registry entry.
+export async function registerApp({ id, start, name, healthPath, readyWhen, routes } = {}) {
+  if (typeof id !== 'string' || id.length === 0 || id.startsWith('.') || path.basename(id) !== id) {
+    const e = new Error('id is required and must be a plain, non-dot-prefixed directory basename (no path separators)'); e.statusCode = 400; throw e;
+  }
+  const dir = path.join(projectsRoot(), id);
+  let stat;
+  try {
+    stat = await fs.stat(dir);
+  } catch {
+    stat = null;
+  }
+  if (!stat || !stat.isDirectory()) {
+    const e = new Error(`'${id}' is not an existing directory under the projects root`); e.statusCode = 400; throw e;
+  }
+  if (await hasManifestFile(dir)) {
+    const e = new Error(`'${id}' already has a .hub.json — no registration needed`); e.statusCode = 409; throw e;
+  }
+  const manifest = validateManifestObject({ start, name, healthPath, readyWhen, routes }, `register_app:${id}`);
+  const registry = await readRegistry();
+  registry[id] = manifest;
+  await writeRegistry(registry);
+  return (await discoverApps()).find((a) => a.id === id);
+}
+
+export async function unregisterApp(id) {
+  const registry = await readRegistry();
+  if (!(id in registry)) { const e = new Error(`'${id}' is not registered`); e.statusCode = 404; throw e; }
+  delete registry[id];
+  await writeRegistry(registry);
+  return { id, registered: false };
 }

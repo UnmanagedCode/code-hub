@@ -41,6 +41,16 @@ export async function mkProject(root, name, manifest, { git = false } = {}) {
   return dir;
 }
 
+// Write <root>/.code-hub/registrations.json directly, bypassing appManager,
+// so tests can set up registry state (including deliberately malformed raw
+// content) without going through registerApp.
+export async function writeRegistrations(root, contents) {
+  const dir = path.join(root, '.code-hub');
+  await fs.mkdir(dir, { recursive: true });
+  const raw = typeof contents === 'string' ? contents : JSON.stringify(contents, null, 2);
+  await fs.writeFile(path.join(dir, 'registrations.json'), raw);
+}
+
 export function gitCommit(dir, msg = 'change') {
   const g = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });
   execFileSync('sh', ['-c', `echo x >> ${JSON.stringify(path.join(dir, 'README'))}`]);
