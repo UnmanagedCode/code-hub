@@ -11,6 +11,8 @@ const handlers = {
   list_apps: () => appManager.list(),
   start_app: (args) => appManager.start(requireId(args)),
   stop_app: (args) => appManager.stop(requireId(args)),
+  register_app: (args) => appManager.registerApp(args ?? {}),
+  unregister_app: (args) => appManager.unregisterApp(requireId(args)),
 };
 
 // Envelope-level problems (missing/invalid `tool`) -> 400.

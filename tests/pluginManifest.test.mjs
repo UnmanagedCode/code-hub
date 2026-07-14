@@ -43,10 +43,10 @@ test('conductor.plugin.json: required top-level fields', async () => {
   assert.equal(manifest.mcp.scope, 'project');
 });
 
-test('conductor.plugin.json: mcp.tools declare the 3 expected tools with shallow schemas', async () => {
+test('conductor.plugin.json: mcp.tools declare the 5 expected tools with shallow schemas', async () => {
   const manifest = await readJson('conductor.plugin.json');
   const names = manifest.mcp.tools.map((t) => t.name);
-  assert.deepEqual(names.sort(), ['list_apps', 'start_app', 'stop_app']);
+  assert.deepEqual(names.sort(), ['list_apps', 'register_app', 'start_app', 'stop_app', 'unregister_app']);
   for (const tool of manifest.mcp.tools) {
     assert.ok(tool.description, `${tool.name} needs a description`);
     assertShallowSchema(tool.inputSchema, `${tool.name}.inputSchema`);
@@ -55,4 +55,8 @@ test('conductor.plugin.json: mcp.tools declare the 3 expected tools with shallow
   assert.deepEqual(startTool.inputSchema.required, ['id']);
   const stopTool = manifest.mcp.tools.find((t) => t.name === 'stop_app');
   assert.deepEqual(stopTool.inputSchema.required, ['id']);
+  const registerTool = manifest.mcp.tools.find((t) => t.name === 'register_app');
+  assert.deepEqual(registerTool.inputSchema.required, ['id', 'start']);
+  const unregisterTool = manifest.mcp.tools.find((t) => t.name === 'unregister_app');
+  assert.deepEqual(unregisterTool.inputSchema.required, ['id']);
 });
