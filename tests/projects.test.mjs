@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { discoverApps } from '../src/projects.js';
+import { discoverApps, registerInMemory, unregisterInMemory, registryFile } from '../src/projects.js';
 import { mkRoot, rmRoot, mkProject, writeRegistrations } from './helpers.mjs';
 
 test('discovers only dirs with a .hub.json, honouring PROJECTS_ROOT', async (t) => {
@@ -138,4 +138,79 @@ test('discovered apps from a real manifest are tagged source: manifest', async (
 
   const apps = await discoverApps();
   assert.equal(apps.find((a) => a.id === 'alpha').source, 'manifest');
+});
+
+test('an in-memory registration fills in a manifest for a dir with no .hub.json, tagged source: memory', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('mem-app'); return rmRoot(root); });
+  await mkProject(root, 'mem-app', null);
+  registerInMemory('mem-app', { start: 'npm start', name: 'Mem App' });
+
+  const apps = await discoverApps();
+  const app = apps.find((a) => a.id === 'mem-app');
+  assert.ok(app);
+  assert.equal(app.source, 'memory');
+  assert.equal(app.manifest.start, 'npm start');
+  assert.equal(app.manifest.name, 'Mem App');
+  assert.equal(app.manifestError, null);
+});
+
+test('registerInMemory rejects an invalid body and never touches registrations.json', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('mem-bad'); return rmRoot(root); });
+  await mkProject(root, 'mem-bad', null);
+
+  assert.throws(() => registerInMemory('mem-bad', { name: 'no start' }), /"start" is required/);
+
+  await assert.rejects(() => fs.access(registryFile()), /ENOENT/);
+});
+
+test('unregisterInMemory removes the in-memory entry; it never persisted to registrations.json', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('mem-app2'); return rmRoot(root); });
+  await mkProject(root, 'mem-app2', null);
+  registerInMemory('mem-app2', { start: 'npm start' });
+
+  let apps = await discoverApps();
+  assert.ok(apps.find((a) => a.id === 'mem-app2'));
+  await assert.rejects(() => fs.access(registryFile()), /ENOENT/);
+
+  unregisterInMemory('mem-app2');
+  apps = await discoverApps();
+  assert.ok(!apps.find((a) => a.id === 'mem-app2'));
+});
+
+test('an in-memory registration wins over a disk registry entry for the same id', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('both-reg'); return rmRoot(root); });
+  await mkProject(root, 'both-reg', null);
+  await writeRegistrations(root, { 'both-reg': { start: 'from-disk' } });
+  registerInMemory('both-reg', { start: 'from-memory' });
+
+  const apps = await discoverApps();
+  const app = apps.find((a) => a.id === 'both-reg');
+  assert.equal(app.source, 'memory');
+  assert.equal(app.manifest.start, 'from-memory');
+});
+
+test('a real .hub.json still wins over an in-memory registration for the same id', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { unregisterInMemory('both-mem'); return rmRoot(root); });
+  await mkProject(root, 'both-mem', { start: 'from-manifest' });
+  registerInMemory('both-mem', { start: 'from-memory' });
+
+  const apps = await discoverApps();
+  const app = apps.find((a) => a.id === 'both-mem');
+  assert.equal(app.source, 'manifest');
+  assert.equal(app.manifest.start, 'from-manifest');
+});
+
+test('an in-memory registration key with no matching directory warns as orphaned, same as a disk one', async (t) => {
+  const root = await mkRoot();
+  t.after(() => unregisterInMemory('ghost-mem'));
+  t.after(() => rmRoot(root));
+  registerInMemory('ghost-mem', { start: 'x' });
+
+  const apps = await discoverApps();
+  assert.ok(!apps.find((a) => a.id === 'ghost-mem'));
 });

@@ -20,6 +20,10 @@ A JSON object keyed by directory basename (`id`), each value the same shape as a
 
 Robustness, mirroring `.hub.json`/`state.json` conventions: whole-file JSON that fails to parse, or isn't a JSON object, is logged (`console.warn`) and treated as an empty registry — it never hides real `.hub.json` apps. A per-entry validation failure (e.g. missing `start`) surfaces that one app as non-startable with `manifestError`, exactly like a broken `.hub.json` does. A registry entry naming a directory that doesn't exist under the projects root is logged and skipped — no phantom app.
 
+## In-memory registration (process-lifetime only, never persisted)
+
+Same schema/validation as `registrations.json`, but held in a module-level `Map` (`registerInMemory`/`unregisterInMemory` in `src/projects.js`) instead of on disk — it is never read from or written to `registrations.json`. Precedence for a dir with no `.hub.json`: in-memory wins over a disk registry entry for the same id; a real `.hub.json` still wins over either. Apps sourced this way carry `source: "memory"`. Not exposed via `register_app`/`unregister_app` — those tools remain disk-only. Currently used for exactly one purpose: `appManager.init()` registers the host `code-conductor` checkout this way when code-hub runs embedded (see `docs/architecture.md`), since the conductor carries no `.hub.json` of its own.
+
 ## HTTP API (`/api`, JSON)
 
 | Method + path | Body | Response |
@@ -65,7 +69,7 @@ Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), 
   "tunnel": { "kind": "tunnel", "url": "https://x.trycloudflare.com", "urls": null, "username": "hub", "proxyPort": 51234 },  // or null; password never exposed here. kind: "lan" → urls lists all LAN IPv4 URLs
   "error": null,                // crash tail / manifest error, when present
   "alwaysOn": false,            // true only for the host code-conductor when code-hub runs embedded as its plugin
-  "source": "manifest"          // "manifest" (has a .hub.json) or "registry" (from registrations.json)
+  "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), or "memory" (in-memory registration)
 }
 ```
 
