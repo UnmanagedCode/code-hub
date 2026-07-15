@@ -39,6 +39,7 @@ A worktree dir (`<project>_worktree_<hash>`, with a sibling `<project>` dir) is 
 | `POST /api/apps/:id/restart` | — | running record |
 | `POST /api/apps/:id/share` | `{ mode?: "tunnel"\|"lan", auth?: boolean }` (default `"tunnel"`, `auth` default `true`) | `{ kind, url, urls?, auth, authUrl?, username?, password?, qrSvg }` (`400` bad mode/`auth` type, or `auth:false` with `mode:"tunnel"`; `409` not running; `501` `tunnel` mode when cloudflared absent) |
 | `PATCH /api/apps/:id/share/credentials` | `{ username?, password? }` (at least one) | `{ id, username, password }` (`400` bad/missing body, or the active share has `auth:false`; `409` no active share) |
+| `PATCH /api/apps/:id/share/auth` | `{ enabled: boolean }` | `{ id, auth }` (`400` non-boolean `enabled`, or the active share is `mode:"tunnel"` — tunnel shares are always gated; `409` no active share) |
 | `DELETE /api/apps/:id/share` | — | `{ id, tunnel: null }` |
 
 `id` is the served directory basename (unique across the projects root; a worktree's id is its `<project>_worktree_<hash>` dir name).
@@ -48,6 +49,8 @@ A worktree dir (`<project>_worktree_<hash>`, with a sibling `<project>` dir) is 
 - `mode: "lan"`: the proxy binds `0.0.0.0` instead — no cloudflared involved. `url` is the machine's first non-loopback LAN IPv4 URL (falls back to a `localhost` URL if the host has no LAN interface); `urls` lists every LAN IPv4 URL found (secondary devices can try an alternate if the primary is unreachable, e.g. a Docker bridge address). **Plain HTTP — no TLS**, so the token/cookie/Basic-Auth all cross the LAN in cleartext. Passing `auth: false` drops the gate entirely: no token/cookie/Basic-Auth is generated or checked, every request and WebSocket upgrade forwards unconditionally, and the response has no `authUrl`/`username`/`password` (`url` itself is the whole share link).
 
 Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), `urls` (LAN mode only — all candidate URLs), `auth` (whether the share is gated), `authUrl` = the share URL plus `?__hubauth=<token>` (**the QR encodes this** for scan-to-auth when `auth` is true; opening it sets the session cookie and redirects to the credential-free URL — no credentials ever appear in the URL or QR) — omitted when `auth` is `false`, `username`/`password` (Basic-Auth fallback for curl/API clients) — also omitted when `auth` is `false`, `qrSvg` (of `authUrl` when gated, else of the plain `url`). Credentials live in the server process for the share's lifetime — **never written to `state.json` or logged** — so `GET /api/apps`'s `tunnel.password` re-reveals them across a UI reload; `PATCH .../share/credentials` edits them in place on the live proxy (no new URL/token). Torn down on `unshare`/`stop`/`restart`. A share does **not** survive a code-hub restart, in either mode: on startup any orphaned share record is cleared (its in-process proxy is gone) and the app needs re-sharing — the next share always starts with a fresh auto-generated password, even if the previous one was edited.
+
+`PATCH .../share/auth` flips the gate on a **LAN** share in place — same proxy, port, token, username/password; a tunnel share rejects this with `400` (always gated). The underlying proxy pre-generates its password/token/cookie-secret regardless of the share's initial `auth` value, and never regenerates them on a toggle, so any `authUrl`/QR issued while gated stays valid across an off→on round-trip. `GET /api/apps`'s `tunnel.auth`/`tunnel.username`/`tunnel.password` reflect the live state immediately after a toggle (no re-share needed).
 
 ### `App` shape (from `GET /api/apps`)
 
@@ -84,7 +87,7 @@ Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), 
 
 ### Errors
 
-Non-2xx responses are `{ error: string }`. Status codes: `400` (bad manifest; an invalid `share` `mode`/`auth`; `auth:false` with `mode:"tunnel"`; a credentials-edit body that's empty/non-string, or targets a no-auth share), `404` (unknown/not-running app), `409` (already running / not running for share / no active share for a credentials edit), `501` (`tunnel`-mode share when cloudflared is absent), `500` (unexpected). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
+Non-2xx responses are `{ error: string }`. Status codes: `400` (bad manifest; an invalid `share` `mode`/`auth`; `auth:false` with `mode:"tunnel"`; a credentials-edit body that's empty/non-string, or targets a no-auth share; a non-boolean `enabled` on an auth-toggle, or one targeting a `mode:"tunnel"` share), `404` (unknown/not-running app), `409` (already running / not running for share / no active share for a credentials edit or auth toggle), `501` (`tunnel`-mode share when cloudflared is absent), `500` (unexpected). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
 
 ## MCP API (`POST /api/mcp`)
 

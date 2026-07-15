@@ -17,7 +17,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true,noAuth?} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -27,12 +27,19 @@ async function api(method, path, opts = {}) {
   return body;
 }
 
-async function refresh() {
+// `periodic: true` marks the background poll (see the setInterval below) —
+// while a credential edit is in progress (state.credEdit non-empty), it
+// skips render() so the poll can't tear down/refocus the edit's <input>s,
+// same "suppress re-render churn while something's in flight" idea as the
+// `busy` set above. Manual triggers (the refresh button, and action()'s own
+// refresh() after Save/Cancel/Unshare/Stop/Restart) never pass this, so they
+// keep rendering immediately as before.
+async function refresh({ periodic = false } = {}) {
   try {
     const data = await api('GET', 'api/apps');
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
-    render();
+    if (!periodic || !Object.keys(state.credEdit).length) render();
     document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
     document.getElementById('empty').textContent = `Failed to load: ${e.message}`;
@@ -120,10 +127,11 @@ function credRow(label, value) {
   );
 }
 
-// Creds display for an active, authed share: read-only rows with an Edit
-// toggle that swaps them for inputs (prefilled) + Save/Cancel. Save PATCHes
-// the live proxy's credentials in place; action()'s own refresh() re-reads
-// them back from list() (see appManager.js), so no local merge is needed.
+// Creds display for an active, authed share: read-only rows, or — while
+// state.credEdit[app.id] is set (toggled by the Edit button in sharePanel's
+// action row) — inputs (prefilled) + Save/Cancel. Save PATCHes the live
+// proxy's credentials in place; action()'s own refresh() re-reads them back
+// from list() (see appManager.js), so no local merge is needed.
 function credsBlock(app, shared) {
   const editing = state.credEdit[app.id];
   if (editing) {
@@ -151,10 +159,6 @@ function credsBlock(app, shared) {
   return el('div', { class: 'creds' },
     credRow('user', shared.username),
     credRow('pass', shared.password),
-    el('button', { class: 'cred-edit', onclick: () => {
-      state.credEdit[app.id] = { username: shared.username, password: shared.password };
-      render();
-    } }, 'Edit'),
   );
 }
 
@@ -162,16 +166,12 @@ function sharePanel(app) {
   const s = state.share[app.id];
   if (s && s.choosing) {
     return el('div', { class: 'share' },
-      el('label', { class: 'auth-toggle' },
-        el('input', { type: 'checkbox', checked: !!s.noAuth, onchange: (e) => { s.noAuth = e.target.checked; } }),
-        ' Disable authentication (LAN only)',
-      ),
       el('div', { class: 'share-actions' },
-        el('button', { onclick: () => doShare(app, 'lan', s.noAuth) }, 'Share on LAN'),
+        el('button', { onclick: () => doShare(app, 'lan') }, 'Share on LAN'),
         el('button', {
           disabled: !state.cloudflaredAvailable,
           title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
-          onclick: () => doShare(app, 'tunnel', false),
+          onclick: () => doShare(app, 'tunnel'),
         }, 'Share via Tunnel'),
         el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
       ));
@@ -202,6 +202,22 @@ function sharePanel(app) {
       ...shared.urls.slice(1).map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
   }
 
+  // Auth is only ever toggleable on a LAN share — a tunnel share is always
+  // gated. Flips the live proxy's gate in place (no new URL/token), so the
+  // toggle just calls the endpoint and lets the next refresh() re-reveal or
+  // hide the creds block below via `authEnabled`.
+  if (kind === 'lan') {
+    panel.appendChild(el('label', { class: 'auth-toggle' },
+      el('input', { type: 'checkbox', checked: authEnabled, onchange: (e) => action(app.id, async () => {
+        await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/auth`, {
+          body: JSON.stringify({ enabled: e.target.checked }),
+          headers: { 'content-type': 'application/json' },
+        });
+      }) }),
+      ' Authentication',
+    ));
+  }
+
   if (authEnabled && shared.username && shared.password) {
     panel.appendChild(credsBlock(app, shared));
   }
@@ -211,9 +227,16 @@ function sharePanel(app) {
       onclick: () => openQr(s.qrSvg, openUrl) });
     panel.appendChild(qr);
   }
+  const editing = !!state.credEdit[app.id];
   panel.appendChild(el('div', { class: 'share-actions' },
     el('a', { class: 'btn-link', href: openUrl, target: '_blank', rel: 'noopener' }, '▶ Open'),
     el('button', { onclick: () => { navigator.clipboard?.writeText(openUrl); } }, 'Copy'),
+    authEnabled && shared.username && shared.password && !editing
+      ? el('button', { onclick: () => {
+          state.credEdit[app.id] = { username: shared.username, password: shared.password };
+          render();
+        } }, 'Edit')
+      : null,
     el('button', { class: 'danger', onclick: () => action(app.id, async () => {
       await api('DELETE', `api/apps/${encodeURIComponent(app.id)}/share`);
       delete state.share[app.id];
@@ -262,12 +285,12 @@ function controls(app) {
   return row;
 }
 
-async function doShare(app, mode, noAuth) {
+async function doShare(app, mode) {
   state.share[app.id] = 'loading';
   render();
   try {
     const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`, {
-      body: JSON.stringify({ mode, auth: !noAuth }),
+      body: JSON.stringify({ mode }),
       headers: { 'content-type': 'application/json' },
     });
     state.share[app.id] = res;
@@ -375,4 +398,4 @@ function render() {
 document.getElementById('refresh').addEventListener('click', refresh);
 document.getElementById('sort').addEventListener('change', (e) => { state.sort = e.target.value; render(); });
 refresh();
-setInterval(refresh, 2000); // reflect readiness / tunnel progress
+setInterval(() => refresh({ periodic: true }), 2000); // reflect readiness / tunnel progress
