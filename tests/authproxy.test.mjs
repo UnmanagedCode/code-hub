@@ -157,3 +157,53 @@ test('generates a strong random password and token per share', async (t) => {
   assert.ok(p1.token.length >= 20);
   assert.notEqual(p1.token, p2.token);
 });
+
+test('auth:false forwards every HTTP request with no gate and generates no creds', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { auth: false });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  assert.equal(proxy.auth, false);
+  assert.equal(proxy.username, null);
+  assert.equal(proxy.password, null);
+  assert.equal(proxy.token, null);
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/`); // no Authorization, no token
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), 'ok');
+});
+
+test('auth:false forwards WebSocket upgrades with no gate', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { auth: false });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const res = await rawUpgrade(proxy.port, null); // no Authorization
+  assert.match(res.statusLine, /101/);
+  assert.equal(res.echoed, true);
+});
+
+test('setCredentials updates the expected Basic-Auth pair in place, no restart', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port);
+  t.after(() => { proxy.close(); up.server.close(); });
+  const originalPort = proxy.port;
+  const originalToken = proxy.token;
+  const originalPassword = proxy.password;
+
+  const before = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { authorization: basic(proxy.username, proxy.password) } });
+  assert.equal(before.status, 200);
+
+  proxy.setCredentials({ username: 'alice', password: 'a-new-strong-password' });
+  assert.equal(proxy.username, 'alice');
+  assert.equal(proxy.password, 'a-new-strong-password');
+  assert.equal(proxy.port, originalPort); // same server, no teardown/recreate
+  assert.equal(proxy.token, originalToken);
+
+  const rejectedOld = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { authorization: basic('hub', originalPassword) } });
+  assert.equal(rejectedOld.status, 401);
+
+  const authedNew = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { authorization: basic('alice', 'a-new-strong-password') } });
+  assert.equal(authedNew.status, 200);
+  assert.equal(await authedNew.text(), 'ok');
+});

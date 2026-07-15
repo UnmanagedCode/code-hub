@@ -140,11 +140,13 @@ test('share stands up a Basic-Auth proxy; unshare tears it down', async (t) => {
   assert.match(res.body.authUrl, /^https:\/\/.+\.trycloudflare\.com\?__hubauth=[\w-]+$/);
   assert.match(res.body.qrSvg, /<svg/);
 
-  // list() exposes username + proxyPort, never the password.
+  // list() exposes username + proxyPort + the live password (persists across
+  // a poll/reload; sourced from the in-memory proxy, never state.json).
   const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
   assert.equal(app.tunnel.username, 'hub');
   assert.ok(app.tunnel.proxyPort > 0);
-  assert.equal(app.tunnel.password, undefined);
+  assert.equal(app.tunnel.auth, true);
+  assert.equal(app.tunnel.password, res.body.password);
 
   // The proxy (which cloudflared points at) enforces auth and forwards to the app.
   const pp = app.tunnel.proxyPort;
@@ -177,11 +179,12 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   assert.equal(res.body.username, 'hub');
   assert.ok(Array.isArray(res.body.urls));
 
-  // list() exposes kind/urls, never the password.
+  // list() exposes kind/urls + the live password (see the tunnel-mode test above).
   const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
   assert.equal(app.tunnel.kind, 'lan');
   assert.ok(Array.isArray(app.tunnel.urls));
-  assert.equal(app.tunnel.password, undefined);
+  assert.equal(app.tunnel.auth, true);
+  assert.equal(app.tunnel.password, res.body.password);
 
   // The proxy (bound 0.0.0.0) is reachable + auth-gated over loopback.
   const pp = app.tunnel.proxyPort;
@@ -193,6 +196,100 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   // unshare tears down a LAN share same as a tunnel share.
   await j(base, 'DELETE', '/api/apps/app/share');
   await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
+});
+
+test('share mode=lan, auth=false stands up an ungated proxy (no creds, no token gate)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', auth: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.kind, 'lan');
+  assert.equal(res.body.auth, false);
+  assert.equal(res.body.username, undefined);
+  assert.equal(res.body.password, undefined);
+  assert.equal(res.body.authUrl, undefined);
+  assert.match(res.body.qrSvg, /<svg/); // still handy to scan-to-open
+
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.auth, false);
+  assert.equal(app.tunnel.username, null);
+  assert.equal(app.tunnel.password, null);
+
+  // No gate at all: a bare, header-less request reaches the app directly.
+  const pp = app.tunnel.proxyPort;
+  const forwarded = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(forwarded.status, 200);
+  assert.equal(await forwarded.text(), 'ok');
+});
+
+test('share mode=tunnel, auth=false → 400 (tunnel shares are always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel', auth: false });
+  assert.equal(res.status, 400);
+});
+
+test('PATCH share credentials edits the live proxy in place', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  process.env.CODEHUB_CLOUDFLARED_BIN = '/nonexistent/cloudflared';
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin; });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  // No active share yet → 409.
+  assert.equal((await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'x' })).status, 409);
+
+  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  const pp = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
+
+  const patch = await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice', password: 'a-new-strong-password' });
+  assert.equal(patch.status, 200);
+  assert.deepEqual(patch.body, { id: 'app', username: 'alice', password: 'a-new-strong-password' });
+
+  // list() reflects the edit immediately.
+  const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(after.tunnel.username, 'alice');
+  assert.equal(after.tunnel.password, 'a-new-strong-password');
+
+  // The old Basic pair is now rejected; the new one is accepted — no restart
+  // (same proxyPort as right after share()).
+  assert.equal(after.tunnel.proxyPort, pp);
+  const rejectedOld = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', shareRes.body.password) } });
+  assert.equal(rejectedOld.status, 401);
+  const authedNew = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('alice', 'a-new-strong-password') } });
+  assert.equal(authedNew.status, 200);
+
+  // Empty body → 400.
+  assert.equal((await j(base, 'PATCH', '/api/apps/app/share/credentials', {})).status, 400);
+});
+
+test('PATCH share credentials on a no-auth share → 400', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', auth: false });
+  const res = await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice' });
+  assert.equal(res.status, 400);
 });
 
 test('share with an invalid mode → 400', async (t) => {

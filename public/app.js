@@ -17,7 +17,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true,noAuth?} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -120,51 +120,90 @@ function credRow(label, value) {
   );
 }
 
+// Creds display for an active, authed share: read-only rows with an Edit
+// toggle that swaps them for inputs (prefilled) + Save/Cancel. Save PATCHes
+// the live proxy's credentials in place; action()'s own refresh() re-reads
+// them back from list() (see appManager.js), so no local merge is needed.
+function credsBlock(app, shared) {
+  const editing = state.credEdit[app.id];
+  if (editing) {
+    return el('div', { class: 'creds' },
+      el('div', { class: 'cred' },
+        el('span', { class: 'cred-label' }, 'user'),
+        el('input', { class: 'cred-input', value: editing.username, oninput: (e) => { editing.username = e.target.value; } }),
+      ),
+      el('div', { class: 'cred' },
+        el('span', { class: 'cred-label' }, 'pass'),
+        el('input', { class: 'cred-input', value: editing.password, oninput: (e) => { editing.password = e.target.value; } }),
+      ),
+      el('div', { class: 'share-actions' },
+        el('button', { onclick: () => action(app.id, async () => {
+          await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+            body: JSON.stringify({ username: editing.username, password: editing.password }),
+            headers: { 'content-type': 'application/json' },
+          });
+          delete state.credEdit[app.id];
+        }) }, 'Save'),
+        el('button', { onclick: () => { delete state.credEdit[app.id]; render(); } }, 'Cancel'),
+      ),
+    );
+  }
+  return el('div', { class: 'creds' },
+    credRow('user', shared.username),
+    credRow('pass', shared.password),
+    el('button', { class: 'cred-edit', onclick: () => {
+      state.credEdit[app.id] = { username: shared.username, password: shared.password };
+      render();
+    } }, 'Edit'),
+  );
+}
+
 function sharePanel(app) {
   const s = state.share[app.id];
   if (s && s.choosing) {
-    return el('div', { class: 'share' }, el('div', { class: 'share-actions' },
-      el('button', { onclick: () => doShare(app, 'lan') }, 'Share on LAN'),
-      el('button', {
-        disabled: !state.cloudflaredAvailable,
-        title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
-        onclick: () => doShare(app, 'tunnel'),
-      }, 'Share via Tunnel'),
-      el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
-    ));
+    return el('div', { class: 'share' },
+      el('label', { class: 'auth-toggle' },
+        el('input', { type: 'checkbox', checked: !!s.noAuth, onchange: (e) => { s.noAuth = e.target.checked; } }),
+        ' Disable authentication (LAN only)',
+      ),
+      el('div', { class: 'share-actions' },
+        el('button', { onclick: () => doShare(app, 'lan', s.noAuth) }, 'Share on LAN'),
+        el('button', {
+          disabled: !state.cloudflaredAvailable,
+          title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
+          onclick: () => doShare(app, 'tunnel', false),
+        }, 'Share via Tunnel'),
+        el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
+      ));
   }
   if (s === 'loading') return el('div', { class: 'share' }, el('span', { class: 'spinner' }, 'Sharing…'));
   const shared = app.tunnel || (s && s.url ? s : null);
   if (s && s.error) return el('div', { class: 'share' }, el('div', { class: 'err' }, s.error));
   if (!shared) return null;
 
-  // Credentials (username + password) come only from the one-time share
-  // response held in state.share; the QR/Open use the token-bearing authUrl —
-  // scanning/opening it exchanges the token for a session cookie server-side,
-  // no credentials ever appear in the URL. Fall back to the plain URL otherwise.
+  // Opening/QR use the token-bearing authUrl when auth is enabled — scanning
+  // it exchanges the token for a session cookie server-side, so no
+  // credentials ever appear in the URL. A no-auth share has no token; the
+  // plain URL is already the whole story. Username/password now come from
+  // `shared` regardless of source (the one-time share() response or the
+  // persisted app.tunnel from list()) — both carry the live proxy's creds.
   const openUrl = (s && s.authUrl) || shared.url;
-  const kind = (s && s.kind) || shared.kind || 'tunnel';
+  const kind = shared.kind || 'tunnel';
+  const authEnabled = shared.auth !== false;
   const panel = el('div', { class: 'share' });
   panel.appendChild(el('div', { class: 'share-url' }, shared.url));
   panel.appendChild(el('div', { class: 'cred-note' },
-    kind === 'lan' ? 'via LAN (plain HTTP — credentials are not encrypted in transit)' : 'via public tunnel'));
+    !authEnabled ? 'via LAN, no authentication — anyone on the network can reach this app'
+    : kind === 'lan' ? 'via LAN (plain HTTP — credentials are not encrypted in transit)'
+    : 'via public tunnel'));
 
   if (shared.urls && shared.urls.length > 1) {
     panel.appendChild(el('div', { class: 'lan-links' },
       ...shared.urls.slice(1).map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
   }
 
-  if (s && s.username && s.password) {
-    panel.appendChild(el('div', { class: 'creds' },
-      credRow('user', s.username),
-      credRow('pass', s.password),
-    ));
-  } else if (shared.username) {
-    // Share active but password not in memory (e.g. after a UI reload).
-    panel.appendChild(el('div', { class: 'creds' },
-      credRow('user', shared.username),
-      el('div', { class: 'cred-note' }, 'Re-share to reveal the password.'),
-    ));
+  if (authEnabled && shared.username && shared.password) {
+    panel.appendChild(credsBlock(app, shared));
   }
 
   if (s && s.qrSvg) {
@@ -178,6 +217,7 @@ function sharePanel(app) {
     el('button', { class: 'danger', onclick: () => action(app.id, async () => {
       await api('DELETE', `api/apps/${encodeURIComponent(app.id)}/share`);
       delete state.share[app.id];
+      delete state.credEdit[app.id];
     }) }, 'Unshare'),
   ));
   return panel;
@@ -200,10 +240,19 @@ function controls(app) {
       onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
   } else {
     if (!app.alwaysOn) {
+      // Stop/restart tear down any active share server-side (teardownShare)
+      // — clear the local share/credEdit state too, or the panel would keep
+      // showing the now-defunct URL/creds until a re-share overwrites it.
       row.appendChild(el('button', { class: 'danger', disabled: isBusy,
-        onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`)) }, 'Stop'));
+        onclick: () => action(app.id, async () => {
+          await api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`);
+          delete state.share[app.id]; delete state.credEdit[app.id];
+        }) }, 'Stop'));
       row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
-        onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`)) }, 'Restart'));
+        onclick: () => action(app.id, async () => {
+          await api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`);
+          delete state.share[app.id]; delete state.credEdit[app.id];
+        }) }, 'Restart'));
     }
     row.appendChild(el('button', {
       disabled: isBusy || !!app.tunnel,
@@ -213,12 +262,12 @@ function controls(app) {
   return row;
 }
 
-async function doShare(app, mode) {
+async function doShare(app, mode, noAuth) {
   state.share[app.id] = 'loading';
   render();
   try {
     const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`, {
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, auth: !noAuth }),
       headers: { 'content-type': 'application/json' },
     });
     state.share[app.id] = res;
