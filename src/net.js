@@ -1,6 +1,6 @@
 import net from 'node:net';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import cp from 'node:child_process';
 
 // Allocate a free TCP port by binding to 0 and reading the assigned port,
 // then closing. There is a small TOCTOU window between close and the child
@@ -45,10 +45,11 @@ export function parseLanIPv4s(text) {
 // beyond loopback (observed on Termux/Android: the app sandbox blocks the
 // netlink-based enumeration libuv uses, even though the LAN address is
 // still visible to ioctl-based tools). Tries `ip` then `ifconfig`, whichever
-// is present; silently yields [] if neither works. Cached briefly so a busy
-// poll loop (list() runs this per running app/route) doesn't spawn a
-// subprocess on every tick — irrelevant on a normal host, where
-// os.networkInterfaces() already finds real interfaces and this is never called.
+// is present; silently yields [] if neither works. Cached briefly in case a
+// share is created/refreshed in quick succession — irrelevant on a normal
+// host, where os.networkInterfaces() already finds real interfaces and this
+// is never called. Only invoked via enumerateUrls(port, { lanFallback: true }),
+// i.e. only from the LAN share path — never for general URL enumeration.
 let fallbackCache = null; // { ips, at }
 const FALLBACK_CACHE_MS = 5000;
 
@@ -58,7 +59,7 @@ function fallbackLanIPv4s() {
   let ips = [];
   for (const [cmd, args] of [['ip', ['-4', 'addr']], ['ifconfig', ['-a']]]) {
     try {
-      const out = execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
       ips = parseLanIPv4s(out);
       if (ips.length) break;
     } catch { /* binary missing / not permitted — try the next one */ }
@@ -70,8 +71,11 @@ function fallbackLanIPv4s() {
 // Every URL that serves an app bound to `port`: the `localhost` loopback name
 // plus each non-internal IPv4 the machine exposes (LAN access from a phone).
 // Only one loopback URL is emitted (localhost) — the 127.0.0.1 form is an
-// equivalent duplicate.
-export function enumerateUrls(port) {
+// equivalent duplicate. The `ip`/`ifconfig` shell-out fallback only runs when
+// `lanFallback` is true — it's for the LAN-share path (appManager.js), which
+// needs a real LAN IP to hand to another device; plain app-card URLs should
+// reflect only what Node's os.networkInterfaces() natively sees.
+export function enumerateUrls(port, { lanFallback = false } = {}) {
   const urls = [`http://localhost:${port}`];
   const ips = new Set();
   const ifaces = os.networkInterfaces();
@@ -80,7 +84,7 @@ export function enumerateUrls(port) {
       if (ni.family === 'IPv4' && !ni.internal) ips.add(ni.address);
     }
   }
-  if (ips.size === 0) {
+  if (ips.size === 0 && lanFallback) {
     for (const ip of fallbackLanIPv4s()) ips.add(ip);
   }
   for (const ip of ips) urls.push(`http://${ip}:${port}`);

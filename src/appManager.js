@@ -257,7 +257,7 @@ export async function share(id, { mode = 'tunnel', auth = true } = {}) {
     const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth });
     proxies.set(id, proxy);
     // Drop the loopback entry — it's not reachable from another device.
-    const urls = enumerateUrls(proxy.port).filter((u) => !u.startsWith('http://localhost:'));
+    const urls = enumerateUrls(proxy.port, { lanFallback: true }).filter((u) => !u.startsWith('http://localhost:'));
     const url = urls[0] ?? `http://localhost:${proxy.port}`; // no LAN interface found
     rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth };
     await persist();
