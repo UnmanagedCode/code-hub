@@ -100,7 +100,22 @@ export async function list() {
 
     if (rec) {
       port = rec.port; urls = rec.urls; startedSha = rec.startedSha;
-      tunnelInfo = rec.tunnel ? { url: rec.tunnel.url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null, username: rec.tunnel.username ?? null, proxyPort: rec.tunnel.proxyPort ?? null } : null;
+      // username/password come from the live proxy (proxies map), never
+      // from rec.tunnel — that's how the password persists across a page
+      // reload (in-memory, for the share's lifetime) without ever touching
+      // state.json. rec.tunnel itself holds only non-secret fields.
+      if (rec.tunnel) {
+        const proxy = proxies.get(base.id);
+        tunnelInfo = {
+          url: rec.tunnel.url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
+          proxyPort: rec.tunnel.proxyPort ?? null,
+          auth: rec.tunnel.auth !== false,
+          username: proxy ? proxy.username : null,
+          password: proxy ? proxy.password : null,
+        };
+      } else {
+        tunnelInfo = null;
+      }
       if (isHostConductorId(base.id)) {
         status = 'running'; // host code-conductor: always on, no pid/runtime to track
       } else {
@@ -213,17 +228,25 @@ export async function restart(id) {
 
 // Share a running app behind a local auth proxy. Two modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
-//   so the public *.trycloudflare.com URL goes through it.
+//   so the public *.trycloudflare.com URL goes through it. Always gated.
 // - 'lan': the auth proxy itself binds 0.0.0.0 instead of loopback, so other
 //   devices on the local network can reach it directly — no cloudflared.
-// Either way, a fresh token + password are generated per share, kept in
-// memory only. The QR/authUrl carries the token (opening it exchanges the
-// token for an httpOnly session cookie server-side — no credentials ever
-// appear in the URL); username/password remain available as a Basic-Auth
-// fallback for curl/API clients and are shown once as plaintext.
-export async function share(id, { mode = 'tunnel' } = {}) {
+//   `auth: false` (LAN only) drops the gate entirely: no token/cookie/Basic,
+//   the proxy forwards every request/upgrade unconditionally and the share
+//   URL is the plain proxy URL.
+// For a gated share, a fresh token + password are generated per share, kept
+// in memory only (see the `proxies` map). The QR/authUrl carries the token
+// (opening it exchanges the token for an httpOnly session cookie server-side
+// — no credentials ever appear in the URL); username/password remain
+// available as a Basic-Auth fallback for curl/API clients, and persist
+// (in-memory) for the lifetime of the share — see `list()`.
+export async function share(id, { mode = 'tunnel', auth = true } = {}) {
   if (mode !== 'tunnel' && mode !== 'lan') {
     const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
+  }
+  if (typeof auth !== 'boolean') { const e = new Error("'auth' must be a boolean"); e.statusCode = 400; throw e; }
+  if (mode === 'tunnel' && auth === false) {
+    const e = new Error('authentication cannot be disabled for tunnel shares'); e.statusCode = 400; throw e;
   }
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
@@ -231,15 +254,20 @@ export async function share(id, { mode = 'tunnel' } = {}) {
 
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
-    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0' });
+    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth });
     proxies.set(id, proxy);
     // Drop the loopback entry — it's not reachable from another device.
     const urls = enumerateUrls(proxy.port).filter((u) => !u.startsWith('http://localhost:'));
     const url = urls[0] ?? `http://localhost:${proxy.port}`; // no LAN interface found
-    rec.tunnel = { kind: 'lan', url, urls, pid: null, username: proxy.username, proxyPort: proxy.port };
+    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth };
     await persist();
+    if (!auth) {
+      // Nothing to authenticate — but a QR of the plain URL is still a
+      // handy scan-to-open shortcut.
+      return { kind: 'lan', url, urls, auth: false, qrSvg: await qrSvg(url) };
+    }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+    return { kind: 'lan', url, urls, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
   }
 
   if (!(await tunnel.available())) {
@@ -257,11 +285,38 @@ export async function share(id, { mode = 'tunnel' } = {}) {
     throw e;
   }
   proxies.set(id, proxy);
-  rec.tunnel = { kind: 'tunnel', url, pid, username: proxy.username, proxyPort: proxy.port };
+  rec.tunnel = { kind: 'tunnel', url, pid, proxyPort: proxy.port, auth: true };
   await persist();
 
   const authUrl = withToken(url, proxy.token);
-  return { kind: 'tunnel', url, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+  return { kind: 'tunnel', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+}
+
+// Edit the active share's Basic-Auth credentials in place — mutates the live
+// proxy (see authproxy.js's setCredentials), so the share URL/token/proxy
+// port never change. Custom creds are per-share-instance only: share()
+// always tears down and recreates the proxy, so the next share starts fresh
+// with an auto-generated password again.
+export async function updateShareCredentials(id, { username, password } = {}) {
+  const proxy = proxies.get(id);
+  if (!proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
+  if (!proxy.auth) {
+    const e = new Error(`share for '${id}' has authentication disabled — nothing to edit`); e.statusCode = 400; throw e;
+  }
+  const hasUsername = username !== undefined;
+  const hasPassword = password !== undefined;
+  if (!hasUsername && !hasPassword) { const e = new Error('provide username and/or password to update'); e.statusCode = 400; throw e; }
+  if (hasUsername && (typeof username !== 'string' || !username.trim())) {
+    const e = new Error('username must be a non-empty string'); e.statusCode = 400; throw e;
+  }
+  if (hasPassword && (typeof password !== 'string' || !password.trim())) {
+    const e = new Error('password must be a non-empty string'); e.statusCode = 400; throw e;
+  }
+  proxy.setCredentials({
+    username: hasUsername ? username.trim() : undefined,
+    password: hasPassword ? password.trim() : undefined,
+  });
+  return { id, username: proxy.username, password: proxy.password };
 }
 
 export async function unshare(id) {

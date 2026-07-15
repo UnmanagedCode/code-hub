@@ -18,6 +18,9 @@ import crypto from 'node:crypto';
 // any shared app's relative `fetch()` calls in Chromium. WS upgrades accept
 // a valid cookie or Basic Auth only (no token handling — the browser already
 // carries the cookie set during the document's load).
+//
+// `auth: false` (LAN shares only) skips all of the above entirely — every
+// request and upgrade forwards unconditionally, no creds/token exist.
 
 const REALM = 'code-hub share';
 const COOKIE_NAME = 'hub_auth';
@@ -70,19 +73,39 @@ function rawHeaderLines(rawHeaders) {
 }
 
 // Start an auth proxy in front of `targetPort`. Resolves once it is listening.
-// Returns { port, username, password, token, close() }. Secrets are generated
-// with a CSPRNG per call and held in memory only (never logged/persisted;
-// the cookie secret is never even returned — only its cookie form matters).
-// `host` defaults to loopback-only (cloudflared share); a LAN share passes
-// '0.0.0.0' so other devices on the network can reach the proxy directly.
-export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1' } = {}) {
-  const password = crypto.randomBytes(18).toString('base64url');
-  const expected = `${username}:${password}`;
-  const token = crypto.randomBytes(18).toString('base64url');
-  const cookieSecret = crypto.randomBytes(18).toString('base64url');
+// Returns { port, auth, username, password, token, setCredentials(), close() }.
+// Secrets are generated with a CSPRNG per call and held in memory only
+// (never logged/persisted; the cookie secret is never even returned — only
+// its cookie form matters). `host` defaults to loopback-only (cloudflared
+// share); a LAN share passes '0.0.0.0' so other devices on the network can
+// reach the proxy directly.
+//
+// `auth: false` (LAN-only) skips the entire gate — no token/cookie/Basic
+// generated or checked, every HTTP request and WS upgrade is forwarded
+// unconditionally. `username`/`password`/`token` are `null` in that mode.
+export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', auth = true } = {}) {
+  let currentUsername = username;
+  let currentPassword = auth ? crypto.randomBytes(18).toString('base64url') : null;
+  const token = auth ? crypto.randomBytes(18).toString('base64url') : null;
+  const cookieSecret = auth ? crypto.randomBytes(18).toString('base64url') : null;
   const sockets = new Set();
 
+  // Recomputed per call (not cached) so an in-place credential edit
+  // (setCredentials) takes effect on the very next request.
+  const isGateAuthed = (req) => isCookieAuthed(req, cookieSecret) || isAuthed(req, `${currentUsername}:${currentPassword}`);
+
   const server = http.createServer((req, res) => {
+    const forward = () => {
+      const up = http.request(
+        { host: '127.0.0.1', port: targetPort, method: req.method, path: req.url, headers: req.headers },
+        (upRes) => { res.writeHead(upRes.statusCode || 502, upRes.headers); upRes.pipe(res); },
+      );
+      up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+      req.pipe(up);
+    };
+
+    if (!auth) { forward(); return; }
+
     const reqUrl = new URL(req.url, 'http://placeholder'); // req.url is relative; base is discarded
     const providedToken = reqUrl.searchParams.get('__hubauth');
 
@@ -103,7 +126,7 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       return;
     }
 
-    if (!isCookieAuthed(req, cookieSecret) && !isAuthed(req, expected)) {
+    if (!isGateAuthed(req)) {
       res.writeHead(401, {
         'WWW-Authenticate': `Basic realm="${REALM}"`,
         'Content-Type': 'text/plain',
@@ -111,18 +134,13 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       res.end('Authentication required\n');
       return;
     }
-    const up = http.request(
-      { host: '127.0.0.1', port: targetPort, method: req.method, path: req.url, headers: req.headers },
-      (upRes) => { res.writeHead(upRes.statusCode || 502, upRes.headers); upRes.pipe(res); },
-    );
-    up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
-    req.pipe(up);
+    forward();
   });
 
   // WebSocket / other upgrades: gate (cookie or Basic — no token handling),
   // then pipe raw sockets to the upstream.
   server.on('upgrade', (req, socket, head) => {
-    if (!isCookieAuthed(req, cookieSecret) && !isAuthed(req, expected)) {
+    if (auth && !isGateAuthed(req)) {
       socket.write(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\nConnection: close\r\n\r\n`);
       socket.destroy();
       return;
@@ -152,9 +170,18 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       server.removeListener('error', reject);
       resolve({
         port: server.address().port,
-        username,
-        password,
+        auth,
+        get username() { return auth ? currentUsername : null; },
+        get password() { return auth ? currentPassword : null; },
         token,
+        // Mutates the expected Basic-Auth creds in place — no restart, so
+        // the share URL/token/proxy port never change. Only meaningful when
+        // `auth` is true; the caller (appManager) guards against calling
+        // this on a no-auth share.
+        setCredentials({ username: u, password: p } = {}) {
+          if (u) currentUsername = u;
+          if (p) currentPassword = p;
+        },
         close() {
           for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
           sockets.clear();
