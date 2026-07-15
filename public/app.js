@@ -127,29 +127,69 @@ function credRow(label, value) {
   );
 }
 
-// Creds display for an active, authed share: read-only rows, or — while
+// Creds display for an active share: read-only rows, or — while
 // state.credEdit[app.id] is set (toggled by the Edit button in sharePanel's
-// action row) — inputs (prefilled) + Save/Cancel. Save PATCHes the live
-// proxy's credentials in place; action()'s own refresh() re-reads them back
-// from list() (see appManager.js), so no local merge is needed.
-function credsBlock(app, shared) {
+// action row) — an edit form + Save/Cancel. For a LAN share this form is also
+// the single place to flip authentication on/off (see the Authentication
+// checkbox below); for a tunnel share (always gated) it only ever edits
+// credentials. Save applies the auth toggle first, then the credentials PATCH
+// (only if actually changed) — see the Save handler below for why the
+// ordering and "only if changed" conditions matter. action()'s own refresh()
+// re-reads everything back from list() (see appManager.js), so no local merge
+// is needed.
+function credsBlock(app, shared, kind) {
   const editing = state.credEdit[app.id];
   if (editing) {
+    const isLan = kind === 'lan';
+    const showCreds = !isLan || editing.auth;
     return el('div', { class: 'creds' },
-      el('div', { class: 'cred' },
+      isLan ? el('label', { class: 'auth-toggle' },
+        el('input', { type: 'checkbox', checked: editing.auth, onchange: (e) => { editing.auth = e.target.checked; render(); } }),
+        ' Authentication',
+      ) : null,
+      showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'user'),
-        el('input', { class: 'cred-input', value: editing.username, oninput: (e) => { editing.username = e.target.value; } }),
-      ),
-      el('div', { class: 'cred' },
+        el('input', { class: 'cred-input', value: editing.username,
+          placeholder: editing.username ? '' : 'leave blank to keep current',
+          oninput: (e) => { editing.username = e.target.value; } }),
+      ) : null,
+      showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'pass'),
-        el('input', { class: 'cred-input', value: editing.password, oninput: (e) => { editing.password = e.target.value; } }),
-      ),
+        el('input', { class: 'cred-input', value: editing.password,
+          placeholder: editing.password ? '' : 'leave blank to keep current',
+          oninput: (e) => { editing.password = e.target.value; } }),
+      ) : null,
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => action(app.id, async () => {
-          await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
-            body: JSON.stringify({ username: editing.username, password: editing.password }),
-            headers: { 'content-type': 'application/json' },
-          });
+          if (isLan) {
+            // Auth first: updateShareCredentials 400s on a no-auth share, so
+            // an auth-enabling toggle must land before any credentials PATCH.
+            if (editing.auth !== (shared.auth !== false)) {
+              await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/auth`, {
+                body: JSON.stringify({ enabled: editing.auth }),
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+            if (editing.auth) {
+              const body = {};
+              if (editing.username && editing.username !== (shared.username ?? '')) body.username = editing.username;
+              if (editing.password && editing.password !== (shared.password ?? '')) body.password = editing.password;
+              // Blank/unchanged fields mean "keep what's there" — the proxy's
+              // credentials are stable across an auth toggle, so skipping the
+              // PATCH here is what lets re-enabling restore them untouched.
+              if (Object.keys(body).length) {
+                await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+                  body: JSON.stringify(body),
+                  headers: { 'content-type': 'application/json' },
+                });
+              }
+            }
+          } else {
+            await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+              body: JSON.stringify({ username: editing.username, password: editing.password }),
+              headers: { 'content-type': 'application/json' },
+            });
+          }
           delete state.credEdit[app.id];
         }) }, 'Save'),
         el('button', { onclick: () => { delete state.credEdit[app.id]; render(); } }, 'Cancel'),
@@ -203,23 +243,11 @@ function sharePanel(app) {
   }
 
   // Auth is only ever toggleable on a LAN share — a tunnel share is always
-  // gated. Flips the live proxy's gate in place (no new URL/token), so the
-  // toggle just calls the endpoint and lets the next refresh() re-reveal or
-  // hide the creds block below via `authEnabled`.
-  if (kind === 'lan') {
-    panel.appendChild(el('label', { class: 'auth-toggle' },
-      el('input', { type: 'checkbox', checked: authEnabled, onchange: (e) => action(app.id, async () => {
-        await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/auth`, {
-          body: JSON.stringify({ enabled: e.target.checked }),
-          headers: { 'content-type': 'application/json' },
-        });
-      }) }),
-      ' Authentication',
-    ));
-  }
-
-  if (authEnabled && shared.username && shared.password) {
-    panel.appendChild(credsBlock(app, shared));
+  // gated. The toggle itself now lives inside the Edit form below (credsBlock)
+  // rather than a standalone control, so it applies on Save instead of live.
+  const editing = !!state.credEdit[app.id];
+  if (editing || (authEnabled && shared.username && shared.password)) {
+    panel.appendChild(credsBlock(app, shared, kind));
   }
 
   if (s && s.qrSvg) {
@@ -227,13 +255,18 @@ function sharePanel(app) {
       onclick: () => openQr(s.qrSvg, openUrl) });
     panel.appendChild(qr);
   }
-  const editing = !!state.credEdit[app.id];
+  // For a LAN share, Edit is reachable regardless of auth state — it's the
+  // only way to turn authentication back on once it's off. A tunnel share is
+  // always gated, so Edit there still only ever edits credentials.
+  const canEdit = kind === 'lan' || (authEnabled && shared.username && shared.password);
   panel.appendChild(el('div', { class: 'share-actions' },
     el('a', { class: 'btn-link', href: openUrl, target: '_blank', rel: 'noopener' }, '▶ Open'),
     el('button', { onclick: () => { navigator.clipboard?.writeText(openUrl); } }, 'Copy'),
-    authEnabled && shared.username && shared.password && !editing
+    canEdit && !editing
       ? el('button', { onclick: () => {
-          state.credEdit[app.id] = { username: shared.username, password: shared.password };
+          state.credEdit[app.id] = kind === 'lan'
+            ? { auth: authEnabled, username: shared.username ?? '', password: shared.password ?? '' }
+            : { username: shared.username, password: shared.password };
           render();
         } }, 'Edit')
       : null,
