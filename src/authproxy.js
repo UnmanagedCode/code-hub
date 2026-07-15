@@ -73,21 +73,26 @@ function rawHeaderLines(rawHeaders) {
 }
 
 // Start an auth proxy in front of `targetPort`. Resolves once it is listening.
-// Returns { port, auth, username, password, token, setCredentials(), close() }.
+// Returns { port, auth, username, password, token, setCredentials(), setAuth(), close() }.
 // Secrets are generated with a CSPRNG per call and held in memory only
 // (never logged/persisted; the cookie secret is never even returned — only
 // its cookie form matters). `host` defaults to loopback-only (cloudflared
 // share); a LAN share passes '0.0.0.0' so other devices on the network can
 // reach the proxy directly.
 //
-// `auth: false` (LAN-only) skips the entire gate — no token/cookie/Basic
-// generated or checked, every HTTP request and WS upgrade is forwarded
-// unconditionally. `username`/`password`/`token` are `null` in that mode.
+// Secrets (password/token/cookie secret) are ALWAYS generated, even when
+// starting with `auth: false` — this is what lets `setAuth(true)` gate the
+// proxy later with no restart and no new token, so a URL/QR handed out while
+// unauthed (or before an off→on toggle) stays valid for the proxy's whole
+// lifetime. `auth: false` only skips the gate itself: every HTTP request and
+// WS upgrade is forwarded unconditionally, and `username`/`password` read as
+// `null` (they're hidden, not absent) until auth is turned on.
 export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', auth = true } = {}) {
   let currentUsername = username;
-  let currentPassword = auth ? crypto.randomBytes(18).toString('base64url') : null;
-  const token = auth ? crypto.randomBytes(18).toString('base64url') : null;
-  const cookieSecret = auth ? crypto.randomBytes(18).toString('base64url') : null;
+  let currentPassword = crypto.randomBytes(18).toString('base64url');
+  let currentAuth = auth;
+  const token = crypto.randomBytes(18).toString('base64url');
+  const cookieSecret = crypto.randomBytes(18).toString('base64url');
   const sockets = new Set();
 
   // Recomputed per call (not cached) so an in-place credential edit
@@ -104,7 +109,7 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       req.pipe(up);
     };
 
-    if (!auth) { forward(); return; }
+    if (!currentAuth) { forward(); return; }
 
     const reqUrl = new URL(req.url, 'http://placeholder'); // req.url is relative; base is discarded
     const providedToken = reqUrl.searchParams.get('__hubauth');
@@ -140,7 +145,7 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
   // WebSocket / other upgrades: gate (cookie or Basic — no token handling),
   // then pipe raw sockets to the upstream.
   server.on('upgrade', (req, socket, head) => {
-    if (auth && !isGateAuthed(req)) {
+    if (currentAuth && !isGateAuthed(req)) {
       socket.write(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\nConnection: close\r\n\r\n`);
       socket.destroy();
       return;
@@ -170,9 +175,9 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       server.removeListener('error', reject);
       resolve({
         port: server.address().port,
-        auth,
-        get username() { return auth ? currentUsername : null; },
-        get password() { return auth ? currentPassword : null; },
+        get auth() { return currentAuth; },
+        get username() { return currentAuth ? currentUsername : null; },
+        get password() { return currentAuth ? currentPassword : null; },
         token,
         // Mutates the expected Basic-Auth creds in place — no restart, so
         // the share URL/token/proxy port never change. Only meaningful when
@@ -182,6 +187,11 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
           if (u) currentUsername = u;
           if (p) currentPassword = p;
         },
+        // Flips the gate itself in place — no restart, no new token/creds,
+        // so a share URL/QR issued before the flip (in either direction)
+        // stays valid. The caller (appManager) persists the new state and
+        // only allows this for LAN shares (tunnel is always gated).
+        setAuth(enabled) { currentAuth = !!enabled; },
         close() {
           for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
           sockets.clear();

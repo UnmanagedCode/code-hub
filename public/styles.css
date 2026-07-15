@@ -162,12 +162,11 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
   word-break: break-all; }
 .cred-input { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 12px; padding: 4px 8px; }
-.cred-copy, .cred-edit { flex: 0 0 auto; min-height: 30px; padding: 4px 10px; font-size: 12px; }
-.cred-edit { align-self: flex-start; }
+.cred-copy { flex: 0 0 auto; min-height: 30px; padding: 4px 10px; font-size: 12px; }
 .cred-note { color: var(--muted); font-size: 11px; }
 
-/* LAN auth-disable toggle (choosing panel) */
-.auth-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
+/* LAN auth on/off toggle (active share panel — tunnel shares are always gated) */
+.auth-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; margin-top: 8px; }
 .auth-toggle input { margin: 0; }
 
 /* Worktrees — expandable subcards under the parent project (ro-hub pattern) */

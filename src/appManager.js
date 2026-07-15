@@ -319,6 +319,25 @@ export async function updateShareCredentials(id, { username, password } = {}) {
   return { id, username: proxy.username, password: proxy.password };
 }
 
+// Flip a live LAN share's auth gate in place — mutates the proxy (see
+// authproxy.js's setAuth), so the share URL/token/proxy port never change.
+// Tunnel shares are always gated and reject this (mirrors the mode==='tunnel'
+// guard in share()); a token/authUrl handed out earlier stays valid either
+// way since the proxy never regenerates them on a toggle.
+export async function setShareAuth(id, enabled) {
+  if (typeof enabled !== 'boolean') { const e = new Error("'enabled' must be a boolean"); e.statusCode = 400; throw e; }
+  const rec = store.apps[id];
+  const proxy = proxies.get(id);
+  if (!rec?.tunnel || !proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
+  if (rec.tunnel.kind !== 'lan') {
+    const e = new Error('authentication cannot be toggled for tunnel shares — tunnel shares are always gated'); e.statusCode = 400; throw e;
+  }
+  proxy.setAuth(enabled);
+  rec.tunnel.auth = enabled;
+  await persist();
+  return { id, auth: enabled };
+}
+
 export async function unshare(id) {
   const rec = store.apps[id];
   if (rec?.tunnel || proxies.has(id)) { teardownShare(id, rec); await persist(); }

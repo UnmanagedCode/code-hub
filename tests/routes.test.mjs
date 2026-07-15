@@ -292,6 +292,65 @@ test('PATCH share credentials on a no-auth share → 400', async (t) => {
   assert.equal(res.status, 400);
 });
 
+test('PATCH share/auth flips a live LAN share in place, no restart', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  process.env.CODEHUB_CLOUDFLARED_BIN = '/nonexistent/cloudflared';
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin; });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  // No active share yet → 409.
+  assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false })).status, 409);
+
+  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  const pp = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
+
+  // Missing/non-boolean `enabled` → 400.
+  assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', {})).status, 400);
+  assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: 'nope' })).status, 400);
+
+  // Turn auth off: list() hides creds, proxy forwards with no gate.
+  const off = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false });
+  assert.equal(off.status, 200);
+  assert.deepEqual(off.body, { id: 'app', auth: false });
+  let after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(after.tunnel.auth, false);
+  assert.equal(after.tunnel.username, null);
+  assert.equal(after.tunnel.password, null);
+  const forwardedNoAuth = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(forwardedNoAuth.status, 200);
+
+  // Turn auth back on: same proxyPort, same password as the original share() — no restart.
+  const on = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: true });
+  assert.equal(on.status, 200);
+  assert.deepEqual(on.body, { id: 'app', auth: true });
+  after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(after.tunnel.auth, true);
+  assert.equal(after.tunnel.proxyPort, pp);
+  assert.equal(after.tunnel.password, shareRes.body.password);
+  const gatedNoAuth = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(gatedNoAuth.status, 401);
+  const gatedAuthed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', shareRes.body.password) } });
+  assert.equal(gatedAuthed.status, 200);
+});
+
+test('PATCH share/auth on a tunnel share → 400 (tunnel shares are always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  await j(base, 'POST', '/api/apps/app/share'); // default mode: tunnel
+  const res = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false });
+  assert.equal(res.status, 400);
+});
+
 test('share with an invalid mode → 400', async (t) => {
   const root = await mkRoot();
   await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
