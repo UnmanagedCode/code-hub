@@ -10,6 +10,7 @@
   --amber: #f59e0b;    /* outdated pill */
   --border: #2c323d;
   --mono: ui-monospace, "JetBrains Mono", monospace;
+  --content-max: 1400px;   /* shared centered content column */
   color-scheme: dark;
 }
 
@@ -35,7 +36,10 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 #topbar {
   position: sticky; top: 0; z-index: 5;
   display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 10px; padding: calc(18px + env(safe-area-inset-top)) 16px 10px;
+  gap: 10px;
+  padding: calc(18px + env(safe-area-inset-top))
+           max(16px, calc((100% - var(--content-max)) / 2 + 12px))
+           10px;
   background: var(--panel); border-bottom: 1px solid var(--border);
 }
 #topbar h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: .5px; }
@@ -54,7 +58,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .pill.off { color: var(--muted); }
 
 /* Layout */
-#app { max-width: 1100px; margin: 0 auto; padding: 12px 12px 80px; }
+#app { max-width: var(--content-max); margin: 0 auto; padding: 12px 12px 80px; }
 .empty { color: var(--muted); text-align: center; padding: 40px 20px; }
 
 /* Toolbar: sort + refresh */
@@ -74,6 +78,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 #projects { display: grid; grid-template-columns: 1fr; gap: 10px; }
 @media (min-width: 640px) { #projects { grid-template-columns: 1fr 1fr; } }
 @media (min-width: 1000px) { #projects { grid-template-columns: 1fr 1fr 1fr; } }
+@media (min-width: 1400px) { #projects { grid-template-columns: 1fr 1fr 1fr 1fr; } }
 .card {
   background: var(--panel); border: 1px solid var(--border);
   border-left: 7px solid var(--accent-bar, var(--accent));
@@ -185,7 +190,8 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .card.subcard .card-title { font-size: 14px; }
 
 /* Footer — fixed, right-aligned (ro-hub) */
-#footer { position: fixed; bottom: 0; left: 0; right: 0; padding: 10px 14px;
+#footer { position: fixed; bottom: 0; left: 0; right: 0;
+  padding: 10px max(14px, calc((100% - var(--content-max)) / 2 + 12px));
   text-align: right; color: var(--muted); font-size: 12px; font-family: var(--mono);
   background: linear-gradient(to top, var(--bg), transparent); }
 
