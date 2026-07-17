@@ -22,6 +22,15 @@ export function hostConductorPort() {
   }
 }
 
+// The conductor's own checkout directory (absolute), injected by the conductor
+// when embedded. May live OUTSIDE the projects root (a conductor with a custom
+// PROJECTS_ROOT keeps its own checkout elsewhere). null when unset (an older
+// conductor that doesn't inject it) or not embedded.
+export function hostConductorDir() {
+  if (!isEmbedded()) return null;
+  return process.env.CONDUCTOR_PROJECT_DIR || null;
+}
+
 // True only for the main code-conductor checkout while embedded — never for
 // a worktree (those have a distinct `_worktree_<hash>`-suffixed id, so this
 // can never misfire on one).

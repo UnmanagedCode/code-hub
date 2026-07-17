@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { unregisterInMemory } from '../src/projects.js';
@@ -139,6 +142,59 @@ test('embedded, no .hub.json on the conductor dir: init() still surfaces it via 
   assert.equal(main.port, conductorPort);
   assert.equal(main.sourceMissing, false);
   assert.equal(main.error, null);
+});
+
+test('embedded with CONDUCTOR_PROJECT_DIR outside the projects root: host conductor still surfaces always-on from the injected dir', async (t) => {
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  // Scanned projects root has NO code-conductor dir; the conductor checkout
+  // lives under a separate parent, outside the root (git repo, no .hub.json).
+  const root = await mkRoot();
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-conductor-'));
+  const conductorDir = await mkProject(outsideParent, 'code-conductor', null, { git: true });
+  process.env.CONDUCTOR_PROJECT_DIR = conductorDir;
+
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  let res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main, 'host conductor should surface even though its dir is outside the root');
+  assert.equal(main.status, 'running');
+  assert.equal(main.alwaysOn, true);
+  assert.equal(main.port, conductorPort);
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.sourceMissing, false);
+  assert.equal(main.path, conductorDir);
+  // Git info reads from the injected dir (proves path-based git works out-of-root).
+  assert.ok(main.currentSha, 'currentSha read from the injected dir');
+  assert.ok(main.lastCommitAt, 'lastCommitAt read from the injected dir');
+
+  // Start/stop/restart are blocked; share works against the running conductor.
+  assert.equal((await j(base, 'POST', '/api/apps/code-conductor/start')).status, 409);
+  assert.equal((await j(base, 'POST', '/api/apps/code-conductor/stop')).status, 409);
+  assert.equal((await j(base, 'POST', '/api/apps/code-conductor/restart')).status, 409);
+
+  res = await j(base, 'POST', '/api/apps/code-conductor/share');
+  assert.equal(res.status, 200);
+  assert.match(res.body.url, /trycloudflare\.com$/);
+
+  res = await j(base, 'DELETE', '/api/apps/code-conductor/share');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.tunnel, null);
 });
 
 test('embedded, worktree with no .hub.json of its own inherits the host conductor\'s in-memory manifest', async (t) => {

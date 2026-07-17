@@ -51,7 +51,7 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 |---|---|---|
 | UI port | `7000` | `PORT` |
 | UI host | `127.0.0.1` | `HOST` |
-| Projects root | parent dir of this repo | `PROJECTS_ROOT` |
+| Projects root | parent dir of this repo | `PROJECTS_ROOT` (the conductor injects this when embedded, so the hub scans the conductor's own root) |
 | cloudflared binary | `cloudflared` (from `PATH`) | `CODEHUB_CLOUDFLARED_BIN` |
 | Runtime state | `<projectsRoot>/.code-hub/state.json` | — |
 | Machine-local registrations | `<projectsRoot>/.code-hub/registrations.json` | — |
@@ -66,7 +66,7 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 
 code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`/`register_app`/`unregister_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
 
-When embedded, code-hub registers the host `code-conductor` checkout itself via an **internal, process-lifetime-only registration** (never persisted, not exposed via `register_app`) so it shows up as an always-on app without needing a `.hub.json` of its own. Running code-hub standalone (no `CONDUCTOR_*` env vars), `code-conductor` doesn't show up at all unless separately given a `.hub.json` or a machine-local registration.
+When embedded, code-hub surfaces the host `code-conductor` checkout as an **always-on** app without needing a `.hub.json` of its own. It locates the checkout from the `CONDUCTOR_PROJECT_DIR` env var the conductor injects — so it shows up even when the conductor's own checkout lives **outside** the scanned `PROJECTS_ROOT` (a conductor with a custom root). Older conductors that don't inject `CONDUCTOR_PROJECT_DIR` fall back to discovering a `code-conductor/` dir under the root via an **internal, process-lifetime-only registration** (never persisted, not exposed via `register_app`). Running code-hub standalone (no `CONDUCTOR_*` env vars), `code-conductor` doesn't show up at all unless separately given a `.hub.json` or a machine-local registration.
 
 ## Testing
 

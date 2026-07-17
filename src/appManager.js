@@ -11,7 +11,7 @@ import { allocatePort, enumerateUrls, routeUrls } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
-import { isEmbedded, isHostConductorId, hostConductorPort, HOST_CONDUCTOR_ID } from './hostConductor.js';
+import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -39,17 +39,32 @@ export async function init() {
   // id to treat it as always-on instead of an ordinary app. It has no real
   // pid, so state.reconcile() prunes it again on the next boot; we simply
   // re-synthesize it here every time, same as any other share not
-  // surviving a restart. The conductor carries no `.hub.json` of its own, so
-  // register it in-memory (never persisted) before discovering — this is
-  // what makes discoverApps() find it at all.
+  // surviving a restart.
   if (isEmbedded()) {
-    registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
-    const discovered = await discoverApps();
-    const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
     const port = hostConductorPort();
-    if (app && port) {
+    const injectedDir = hostConductorDir();
+    let appPath = null;
+    if (injectedDir) {
+      // Modern conductor: it injected its own checkout dir, which may live
+      // OUTSIDE the scanned projects root. Use it directly — no under-root
+      // discovery and no in-memory registration (a dir absent from the root
+      // would only make discoverApps() warn about an orphaned key). list()'s
+      // second loop surfaces this store.apps record even though discoverApps()
+      // never returns it.
+      appPath = injectedDir;
+    } else {
+      // Older conductor (no CONDUCTOR_PROJECT_DIR): fall back to discovering a
+      // `code-conductor/` dir under the root. The conductor carries no
+      // `.hub.json` of its own, so register it in-memory (never persisted)
+      // before discovering — this is what makes discoverApps() find it at all.
+      registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
+      const discovered = await discoverApps();
+      const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
+      appPath = app ? app.path : null;
+    }
+    if (appPath && port) {
       store.apps[HOST_CONDUCTOR_ID] = {
-        id: HOST_CONDUCTOR_ID, project: app.project, path: app.path,
+        id: HOST_CONDUCTOR_ID, project: HOST_CONDUCTOR_ID, path: appPath,
         isWorktree: false, branch: null,
         pid: null, pgid: null, port,
         urls: enumerateUrls(port),
@@ -93,7 +108,12 @@ export async function list() {
   let mutated = false;
 
   const build = async (base, rec) => {
-    const sourceMissing = !byId.has(base.id);
+    // The always-on host conductor may live at an injected dir OUTSIDE the
+    // scanned projects root, so discoverApps() never returns it (byId misses
+    // it) even though its checkout is present. Don't flag it sourceMissing —
+    // the git-info lines below then read from base.path (the injected dir) as
+    // usual. Under-root (discovered) and standalone cases are unaffected.
+    const sourceMissing = !byId.has(base.id) && !isHostConductorId(base.id);
     let status = 'stopped';
     let error = base.manifestError ?? null;
     let port, urls, startedSha, tunnelInfo = null;
