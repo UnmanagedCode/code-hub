@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import crypto from 'node:crypto';
 
@@ -21,6 +22,12 @@ import crypto from 'node:crypto';
 //
 // `auth: false` (LAN shares only) skips all of the above entirely — every
 // request and upgrade forwards unconditionally, no creds/token exist.
+//
+// `tls: { key, cert }` (LAN shares only) makes the proxy serve HTTPS instead of
+// plain HTTP, so the token/cookie/Basic-Auth are encrypted on the LAN hop; the
+// session cookie then also gets the `Secure` attribute. Tunnel-mode shares
+// never pass `tls` — cloudflared terminates TLS upstream and forwards plain
+// HTTP to this proxy, so a `Secure` cookie would be silently dropped there.
 
 const REALM = 'code-hub share';
 const COOKIE_NAME = 'hub_auth';
@@ -87,19 +94,20 @@ function rawHeaderLines(rawHeaders) {
 // lifetime. `auth: false` only skips the gate itself: every HTTP request and
 // WS upgrade is forwarded unconditionally, and `username`/`password` read as
 // `null` (they're hidden, not absent) until auth is turned on.
-export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', auth = true } = {}) {
+export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', auth = true, tls = null } = {}) {
   let currentUsername = username;
   let currentPassword = crypto.randomBytes(18).toString('base64url');
   let currentAuth = auth;
   const token = crypto.randomBytes(18).toString('base64url');
   const cookieSecret = crypto.randomBytes(18).toString('base64url');
+  const secureCookie = Boolean(tls); // add `Secure` only when this hop is HTTPS
   const sockets = new Set();
 
   // Recomputed per call (not cached) so an in-place credential edit
   // (setCredentials) takes effect on the very next request.
   const isGateAuthed = (req) => isCookieAuthed(req, cookieSecret) || isAuthed(req, `${currentUsername}:${currentPassword}`);
 
-  const server = http.createServer((req, res) => {
+  const handler = (req, res) => {
     const forward = () => {
       const up = http.request(
         { host: '127.0.0.1', port: targetPort, method: req.method, path: req.url, headers: req.headers },
@@ -119,12 +127,14 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
     // stale/foreign cookie must never shadow a fresh, valid token.
     if (providedToken !== null && credsMatch(providedToken, token)) {
       reqUrl.searchParams.delete('__hubauth');
-      // No `Secure` attribute: LAN shares are plain http, and tunnel-mode
-      // shares are plain http on this hop too (cloudflared terminates TLS
-      // upstream and forwards http to the proxy) — `Secure` would make the
-      // browser silently drop the cookie in both cases.
+      // `Secure` is added only for an HTTPS proxy (LAN TLS): the browser talks
+      // https directly, so the cookie rides an encrypted hop. Plain-LAN and
+      // tunnel-mode shares serve http on this hop (cloudflared terminates TLS
+      // upstream and forwards http here), where `Secure` would make the browser
+      // silently drop the cookie.
+      const cookie = `${COOKIE_NAME}=${cookieSecret}; Path=/; HttpOnly; SameSite=Lax${secureCookie ? '; Secure' : ''}`;
       res.writeHead(302, {
-        'Set-Cookie': `${COOKIE_NAME}=${cookieSecret}; Path=/; HttpOnly; SameSite=Lax`,
+        'Set-Cookie': cookie,
         Location: reqUrl.pathname + reqUrl.search,
       });
       res.end();
@@ -140,7 +150,14 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
       return;
     }
     forward();
-  });
+  };
+
+  // HTTPS when a cert is supplied (LAN TLS), else plain HTTP. The upgrade
+  // handler and raw-socket upstream pipe below are identical either way — an
+  // https server transparently hands the `upgrade` handler a TLS-wrapped
+  // inbound socket, and the upstream leg is always a plain net.connect to
+  // localhost.
+  const server = tls ? https.createServer(tls, handler) : http.createServer(handler);
 
   // WebSocket / other upgrades: gate (cookie or Basic — no token handling),
   // then pipe raw sockets to the upstream.

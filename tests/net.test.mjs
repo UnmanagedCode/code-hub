@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s } from '../src/net.js';
+import { allocatePort, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
   const port = await allocatePort();
@@ -21,6 +21,20 @@ test('enumerateUrls emits a single localhost loopback (no 127.0.0.1 dup)', () =>
   assert.ok(urls.includes('http://localhost:1234'));
   assert.ok(!urls.includes('http://127.0.0.1:1234'));
   assert.ok(urls.every((u) => /^http:\/\/[^/]+:1234$/.test(u)));
+});
+
+test('enumerateUrls with scheme:"https" emits https:// URLs (LAN TLS)', (t) => {
+  t.mock.method(os, 'networkInterfaces', () => ONE_NON_INTERNAL_IFACE);
+  const urls = enumerateUrls(1234, { scheme: 'https' });
+  assert.deepEqual(urls, ['https://localhost:1234', 'https://10.0.0.5:1234']);
+});
+
+test('localIPv4s returns an array of non-internal IPv4s (empty when none visible)', (t) => {
+  t.mock.method(os, 'networkInterfaces', () => ONE_NON_INTERNAL_IFACE);
+  assert.deepEqual(localIPv4s(), ['10.0.0.5']);
+  t.mock.method(os, 'networkInterfaces', () => NO_NON_INTERNAL_IFACES);
+  t.mock.method(cp, 'execFileSync', () => { throw new Error('must not shell out without lanFallback'); });
+  assert.deepEqual(localIPv4s(), []);
 });
 
 test('routeUrls for "/" equals the clean base URLs', () => {

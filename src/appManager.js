@@ -7,10 +7,11 @@ import {
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
-import { allocatePort, enumerateUrls, routeUrls } from './net.js';
+import { allocatePort, enumerateUrls, routeUrls, localIPv4s } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
+import { generateSelfSigned } from './selfsigned.js';
 import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
@@ -130,6 +131,7 @@ export async function list() {
           url: rec.tunnel.url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
           proxyPort: rec.tunnel.proxyPort ?? null,
           auth: rec.tunnel.auth !== false,
+          tls: rec.tunnel.tls === true,
           username: proxy ? proxy.username : null,
           password: proxy ? proxy.password : null,
         };
@@ -246,6 +248,16 @@ export async function restart(id) {
   return start(id);
 }
 
+// Default for LAN-share TLS wrapping — on unless CODEHUB_LAN_TLS is set to a
+// falsy value ('0'/'false'/'no'/'off'). Read per call (not cached) so tests can
+// toggle it via env, mirroring tunnel.js's bin(). A per-share `tls` flag
+// overrides this.
+function lanTlsDefault() {
+  const v = process.env.CODEHUB_LAN_TLS;
+  if (v === undefined) return true;
+  return !/^(0|false|no|off)$/i.test(v.trim());
+}
+
 // Share a running app behind a local auth proxy. Two modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
 //   so the public *.trycloudflare.com URL goes through it. Always gated.
@@ -253,14 +265,16 @@ export async function restart(id) {
 //   devices on the local network can reach it directly — no cloudflared.
 //   `auth: false` (LAN only) drops the gate entirely: no token/cookie/Basic,
 //   the proxy forwards every request/upgrade unconditionally and the share
-//   URL is the plain proxy URL.
+//   URL is the plain proxy URL. `tls` (LAN only, default on — see
+//   lanTlsDefault) wraps the proxy in HTTPS with a per-share self-signed cert
+//   so the LAN hop is encrypted; set it false for plain HTTP.
 // For a gated share, a fresh token + password are generated per share, kept
 // in memory only (see the `proxies` map). The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
 // — no credentials ever appear in the URL); username/password remain
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
-export async function share(id, { mode = 'tunnel', auth = true } = {}) {
+export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
   if (mode !== 'tunnel' && mode !== 'lan') {
     const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
   }
@@ -268,26 +282,39 @@ export async function share(id, { mode = 'tunnel', auth = true } = {}) {
   if (mode === 'tunnel' && auth === false) {
     const e = new Error('authentication cannot be disabled for tunnel shares'); e.statusCode = 400; throw e;
   }
+  if (tls !== undefined && typeof tls !== 'boolean') { const e = new Error("'tls' must be a boolean"); e.statusCode = 400; throw e; }
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
   if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
 
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
-    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth });
+    const useTls = tls ?? lanTlsDefault();
+    // Self-signed cert covering the LAN IPs + loopback, generated per share and
+    // held in memory only (via the proxy) — nothing on disk. Browsers show a
+    // one-time "not private" warning (self-signed); documented as a limitation.
+    let tlsOpt = null;
+    if (useTls) {
+      const ips = localIPv4s({ lanFallback: true });
+      const { key, cert } = generateSelfSigned({ ipAddresses: [...ips, '127.0.0.1'], dnsNames: ['localhost'] });
+      tlsOpt = { key, cert };
+    }
+    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth, tls: tlsOpt });
     proxies.set(id, proxy);
+    const scheme = useTls ? 'https' : 'http';
     // Drop the loopback entry — it's not reachable from another device.
-    const urls = enumerateUrls(proxy.port, { lanFallback: true }).filter((u) => !u.startsWith('http://localhost:'));
-    const url = urls[0] ?? `http://localhost:${proxy.port}`; // no LAN interface found
-    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth };
+    const loopbackPrefix = `${scheme}://localhost:`;
+    const urls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
+    const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
+    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls };
     await persist();
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
-      return { kind: 'lan', url, urls, auth: false, qrSvg: await qrSvg(url) };
+      return { kind: 'lan', url, urls, auth: false, tls: useTls, qrSvg: await qrSvg(url) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+    return { kind: 'lan', url, urls, auth: true, tls: useTls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
   }
 
   if (!(await tunnel.available())) {
