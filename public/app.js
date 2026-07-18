@@ -230,12 +230,15 @@ function sharePanel(app) {
   const openUrl = (s && s.authUrl) || shared.url;
   const kind = shared.kind || 'tunnel';
   const authEnabled = shared.auth !== false;
+  const lanTls = kind === 'lan' && String(shared.url).startsWith('https:');
   const panel = el('div', { class: 'share' });
   panel.appendChild(el('div', { class: 'share-url' }, shared.url));
   panel.appendChild(el('div', { class: 'cred-note' },
-    !authEnabled ? 'via LAN, no authentication — anyone on the network can reach this app'
-    : kind === 'lan' ? 'via LAN (plain HTTP — credentials are not encrypted in transit)'
-    : 'via public tunnel'));
+    kind !== 'lan' ? 'via public tunnel'
+    : !authEnabled && lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit), no authentication — anyone on the network can reach this app'
+    : !authEnabled ? 'via LAN, no authentication — anyone on the network can reach this app'
+    : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
+    : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
 
   if (shared.urls && shared.urls.length > 1) {
     panel.appendChild(el('div', { class: 'lan-links' },

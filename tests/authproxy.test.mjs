@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
+import tls from 'node:tls';
 import { startAuthProxy } from '../src/authproxy.js';
+import { generateSelfSigned } from '../src/selfsigned.js';
 
 // A tiny raw upstream: serves "ok" for normal requests, and on a WS-style
 // upgrade replies 101 then echoes bytes. Lets us prove the auth gate + the
@@ -17,6 +20,56 @@ function upstream() {
 }
 
 const basic = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+
+// A self-signed cert for the loopback host — mirrors what appManager builds for
+// a LAN HTTPS share. Global fetch (undici) ignores the http `agent` option, so
+// TLS requests below go through https.request with rejectUnauthorized:false.
+function lanCert() {
+  return generateSelfSigned({ ipAddresses: ['127.0.0.1'], dnsNames: ['localhost'] });
+}
+
+// HTTPS GET against a self-signed proxy. Resolves { status, headers, body }.
+function httpsGet(port, path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ host: '127.0.0.1', port, path, headers, rejectUnauthorized: false }, (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Raw WS-upgrade handshake over a TLS socket (wss). Same shape as rawUpgrade.
+function tlsUpgrade(port, authHeader, payload = 'PING', cookieHeader = null) {
+  return new Promise((resolve, reject) => {
+    const sock = tls.connect({ port, host: '127.0.0.1', rejectUnauthorized: false }, () => {
+      const lines = [
+        'GET /ws HTTP/1.1', `Host: 127.0.0.1:${port}`,
+        'Upgrade: websocket', 'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version: 13',
+      ];
+      if (authHeader) lines.push(`Authorization: ${authHeader}`);
+      if (cookieHeader) lines.push(`Cookie: ${cookieHeader}`);
+      sock.write(lines.join('\r\n') + '\r\n\r\n');
+    });
+    let buf = '', sent = false;
+    sock.on('data', (d) => {
+      buf += d.toString('binary');
+      const statusLine = buf.split('\r\n')[0];
+      if (!sent && buf.includes('\r\n\r\n')) {
+        if (statusLine.startsWith('HTTP/1.1 101')) { sent = true; sock.write(payload); }
+        else { sock.destroy(); resolve({ statusLine, echoed: false }); }
+      } else if (sent) {
+        const body = buf.split('\r\n\r\n').slice(1).join('\r\n\r\n');
+        if (body.includes(payload)) { sock.destroy(); resolve({ statusLine, echoed: true }); }
+      }
+    });
+    sock.on('error', reject);
+    setTimeout(() => { sock.destroy(); resolve({ statusLine: buf.split('\r\n')[0] || '', echoed: false }); }, 2000).unref();
+  });
+}
 
 // Raw WS-upgrade handshake over a bare TCP socket. Resolves with the status
 // line and, on a 101, whether the payload we sent was echoed back.
@@ -280,4 +333,58 @@ test('a proxy started auth:false can setAuth(true) using creds pre-generated at 
   const wsAuthed = await rawUpgrade(proxy.port, basic(username, password));
   assert.match(wsAuthed.statusLine, /101/);
   assert.equal(wsAuthed.echoed, true);
+});
+
+test('tls: serves HTTPS, gates and forwards, and sets a Secure cookie on token exchange', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { host: '0.0.0.0', tls: lanCert() });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const bad = await httpsGet(proxy.port, '/');
+  assert.equal(bad.status, 401);
+  assert.match(bad.headers['www-authenticate'] || '', /Basic/);
+
+  // Token exchange over HTTPS sets the session cookie WITH `Secure`.
+  const redirect = await httpsGet(proxy.port, `/some/path?__hubauth=${proxy.token}&keep=1`);
+  assert.equal(redirect.status, 302);
+  const setCookie = (redirect.headers['set-cookie'] || [])[0] || '';
+  assert.match(setCookie, /^hub_auth=[^;]+; Path=\/; HttpOnly; SameSite=Lax; Secure$/);
+  assert.equal(redirect.headers.location, '/some/path?keep=1');
+
+  // Basic-Auth still forwards over HTTPS.
+  const ok = await httpsGet(proxy.port, '/', { authorization: basic(proxy.username, proxy.password) });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body, 'ok');
+
+  // Cookie obtained via the exchange authenticates a follow-up HTTPS request.
+  const cookie = setCookie.split(';')[0];
+  const viaCookie = await httpsGet(proxy.port, '/', { cookie });
+  assert.equal(viaCookie.status, 200);
+});
+
+test('tls: forwards a WebSocket upgrade over wss', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { host: '0.0.0.0', tls: lanCert() });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const noauth = await tlsUpgrade(proxy.port, null);
+  assert.match(noauth.statusLine, /401/);
+
+  const good = await tlsUpgrade(proxy.port, basic(proxy.username, proxy.password));
+  assert.match(good.statusLine, /101/);
+  assert.equal(good.echoed, true); // bytes round-tripped through the TLS-fronted tunnel
+});
+
+test('no tls (tunnel/plain-LAN hop): token cookie omits Secure', async (t) => {
+  // Regression guard: the shared code path must NOT set `Secure` on the plain
+  // HTTP hop — cloudflared forwards http to the proxy, where a Secure cookie
+  // would be silently dropped by the browser.
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port); // default: no tls, loopback (tunnel-style)
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/?__hubauth=${proxy.token}`, { redirect: 'manual' });
+  assert.equal(res.status, 302);
+  const setCookie = res.headers.get('set-cookie') || '';
+  assert.doesNotMatch(setCookie, /Secure/);
 });

@@ -68,15 +68,14 @@ function fallbackLanIPv4s() {
   return ips;
 }
 
-// Every URL that serves an app bound to `port`: the `localhost` loopback name
-// plus each non-internal IPv4 the machine exposes (LAN access from a phone).
-// Only one loopback URL is emitted (localhost) — the 127.0.0.1 form is an
-// equivalent duplicate. The `ip`/`ifconfig` shell-out fallback only runs when
-// `lanFallback` is true — it's for the LAN-share path (appManager.js), which
-// needs a real LAN IP to hand to another device; plain app-card URLs should
-// reflect only what Node's os.networkInterfaces() natively sees.
-export function enumerateUrls(port, { lanFallback = false } = {}) {
-  const urls = [`http://localhost:${port}`];
+// Non-internal IPv4 addresses the machine exposes (LAN access from a phone).
+// The `ip`/`ifconfig` shell-out fallback only runs when `lanFallback` is true —
+// it's for the LAN-share path (appManager.js), which needs a real LAN IP to
+// hand to another device (and, for LAN HTTPS, to put in the cert SAN); plain
+// app-card URLs should reflect only what Node's os.networkInterfaces() sees.
+// Single source of truth for local IPs — used by both URL enumeration and the
+// self-signed cert's subjectAltName.
+export function localIPv4s({ lanFallback = false } = {}) {
   const ips = new Set();
   const ifaces = os.networkInterfaces();
   for (const list of Object.values(ifaces)) {
@@ -87,7 +86,16 @@ export function enumerateUrls(port, { lanFallback = false } = {}) {
   if (ips.size === 0 && lanFallback) {
     for (const ip of fallbackLanIPv4s()) ips.add(ip);
   }
-  for (const ip of ips) urls.push(`http://${ip}:${port}`);
+  return [...ips];
+}
+
+// Every URL that serves an app bound to `port`: the `localhost` loopback name
+// plus each non-internal IPv4 (see localIPv4s). Only one loopback URL is
+// emitted (localhost) — the 127.0.0.1 form is an equivalent duplicate. `scheme`
+// is 'http' by default; the LAN-share path passes 'https' when TLS-wrapped.
+export function enumerateUrls(port, { lanFallback = false, scheme = 'http' } = {}) {
+  const urls = [`${scheme}://localhost:${port}`];
+  for (const ip of localIPv4s({ lanFallback })) urls.push(`${scheme}://${ip}:${port}`);
   return urls;
 }
 

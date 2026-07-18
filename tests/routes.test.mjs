@@ -3,12 +3,24 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import https from 'node:https';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { storeRoot } from '../src/projects.js';
 import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+
+// HTTPS GET against a self-signed LAN proxy (undici's fetch ignores TLS opts).
+const httpsGet = (port, path, headers = {}) => new Promise((resolve, reject) => {
+  const req = https.request({ host: '127.0.0.1', port, path, headers, rejectUnauthorized: false }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve({ status: res.statusCode, body }));
+  });
+  req.on('error', reject);
+  req.end();
+});
 
 async function boot(root) {
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
@@ -172,9 +184,10 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   await j(base, 'POST', '/api/apps/app/start');
   await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
 
-  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
   assert.equal(res.status, 200);
   assert.equal(res.body.kind, 'lan');
+  assert.equal(res.body.tls, false);
   assert.match(res.body.authUrl, /^http:\/\/.+\?__hubauth=[\w-]+$/);
   assert.equal(res.body.username, 'hub');
   assert.ok(Array.isArray(res.body.urls));
@@ -198,6 +211,68 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
 });
 
+test('share mode=lan defaults to HTTPS (self-signed): tls:true, https URLs, reachable + gated over TLS', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root); // no CODEHUB_LAN_TLS set → default on
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' }); // no tls flag → default
+  assert.equal(res.status, 200);
+  assert.equal(res.body.tls, true);
+  assert.match(res.body.authUrl, /^https:\/\/.+\?__hubauth=[\w-]+$/);
+  assert.ok(res.body.urls.every((u) => u.startsWith('https://')));
+
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.tls, true);
+  const pp = app.tunnel.proxyPort;
+
+  // The proxy serves HTTPS: plain-HTTP fetch fails the handshake; HTTPS is gated + forwards.
+  await assert.rejects(fetch(`http://127.0.0.1:${pp}/`));
+  const noauth = await httpsGet(pp, '/');
+  assert.equal(noauth.status, 401);
+  const authed = await httpsGet(pp, '/', { authorization: basicAuth('hub', res.body.password) });
+  assert.equal(authed.status, 200);
+  assert.equal(authed.body, 'ok');
+});
+
+test('share mode=lan honors CODEHUB_LAN_TLS=0 as the default-off switch', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  process.env.CODEHUB_LAN_TLS = '0';
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); delete process.env.CODEHUB_LAN_TLS; });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' }); // env default now off
+  assert.equal(res.status, 200);
+  assert.equal(res.body.tls, false);
+  assert.match(res.body.authUrl, /^http:\/\//);
+
+  // A per-share tls:true still overrides the env default.
+  const on = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: true });
+  assert.equal(on.body.tls, true);
+  assert.match(on.body.authUrl, /^https:\/\//);
+});
+
+test('share with a non-boolean tls → 400', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: 'yes' });
+  assert.equal(res.status, 400);
+});
+
 test('share mode=lan, auth=false stands up an ungated proxy (no creds, no token gate)', async (t) => {
   const root = await mkRoot();
   await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
@@ -207,7 +282,7 @@ test('share mode=lan, auth=false stands up an ungated proxy (no creds, no token 
   await j(base, 'POST', '/api/apps/app/start');
   await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
 
-  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', auth: false });
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', auth: false, tls: false });
   assert.equal(res.status, 200);
   assert.equal(res.body.kind, 'lan');
   assert.equal(res.body.auth, false);
@@ -254,7 +329,7 @@ test('PATCH share credentials edits the live proxy in place', async (t) => {
   // No active share yet → 409.
   assert.equal((await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'x' })).status, 409);
 
-  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
   const pp = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
 
   const patch = await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice', password: 'a-new-strong-password' });
@@ -305,7 +380,7 @@ test('PATCH share/auth flips a live LAN share in place, no restart', async (t) =
   // No active share yet → 409.
   assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false })).status, 409);
 
-  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  const shareRes = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
   const pp = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
 
   // Missing/non-boolean `enabled` → 400.
