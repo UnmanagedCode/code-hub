@@ -214,7 +214,7 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
 test('share mode=lan defaults to HTTPS (self-signed): tls:true, https URLs, reachable + gated over TLS', async (t) => {
   const root = await mkRoot();
   await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
-  const { server, base } = await boot(root); // no CODEHUB_LAN_TLS set → default on
+  const { server, base } = await boot(root); // no tls flag → default on
   t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
 
   await j(base, 'POST', '/api/apps/app/start');
@@ -239,25 +239,35 @@ test('share mode=lan defaults to HTTPS (self-signed): tls:true, https URLs, reac
   assert.equal(authed.body, 'ok');
 });
 
-test('share mode=lan honors CODEHUB_LAN_TLS=0 as the default-off switch', async (t) => {
+test('re-sharing a LAN app with a different tls swaps the scheme on a fresh proxy', async (t) => {
+  // This is the path the UI's Edit-form TLS toggle drives on Save: TLS can't
+  // flip in place, so Save re-shares. Asserts the fresh proxy (new port), the
+  // scheme swap, teardown of the old proxy, and creds set after the re-share.
   const root = await mkRoot();
   await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
-  process.env.CODEHUB_LAN_TLS = '0';
   const { server, base } = await boot(root);
-  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); delete process.env.CODEHUB_LAN_TLS; });
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
 
   await j(base, 'POST', '/api/apps/app/start');
   await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').status));
 
-  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' }); // env default now off
-  assert.equal(res.status, 200);
-  assert.equal(res.body.tls, false);
-  assert.match(res.body.authUrl, /^http:\/\//);
+  // Default share is HTTPS (TLS on when the flag is absent).
+  const https = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan' });
+  assert.equal(https.body.tls, true);
+  const before = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
 
-  // A per-share tls:true still overrides the env default.
-  const on = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: true });
-  assert.equal(on.body.tls, true);
-  assert.match(on.body.authUrl, /^https:\/\//);
+  // Re-share with tls:false → plain HTTP on a brand-new proxy; the old one is gone.
+  const plain = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(plain.body.tls, false);
+  assert.match(plain.body.authUrl, /^http:\/\//);
+  const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.proxyPort;
+  assert.notEqual(after, before);
+  await assert.rejects(fetch(`http://127.0.0.1:${before}/`));
+
+  // The fresh proxy is reachable, gated, and accepts creds applied after the re-share.
+  await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice', password: 'secret1' });
+  const authed = await fetch(`http://127.0.0.1:${after}/`, { headers: { authorization: basicAuth('alice', 'secret1') } });
+  assert.equal(authed.status, 200);
 });
 
 test('share with a non-boolean tls → 400', async (t) => {

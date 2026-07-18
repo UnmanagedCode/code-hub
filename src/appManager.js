@@ -248,16 +248,6 @@ export async function restart(id) {
   return start(id);
 }
 
-// Default for LAN-share TLS wrapping — on unless CODEHUB_LAN_TLS is set to a
-// falsy value ('0'/'false'/'no'/'off'). Read per call (not cached) so tests can
-// toggle it via env, mirroring tunnel.js's bin(). A per-share `tls` flag
-// overrides this.
-function lanTlsDefault() {
-  const v = process.env.CODEHUB_LAN_TLS;
-  if (v === undefined) return true;
-  return !/^(0|false|no|off)$/i.test(v.trim());
-}
-
 // Share a running app behind a local auth proxy. Two modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
 //   so the public *.trycloudflare.com URL goes through it. Always gated.
@@ -289,7 +279,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
 
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
-    const useTls = tls ?? lanTlsDefault();
+    const useTls = tls ?? true; // TLS on by default; the UI/API `tls` flag overrides
     // Self-signed cert covering the LAN IPs + loopback, generated per share and
     // held in memory only (via the proxy) — nothing on disk. Browsers show a
     // one-time "not private" warning (self-signed); documented as a limitation.

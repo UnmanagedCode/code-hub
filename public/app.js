@@ -147,6 +147,17 @@ function credsBlock(app, shared, kind) {
         el('input', { type: 'checkbox', checked: editing.auth, onchange: (e) => { editing.auth = e.target.checked; render(); } }),
         ' Authentication',
       ) : null,
+      isLan ? el('label', { class: 'auth-toggle' },
+        el('input', { type: 'checkbox', checked: editing.tls, onchange: (e) => { editing.tls = e.target.checked; render(); } }),
+        ' TLS (HTTPS)',
+      ) : null,
+      // TLS can't flip in place — Save re-shares to swap the scheme, so the link,
+      // QR, and password all regenerate. Warn only when it's actually changing.
+      isLan && editing.tls !== (shared.tls !== false)
+        ? el('div', { class: 'cred-note' }, editing.auth
+            ? 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).'
+            : 'Changing TLS re-shares the app — new link & QR.')
+        : null,
       showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'user'),
         el('input', { class: 'cred-input', value: editing.username,
@@ -161,7 +172,30 @@ function credsBlock(app, shared, kind) {
       ) : null,
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => action(app.id, async () => {
-          if (isLan) {
+          if (isLan && editing.tls !== (shared.tls !== false)) {
+            // TLS changed — it can't flip in place (scheme/URL/cert are fixed at
+            // proxy creation), so re-share to swap it. This spins up a fresh proxy
+            // (new URL/QR/token, auto-generated password); share() applies the auth
+            // choice itself, so no separate auth PATCH here.
+            const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`, {
+              body: JSON.stringify({ mode: 'lan', auth: editing.auth, tls: editing.tls }),
+              headers: { 'content-type': 'application/json' },
+            });
+            state.share[app.id] = res;
+            // The fresh proxy started with an auto-generated password; apply any
+            // creds the user typed in this same edit (blank = keep the fresh one).
+            if (editing.auth) {
+              const body = {};
+              if (editing.username) body.username = editing.username;
+              if (editing.password) body.password = editing.password;
+              if (Object.keys(body).length) {
+                await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+                  body: JSON.stringify(body),
+                  headers: { 'content-type': 'application/json' },
+                });
+              }
+            }
+          } else if (isLan) {
             // Auth first: updateShareCredentials 400s on a no-auth share, so
             // an auth-enabling toggle must land before any credentials PATCH.
             if (editing.auth !== (shared.auth !== false)) {
@@ -268,7 +302,7 @@ function sharePanel(app) {
     canEdit && !editing
       ? el('button', { onclick: () => {
           state.credEdit[app.id] = kind === 'lan'
-            ? { auth: authEnabled, username: shared.username ?? '', password: shared.password ?? '' }
+            ? { auth: authEnabled, tls: shared.tls !== false, username: shared.username ?? '', password: shared.password ?? '' }
             : { username: shared.username, password: shared.password };
           render();
         } }, 'Edit')
