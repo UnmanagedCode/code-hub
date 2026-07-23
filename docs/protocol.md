@@ -10,7 +10,7 @@
 | `readyWhen` | string | no | Regex matched against the child's stdout/stderr to detect readiness. |
 | `routes` | array | no | Named URLs the app serves. Non-empty array of `{ name, path }`; `name` a non-empty string, `path` a string starting with `/`. When absent, a single implicit route at `/` is used. |
 
-Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe on `$PORT`. 30s timeout; on timeout the app stays running, flagged readiness-unconfirmed. Validation rejects missing/empty `start`, non-string optionals, a `routes` value that isn't a non-empty array, and any route entry missing `name` or with a `path` not starting with `/` — loudly, naming the offending file (e.g. `routes[1].path is required and must start with "/"`). A broken manifest surfaces as a non-startable app (with `error`), not a hidden one.
+Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe on `$PORT`. 30s timeout; on timeout the app stays running, flagged readiness-unconfirmed. Validation rejects missing/empty `start`, non-string optionals, a `routes` value that isn't a non-empty array, and any route entry missing `name` or with a `path` not starting with `/` — loudly, naming the offending file (e.g. `routes[1].path is required and must start with "/"`). A broken manifest surfaces as a non-startable app (with `manifestError`), not a hidden one.
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
 
@@ -75,7 +75,8 @@ Response fields: `kind` (`"tunnel"` or `"lan"`), `url` (primary shareable URL), 
     { "name": "Terrain editor", "path": "/terrain-editor.html", "urls": ["http://localhost:41051/terrain-editor.html", "..."] }
   ],
   "tunnel": { "kind": "tunnel", "url": "https://x.trycloudflare.com", "urls": null, "auth": true, "tls": false, "username": "hub", "password": "…", "proxyPort": 51234 },  // or null. kind: "lan" → urls lists all LAN IPv4 URLs and tls indicates HTTPS (https:// URLs) vs plain HTTP; tunnel is always tls:false on this hop (cloudflared terminates TLS). auth:false → username/password are null (no gate exists). password/username come from the live in-process proxy (never state.json), so they disappear once the share is torn down/restarted
-  "error": null,                // crash tail / manifest error, when present
+  "error": null,                // crash tail for a crashed app, or the manifest error text for a stopped bad-manifest app; display-only, not the Start-disable signal
+  "manifestError": null,        // manifest parse/validation error (the Start-disable signal), or null
   "alwaysOn": false,            // true only for the host code-conductor when code-hub runs embedded as its plugin
   "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), or "memory" (in-memory registration) — for a worktree with none of its own, reflects where its PARENT's manifest came from (see "Worktree manifest inheritance" above)
 }
