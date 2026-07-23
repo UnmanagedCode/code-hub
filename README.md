@@ -81,3 +81,7 @@ RUN_REAL_CLOUDFLARED=1 npm test   # also runs the real-cloudflared smoke test
 - `docs/features.md` — UI and user-facing features
 - `docs/protocol.md` — `.hub.json` schema + HTTP API
 - `docs/architecture.md` — modules, process/state lifecycle, test patterns
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). Copyright (c) 2026 UnmanagedCode. See [LICENSE](LICENSE) for details.
