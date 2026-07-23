@@ -94,6 +94,29 @@ test('full lifecycle over HTTP: discover → start → share → out-of-date →
   });
 });
 
+test('a crashed app keeps manifestError null and can be restarted from the UI', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd('crash') }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  let res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 200);
+
+  await waitFor(async () => {
+    const { body } = await j(base, 'GET', '/api/apps');
+    return body.apps.find((a) => a.id === 'app').status === 'crashed';
+  });
+  res = await j(base, 'GET', '/api/apps');
+  const crashed = res.body.apps.find((a) => a.id === 'app');
+  assert.equal(crashed.manifestError, null);
+  assert.match(crashed.error, /exited|boom/);
+
+  // restart isn't blocked by the crash tail
+  res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 200);
+});
+
 test('unknown app id → 404, and share on a stopped app → 409', async (t) => {
   const root = await mkRoot();
   await mkProject(root, 'app', { start: fakeAppCmd() });

@@ -329,7 +329,7 @@ function controls(app) {
   const row = el('div', { class: 'controls' });
 
   if (!running) {
-    row.appendChild(el('button', { class: 'start', disabled: isBusy || (!!app.error && !app.sourceMissing) || app.sourceMissing,
+    row.appendChild(el('button', { class: 'start', disabled: isBusy || !!app.manifestError || app.sourceMissing,
       onclick: () => action(app.id, () => api('POST', `api/apps/${encodeURIComponent(app.id)}/start`)) }, 'Start'));
   } else {
     if (!app.alwaysOn) {

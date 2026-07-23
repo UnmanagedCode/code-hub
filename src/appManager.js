@@ -116,7 +116,8 @@ export async function list() {
     // usual. Under-root (discovered) and standalone cases are unaffected.
     const sourceMissing = !byId.has(base.id) && !isHostConductorId(base.id);
     let status = 'stopped';
-    let error = base.manifestError ?? null;
+    const manifestError = base.manifestError ?? null;
+    let error = manifestError;
     let port, urls, startedSha, tunnelInfo = null;
 
     if (rec) {
@@ -182,6 +183,7 @@ export async function list() {
       routes,
       tunnel: tunnelInfo,
       error,
+      manifestError,
       alwaysOn: isHostConductorId(base.id) && !!rec,
       source: base.source,
     };
