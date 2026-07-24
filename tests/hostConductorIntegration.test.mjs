@@ -4,10 +4,11 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { unregisterInMemory } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
 
 async function bootFakeConductor() {
   const srv = http.createServer((req, res) => { res.writeHead(200); res.end('conductor-ui'); });
@@ -157,6 +158,7 @@ test('embedded with CONDUCTOR_PROJECT_DIR outside the projects root: host conduc
   const conductorDir = await mkProject(outsideParent, 'code-conductor', null, { git: true });
   process.env.CONDUCTOR_PROJECT_DIR = conductorDir;
 
+  const warnMock = t.mock.method(console, 'warn', () => {});
   const { server, base } = await bootHub();
 
   t.after(async () => {
@@ -182,6 +184,9 @@ test('embedded with CONDUCTOR_PROJECT_DIR outside the projects root: host conduc
   // Git info reads from the injected dir (proves path-based git works out-of-root).
   assert.ok(main.currentSha, 'currentSha read from the injected dir');
   assert.ok(main.lastCommitAt, 'lastCommitAt read from the injected dir');
+  // No in-root sibling and no in-memory registration for an out-of-root
+  // checkout ⇒ discoverApps()'s orphaned-registry-key warning must never fire.
+  assert.equal(warnMock.mock.callCount(), 0);
 
   // Start/stop/restart are blocked; share works against the running conductor.
   assert.equal((await j(base, 'POST', '/api/apps/code-conductor/start')).status, 409);
@@ -195,6 +200,56 @@ test('embedded with CONDUCTOR_PROJECT_DIR outside the projects root: host conduc
   res = await j(base, 'DELETE', '/api/apps/code-conductor/share');
   assert.equal(res.status, 200);
   assert.equal(res.body.tunnel, null);
+});
+
+test('embedded with CONDUCTOR_PROJECT_DIR outside the root, plus a stale same-named dir under the root: the injected dir still wins', async (t) => {
+  // Regression coverage: registering code-conductor in-memory unconditionally
+  // let discoverApps() resolve a stale in-root `code-conductor/` sibling via
+  // that registration, which then shadowed the real out-of-root checkout in
+  // list() (wrong path/currentSha/lastCommitAt, right port). The fix only
+  // registers in-memory when the injected dir is itself under the scanned
+  // root, so an out-of-root checkout must never be affected by an unrelated
+  // same-named dir under the root.
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  // Stale/unrelated dir that happens to share the id, with its own distinct
+  // git history (an extra commit) — if it ever won, its sha would differ
+  // from the real one.
+  const staleDir = await mkProject(root, 'code-conductor', null, { git: true });
+  gitCommit(staleDir, 'stale, unrelated commit');
+
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-conductor-'));
+  const conductorDir = await mkProject(outsideParent, 'code-conductor', null, { git: true });
+  process.env.CONDUCTOR_PROJECT_DIR = conductorDir;
+
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.path, conductorDir, 'must resolve from the injected dir, not the stale in-root sibling');
+  assert.notEqual(main.path, staleDir);
+
+  const expectedSha = execFileSync('git', ['-C', conductorDir, 'rev-parse', 'HEAD']).toString().trim();
+  const staleSha = execFileSync('git', ['-C', staleDir, 'rev-parse', 'HEAD']).toString().trim();
+  assert.notEqual(expectedSha, staleSha, 'test setup sanity: the two checkouts must have distinct history');
+  assert.equal(main.currentSha, expectedSha, 'currentSha must read from the injected dir, not the stale sibling');
+  assert.equal(main.sourceMissing, false);
 });
 
 test('embedded, worktree with no .hub.json of its own inherits the host conductor\'s in-memory manifest', async (t) => {
@@ -226,4 +281,52 @@ test('embedded, worktree with no .hub.json of its own inherits the host conducto
   assert.equal(wt.alwaysOn, false);
   assert.equal(wt.status, 'stopped');
   assert.equal(wt.error, null);
+});
+
+test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree still inherits the in-memory manifest', async (t) => {
+  // Regression coverage: a prior version only called registerInMemory() in
+  // the discovery-fallback branch (no CONDUCTOR_PROJECT_DIR), so this
+  // injected-dir path never registered code-conductor's manifest in memory
+  // and any code-conductor_worktree_* dir silently vanished from the listing
+  // — even though its checkout was right there on disk.
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  const conductorDir = await mkProject(root, 'code-conductor', null); // no .hub.json, lives in-root
+  process.env.CONDUCTOR_PROJECT_DIR = conductorDir; // modern conductor injects its own dir
+  await mkProject(root, 'code-conductor_worktree_ab12cd', null, { git: true }); // no .hub.json, no own registration
+
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.status, 'running');
+  assert.equal(main.alwaysOn, true);
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.path, conductorDir); // still resolved from the injected dir
+
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  assert.ok(wt, 'worktree of an in-root, injected-dir host conductor should still be surfaced via manifest inheritance');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'code-conductor');
+  assert.equal(wt.source, 'memory');
+  assert.equal(wt.alwaysOn, false);
+  assert.equal(wt.status, 'stopped');
+  assert.equal(wt.error, null);
+  assert.ok(wt.branch); // some default branch name, resolved via git.js
 });
