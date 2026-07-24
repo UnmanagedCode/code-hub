@@ -23,6 +23,15 @@ let store = { apps: {} };
 // the proxy server never survive a code-hub restart (see init teardown).
 const proxies = new Map();
 
+// True when `dir` is `root` itself or a descendant of it. Used to decide
+// whether the injected host-conductor dir is reachable by discoverApps()'s
+// root scan at all — an out-of-root checkout (and therefore any worktree of
+// it, which is always a sibling of the checkout) never is.
+function isUnderRoot(root, dir) {
+  const rel = path.relative(root, dir);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 export async function init() {
   store = await state.load();
   await state.reconcile(store); // drop dead pids / tunnels; adopt live ones
@@ -44,14 +53,6 @@ export async function init() {
   if (isEmbedded()) {
     const port = hostConductorPort();
     const injectedDir = hostConductorDir();
-    // Always register in-memory (never persisted), regardless of which branch
-    // below resolves appPath. This is what lets a code-conductor_worktree_*
-    // dir with no manifest of its own inherit one via projects.js's
-    // worktree-parent-fallback — that lookup resolves the parent name's
-    // manifest independently of how appPath itself is resolved, so skipping
-    // this when injectedDir is set (as a prior version did) silently hid
-    // every worktree of an in-root code-conductor checkout.
-    registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
     let appPath = null;
     if (injectedDir) {
       // Modern conductor: it injected its own checkout dir, which may live
@@ -59,9 +60,25 @@ export async function init() {
       // discovery needed. list()'s second loop surfaces this store.apps
       // record even though discoverApps() never returns it.
       appPath = injectedDir;
+      // Only register in-memory when that dir is actually reachable by
+      // discoverApps()'s root scan. Worktrees are always created as siblings
+      // of the checkout they branch from, so an out-of-root checkout can
+      // never have an in-root worktree either — registering here would do
+      // nothing useful, and would either shadow the injected dir with a
+      // same-named but unrelated sibling under root (wrong path/git info) or,
+      // with no such sibling, make discoverApps() warn about an orphaned key
+      // on every call.
+      if (isUnderRoot(projectsRoot(), injectedDir)) {
+        registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
+      }
     } else {
       // Older conductor (no CONDUCTOR_PROJECT_DIR): fall back to discovering a
-      // `code-conductor/` dir under the root.
+      // `code-conductor/` dir under the root. The conductor carries no
+      // `.hub.json` of its own, so register it in-memory (never persisted)
+      // before discovering — this is what makes discoverApps() find it at
+      // all, and lets a code-conductor_worktree_* dir with no manifest of its
+      // own inherit one via projects.js's worktree-parent-fallback.
+      registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
       const discovered = await discoverApps();
       const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
       appPath = app ? app.path : null;
