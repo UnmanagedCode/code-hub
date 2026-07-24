@@ -44,21 +44,24 @@ export async function init() {
   if (isEmbedded()) {
     const port = hostConductorPort();
     const injectedDir = hostConductorDir();
+    // Always register in-memory (never persisted), regardless of which branch
+    // below resolves appPath. This is what lets a code-conductor_worktree_*
+    // dir with no manifest of its own inherit one via projects.js's
+    // worktree-parent-fallback — that lookup resolves the parent name's
+    // manifest independently of how appPath itself is resolved, so skipping
+    // this when injectedDir is set (as a prior version did) silently hid
+    // every worktree of an in-root code-conductor checkout.
+    registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
     let appPath = null;
     if (injectedDir) {
       // Modern conductor: it injected its own checkout dir, which may live
       // OUTSIDE the scanned projects root. Use it directly — no under-root
-      // discovery and no in-memory registration (a dir absent from the root
-      // would only make discoverApps() warn about an orphaned key). list()'s
-      // second loop surfaces this store.apps record even though discoverApps()
-      // never returns it.
+      // discovery needed. list()'s second loop surfaces this store.apps
+      // record even though discoverApps() never returns it.
       appPath = injectedDir;
     } else {
       // Older conductor (no CONDUCTOR_PROJECT_DIR): fall back to discovering a
-      // `code-conductor/` dir under the root. The conductor carries no
-      // `.hub.json` of its own, so register it in-memory (never persisted)
-      // before discovering — this is what makes discoverApps() find it at all.
-      registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
+      // `code-conductor/` dir under the root.
       const discovered = await discoverApps();
       const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
       appPath = app ? app.path : null;

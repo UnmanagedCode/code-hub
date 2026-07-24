@@ -227,3 +227,51 @@ test('embedded, worktree with no .hub.json of its own inherits the host conducto
   assert.equal(wt.status, 'stopped');
   assert.equal(wt.error, null);
 });
+
+test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree still inherits the in-memory manifest', async (t) => {
+  // Regression coverage: a prior version only called registerInMemory() in
+  // the discovery-fallback branch (no CONDUCTOR_PROJECT_DIR), so this
+  // injected-dir path never registered code-conductor's manifest in memory
+  // and any code-conductor_worktree_* dir silently vanished from the listing
+  // — even though its checkout was right there on disk.
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  const conductorDir = await mkProject(root, 'code-conductor', null); // no .hub.json, lives in-root
+  process.env.CONDUCTOR_PROJECT_DIR = conductorDir; // modern conductor injects its own dir
+  await mkProject(root, 'code-conductor_worktree_ab12cd', null, { git: true }); // no .hub.json, no own registration
+
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.status, 'running');
+  assert.equal(main.alwaysOn, true);
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.path, conductorDir); // still resolved from the injected dir
+
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  assert.ok(wt, 'worktree of an in-root, injected-dir host conductor should still be surfaced via manifest inheritance');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'code-conductor');
+  assert.equal(wt.source, 'memory');
+  assert.equal(wt.alwaysOn, false);
+  assert.equal(wt.status, 'stopped');
+  assert.equal(wt.error, null);
+  assert.ok(wt.branch); // some default branch name, resolved via git.js
+});
