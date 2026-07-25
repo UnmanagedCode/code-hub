@@ -204,10 +204,13 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
           if (u) currentUsername = u;
           if (p) currentPassword = p;
         },
-        // Flips the gate itself in place — no restart, no new token/creds,
-        // so a share URL/QR issued before the flip (in either direction)
-        // stays valid. The caller (appManager) persists the new state and
-        // only allows this for LAN shares (tunnel is always gated).
+        // Flips the gate itself in place — no restart, no new token/creds.
+        // The token is never regenerated on a toggle, so a token URL (and its
+        // QR) issued while gated keeps working after the gate turns off; a
+        // plain URL/QR issued while ungated does NOT work after re-gating (no
+        // token → 401) — which is why `setShareAuth` regenerates the QR on
+        // toggle. The caller (appManager) persists the new state and only
+        // allows this for LAN shares (tunnel is always gated).
         setAuth(enabled) { currentAuth = !!enabled; },
         close() {
           for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
