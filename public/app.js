@@ -1,6 +1,8 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
 // renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch } from './shareState.js';
+
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -172,6 +174,20 @@ function credsBlock(app, shared, kind) {
       ) : null,
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => action(app.id, async () => {
+          // A credentials PATCH (fresh QR + new user/pass) or an auth-gate PATCH
+          // (fresh QR only — credentialed when on, plain when off) mints a QR the
+          // pre-edit share response can't know about. refresh() alone can't fix
+          // it: render's QR fallback is `(s && s.qrSvg) || shared.qrSvg`, so the
+          // STALE s.qrSvg from the pre-edit share response shadows the fresh
+          // shared.qrSvg list() now serves. mergeSharePatch overwrites s.qrSvg
+          // (and user/pass) so that shadow no longer wins, and drops s.authUrl
+          // when the gate turned off (the auth PATCH carries no authUrl, so the
+          // stale magic-link would otherwise keep winning at resolveOpenUrl —
+          // leaking the ?__hubauth token into upstream URLs once the proxy is
+          // ungated, and re-minting it as a live cred on re-gate). No-op if no
+          // share state is on screen; a from-the-start auth:false share has no
+          // s.authUrl to clear.
+          const mergeShareCreds = (patched) => mergeSharePatch(state.share[app.id], patched);
           if (isLan && editing.tls !== (shared.tls !== false)) {
             // TLS changed — it can't flip in place (scheme/URL/cert are fixed at
             // proxy creation), so re-share to swap it. This spins up a fresh proxy
@@ -189,20 +205,22 @@ function credsBlock(app, shared, kind) {
               if (editing.username) body.username = editing.username;
               if (editing.password) body.password = editing.password;
               if (Object.keys(body).length) {
-                await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+                const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
                   body: JSON.stringify(body),
                   headers: { 'content-type': 'application/json' },
                 });
+                mergeShareCreds(patched); // fresh proxy's auto-gen QR now stale
               }
             }
           } else if (isLan) {
             // Auth first: updateShareCredentials 400s on a no-auth share, so
             // an auth-enabling toggle must land before any credentials PATCH.
             if (editing.auth !== (shared.auth !== false)) {
-              await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/auth`, {
+              const toggled = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/auth`, {
                 body: JSON.stringify({ enabled: editing.auth }),
                 headers: { 'content-type': 'application/json' },
               });
+              mergeShareCreds(toggled); // QR now tracks the gate (credentialed on / plain off)
             }
             if (editing.auth) {
               const body = {};
@@ -212,17 +230,19 @@ function credsBlock(app, shared, kind) {
               // credentials are stable across an auth toggle, so skipping the
               // PATCH here is what lets re-enabling restore them untouched.
               if (Object.keys(body).length) {
-                await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+                const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
                   body: JSON.stringify(body),
                   headers: { 'content-type': 'application/json' },
                 });
+                mergeShareCreds(patched);
               }
             }
           } else {
-            await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+            const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
               body: JSON.stringify({ username: editing.username, password: editing.password }),
               headers: { 'content-type': 'application/json' },
             });
+            mergeShareCreds(patched);
           }
           delete state.credEdit[app.id];
         }) }, 'Save'),
@@ -255,13 +275,19 @@ function sharePanel(app) {
   if (s && s.error) return el('div', { class: 'share' }, el('div', { class: 'err' }, s.error));
   if (!shared) return null;
 
-  // Opening/QR use the token-bearing authUrl when auth is enabled — scanning
-  // it exchanges the token for a session cookie server-side, so no
-  // credentials ever appear in the URL. A no-auth share has no token; the
-  // plain URL is already the whole story. Username/password now come from
-  // `shared` regardless of source (the one-time share() response or the
-  // persisted app.tunnel from list()) — both carry the live proxy's creds.
-  const openUrl = (s && s.authUrl) || shared.url;
+  // The browser-clicked "Open" link uses the token-bearing authUrl when auth is
+  // enabled — clicking it exchanges the token for a session cookie server-side,
+  // so no credentials appear in that URL (Chromium also strips embedded creds
+  // from clicked links, so Basic wouldn't work here). The QR (rendered
+  // server-side) instead encodes a `https://user:pass@host/` URL scanned into a
+  // Basic-Auth header that the proxy exchanges for the same cookie. A no-auth
+  // share has no token; the plain URL is already the whole story. authUrl and
+  // qrSvg are read from `s` (the one-time share() response) right after sharing,
+  // and fall back to `shared` (app.tunnel from list(), which rebuilds authUrl
+  // from the live proxy token and serves a cached qrSvg) so a full UI refresh
+  // — which wipes the in-memory `state.share` — still shows the QR and Open's
+  // magic-link. Username/password likewise come from `shared` (live proxy creds).
+  const openUrl = resolveOpenUrl(s, shared);
   const kind = shared.kind || 'tunnel';
   const authEnabled = shared.auth !== false;
   const lanTls = kind === 'lan' && String(shared.url).startsWith('https:');
@@ -287,9 +313,10 @@ function sharePanel(app) {
     panel.appendChild(credsBlock(app, shared, kind));
   }
 
-  if (s && s.qrSvg) {
-    const qr = el('div', { class: 'qr', title: 'Tap to enlarge', html: s.qrSvg,
-      onclick: () => openQr(s.qrSvg, openUrl) });
+  const qrSvg = resolveQrSvg(s, shared);
+  if (qrSvg) {
+    const qr = el('div', { class: 'qr', title: 'Tap to enlarge', html: qrSvg,
+      onclick: () => openQr(qrSvg, openUrl) });
     panel.appendChild(qr);
   }
   // For a LAN share, Edit is reachable regardless of auth state — it's the
