@@ -104,6 +104,7 @@ function teardownShare(id, rec) {
   if (proxy) { proxy.close(); proxies.delete(id); }
   if (rec?.tunnel) tunnel.stopTunnel(rec.tunnel.pid);
   if (rec) rec.tunnel = null;
+  qrCache.delete(id);
 }
 
 async function persist() {
@@ -117,6 +118,26 @@ async function persist() {
 function withToken(url, token) {
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}__hubauth=${encodeURIComponent(token)}`;
+}
+
+// In-memory QR cache keyed by app id. The QR's only inputs are
+// { url, authUrl } (gated → the token URL via `withToken`; ungated/no-auth →
+// the plain `url`), so an entry is reused until one of them changes —
+// share()/creds-edit/auth-toggle — NOT on every list() poll. Lives in memory
+// like the `proxies` map and is cleared in teardownShare. This is what lets
+// list() recover the QR after a UI refresh (state.share is gone) without
+// re-rendering a QR every few seconds. Used by
+// share()/updateShareCredentials()/setShareAuth() AND list(), so the QR served
+// to every client and returned by every PATCH comes from one place.
+const qrCache = new Map(); // id → { key, svg }
+
+async function cachedQrSvg(id, { url, authUrl }) {
+  const key = JSON.stringify({ url, authUrl });
+  const hit = qrCache.get(id);
+  if (hit && hit.key === key) return hit.svg;
+  const svg = await qrSvg(authUrl ?? url);
+  qrCache.set(id, { key, svg });
+  return svg;
 }
 
 // Merge discoverable apps (main checkouts + worktrees with a `.hub.json`)
@@ -145,16 +166,27 @@ export async function list() {
       // username/password come from the live proxy (proxies map), never
       // from rec.tunnel — that's how the password persists across a page
       // reload (in-memory, for the share's lifetime) without ever touching
-      // state.json. rec.tunnel itself holds only non-secret fields.
+      // state.json. rec.tunnel itself holds only non-secret fields. authUrl and
+      // qrSvg likewise recover from the live proxy: authUrl is rebuilt from the
+      // proxy token, and qrSvg is served from cachedQrSvg (regenerated only on
+      // share/creds-edit/auth-toggle, not per poll) — so a full UI refresh (which
+      // wipes the client's in-memory state.share) still shows the QR and Open's
+      // magic-link. Omitted for a no-auth share (no token path) or a gone proxy.
       if (rec.tunnel) {
         const proxy = proxies.get(base.id);
+        const url = rec.tunnel.url;
+        const auth = rec.tunnel.auth !== false;
+        const username = proxy ? proxy.username : null;
+        const password = proxy ? proxy.password : null;
+        const authUrl = proxy && auth ? withToken(url, proxy.token) : null;
+        const svg = proxy ? await cachedQrSvg(base.id, { url, authUrl }) : null;
         tunnelInfo = {
-          url: rec.tunnel.url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
+          url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
           proxyPort: rec.tunnel.proxyPort ?? null,
-          auth: rec.tunnel.auth !== false,
-          tls: rec.tunnel.tls === true,
-          username: proxy ? proxy.username : null,
-          password: proxy ? proxy.password : null,
+          auth, tls: rec.tunnel.tls === true,
+          username, password,
+          ...(authUrl ? { authUrl } : {}),
+          ...(svg ? { qrSvg: svg } : {}),
         };
       } else {
         tunnelInfo = null;
@@ -323,10 +355,10 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
-      return { kind: 'lan', url, urls, auth: false, tls: useTls, qrSvg: await qrSvg(url) };
+      return { kind: 'lan', url, urls, auth: false, tls: useTls, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, tls: useTls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+    return { kind: 'lan', url, urls, auth: true, tls: useTls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
   if (!(await tunnel.available())) {
@@ -348,7 +380,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
   await persist();
 
   const authUrl = withToken(url, proxy.token);
-  return { kind: 'tunnel', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await qrSvg(authUrl) };
+  return { kind: 'tunnel', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
 }
 
 // Edit the active share's Basic-Auth credentials in place — mutates the live
@@ -375,7 +407,17 @@ export async function updateShareCredentials(id, { username, password } = {}) {
     username: hasUsername ? username.trim() : undefined,
     password: hasPassword ? password.trim() : undefined,
   });
-  return { id, username: proxy.username, password: proxy.password };
+  // The QR encodes the token URL, which is stable across a creds edit (the
+  // token/proxy/URL are untouched), so this is a cache hit — but the field is
+  // still returned so the caller can fold it back into its share state on the
+  // same shape as the auth-toggle response. `auth` is guaranteed true here
+  // (guarded above), so the token URL always exists.
+  const url = store.apps[id].tunnel.url;
+  const authUrl = withToken(url, proxy.token);
+  return {
+    id, username: proxy.username, password: proxy.password,
+    qrSvg: await cachedQrSvg(id, { url, authUrl }),
+  };
 }
 
 // Flip a live LAN share's auth gate in place — mutates the proxy (see
@@ -394,7 +436,15 @@ export async function setShareAuth(id, enabled) {
   proxy.setAuth(enabled);
   rec.tunnel.auth = enabled;
   await persist();
-  return { id, auth: enabled };
+  // The QR tracks the gate: gated → the token URL (the proxy's stable token,
+  // available again now that auth is on); ungated → the plain URL (no token
+  // exists). Returned so the client can refresh the QR shown from the
+  // pre-toggle share response, which would otherwise be stale (a plain QR
+  // scanned after re-gating would 401).
+  const url = rec.tunnel.url;
+  const authUrl = enabled ? withToken(url, proxy.token) : null;
+  const qr = await cachedQrSvg(id, { url, authUrl });
+  return { id, auth: enabled, qrSvg: qr };
 }
 
 export async function unshare(id) {

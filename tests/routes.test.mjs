@@ -6,6 +6,7 @@ import path from 'node:path';
 import https from 'node:https';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
+import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
 import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive } from './helpers.mjs';
 
@@ -183,6 +184,19 @@ test('share stands up a Basic-Auth proxy; unshare tears it down', async (t) => {
   assert.equal(app.tunnel.auth, true);
   assert.equal(app.tunnel.password, res.body.password);
 
+  // list() also rebuilds authUrl (magic-link, from the live proxy token) and
+  // serves a cached qrSvg — so the QR and Open magic-link survive a full UI
+  // refresh that wipes the client's in-memory share response. authUrl must
+  // carry the same token the proxy holds (matching the share response's).
+  assert.ok(app.tunnel.authUrl);
+  assert.equal(app.tunnel.authUrl, res.body.authUrl);
+  assert.match(app.tunnel.qrSvg, /<svg/);
+  // Two list() calls with no intervening change return the SAME qrSvg (cache
+  // hit — no per-poll QR re-render).
+  const app2 = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app2.tunnel.qrSvg, app.tunnel.qrSvg);
+  assert.equal(app2.tunnel.authUrl, app.tunnel.authUrl);
+
   // The proxy (which cloudflared points at) enforces auth and forwards to the app.
   const pp = app.tunnel.proxyPort;
   const noauth = await fetch(`http://127.0.0.1:${pp}/`);
@@ -228,6 +242,7 @@ test('share mode=lan stands up an HTTP proxy without cloudflared', async (t) => 
   assert.equal(noauth.status, 401);
   const authed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
   assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
 
   // unshare tears down a LAN share same as a tunnel share.
   await j(base, 'DELETE', '/api/apps/app/share');
@@ -291,6 +306,7 @@ test('re-sharing a LAN app with a different tls swaps the scheme on a fresh prox
   await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice', password: 'secret1' });
   const authed = await fetch(`http://127.0.0.1:${after}/`, { headers: { authorization: basicAuth('alice', 'secret1') } });
   assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
 });
 
 test('share with a non-boolean tls → 400', async (t) => {
@@ -328,6 +344,10 @@ test('share mode=lan, auth=false stands up an ungated proxy (no creds, no token 
   assert.equal(app.tunnel.auth, false);
   assert.equal(app.tunnel.username, null);
   assert.equal(app.tunnel.password, null);
+  // A no-auth share has no magic-link, but list() still serves the plain-url QR
+  // so the QR survives a UI refresh (the only thing worth scanning is the URL).
+  assert.equal(app.tunnel.authUrl, undefined);
+  assert.match(app.tunnel.qrSvg, /<svg/);
 
   // No gate at all: a bare, header-less request reaches the app directly.
   const pp = app.tunnel.proxyPort;
@@ -367,12 +387,23 @@ test('PATCH share credentials edits the live proxy in place', async (t) => {
 
   const patch = await j(base, 'PATCH', '/api/apps/app/share/credentials', { username: 'alice', password: 'a-new-strong-password' });
   assert.equal(patch.status, 200);
-  assert.deepEqual(patch.body, { id: 'app', username: 'alice', password: 'a-new-strong-password' });
+  assert.equal(patch.body.id, 'app');
+  assert.equal(patch.body.username, 'alice');
+  assert.equal(patch.body.password, 'a-new-strong-password');
 
-  // list() reflects the edit immediately.
+  // The QR encodes the token URL, which is stable across a creds edit (the
+  // token/URL/proxy are untouched) — so the PATCH returns the SAME qrSvg as
+  // share time (a cache hit), not a fresh one. The client still folds it back
+  // in on the same response shape as the auth-toggle.
+  assert.equal(patch.body.qrSvg, shareRes.body.qrSvg);
+
+  // list() reflects the edit immediately — the unchanged qrSvg (served from the
+  // cache the PATCH just confirmed) and the unchanged authUrl.
   const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
   assert.equal(after.tunnel.username, 'alice');
   assert.equal(after.tunnel.password, 'a-new-strong-password');
+  assert.equal(after.tunnel.qrSvg, patch.body.qrSvg);
+  assert.equal(after.tunnel.authUrl, shareRes.body.authUrl);
 
   // The old Basic pair is now rejected; the new one is accepted — no restart
   // (same proxyPort as right after share()).
@@ -381,6 +412,7 @@ test('PATCH share credentials edits the live proxy in place', async (t) => {
   assert.equal(rejectedOld.status, 401);
   const authedNew = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('alice', 'a-new-strong-password') } });
   assert.equal(authedNew.status, 200);
+  assert.equal(await authedNew.text(), 'ok');
 
   // Empty body → 400.
   assert.equal((await j(base, 'PATCH', '/api/apps/app/share/credentials', {})).status, 400);
@@ -420,29 +452,53 @@ test('PATCH share/auth flips a live LAN share in place, no restart', async (t) =
   assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', {})).status, 400);
   assert.equal((await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: 'nope' })).status, 400);
 
-  // Turn auth off: list() hides creds, proxy forwards with no gate.
+  // QR payloads track the gate. Gated: the token URL (authUrl — the token is
+  // stable across a toggle, so it matches the original share QR). Ungated: the
+  // plain URL, no token.
+  const gatedQr = await qrSvg(shareRes.body.authUrl);
+  const plainQr = await qrSvg(shareRes.body.url);
+  assert.equal(shareRes.body.qrSvg, gatedQr); // share started gated → token-URL QR
+
+  // Turn auth off: list() hides creds, proxy forwards with no gate, and the QR
+  // reverts to the plain (token-less) URL.
   const off = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false });
   assert.equal(off.status, 200);
-  assert.deepEqual(off.body, { id: 'app', auth: false });
+  assert.equal(off.body.id, 'app');
+  assert.equal(off.body.auth, false);
+  assert.equal(off.body.qrSvg, plainQr);
+  assert.notEqual(off.body.qrSvg, gatedQr);
   let after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
   assert.equal(after.tunnel.auth, false);
   assert.equal(after.tunnel.username, null);
   assert.equal(after.tunnel.password, null);
+  // No-auth share has no magic-link (no token path) and serves the plain-url QR.
+  assert.equal(after.tunnel.authUrl, undefined);
+  assert.equal(after.tunnel.qrSvg, plainQr);
   const forwardedNoAuth = await fetch(`http://127.0.0.1:${pp}/`);
   assert.equal(forwardedNoAuth.status, 200);
 
-  // Turn auth back on: same proxyPort, same password as the original share() — no restart.
+  // Turn auth back on: same proxyPort, same password as the original share() — no
+  // restart — and the QR flips back to the token URL (was stale: a scan of the
+  // plain QR would 401 against the now-gated proxy).
   const on = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: true });
   assert.equal(on.status, 200);
-  assert.deepEqual(on.body, { id: 'app', auth: true });
+  assert.equal(on.body.id, 'app');
+  assert.equal(on.body.auth, true);
+  assert.equal(on.body.qrSvg, gatedQr);
+  assert.notEqual(on.body.qrSvg, plainQr);
   after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
   assert.equal(after.tunnel.auth, true);
   assert.equal(after.tunnel.proxyPort, pp);
   assert.equal(after.tunnel.password, shareRes.body.password);
+  // Re-gating brings the magic-link back (rebuilt from the unchanged token)
+  // and flips the cached QR back to the token URL.
+  assert.equal(after.tunnel.authUrl, shareRes.body.authUrl);
+  assert.equal(after.tunnel.qrSvg, gatedQr);
   const gatedNoAuth = await fetch(`http://127.0.0.1:${pp}/`);
   assert.equal(gatedNoAuth.status, 401);
   const gatedAuthed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', shareRes.body.password) } });
   assert.equal(gatedAuthed.status, 200);
+  assert.equal(await gatedAuthed.text(), 'ok');
 });
 
 test('PATCH share/auth on a tunnel share → 400 (tunnel shares are always gated)', async (t) => {
