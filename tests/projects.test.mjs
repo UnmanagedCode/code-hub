@@ -340,3 +340,59 @@ test('a <x>_worktree_<hash>-shaped dir with no sibling <x> dir is not eligible f
   const apps = await discoverApps();
   assert.ok(!apps.find((a) => a.id === 'orphan_worktree_ab12cd'));
 });
+
+test('classifies a named (non-hex) worktree slug as a worktree of its parent', async (t) => {
+  // Reproduces the live bug: code-conductor now composes worktree dirs with
+  // free-form slug ids (letters + hyphens), not just 6-char hex. A regex
+  // charset-matching the id shape misses this entirely and the dir vanishes
+  // from discovery. Matching on the `_worktree_` delimiter and the sibling
+  // check must classify this correctly regardless of id charset.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'code-conductor', { start: 'x' });
+  await mkProject(root, 'code-conductor_worktree_hub-probe', { start: 'x' });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'code-conductor_worktree_hub-probe');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'code-conductor');
+});
+
+test('a _worktree_-delimited dir with its own manifest but no matching sibling is treated as an ordinary project, not a worktree', async (t) => {
+  // Deliberately gives the dir its OWN .hub.json so it appears in the
+  // output either way. Without that, "correctly not a worktree" and
+  // "dropped for lack of a manifest" (see the orphan test above, which uses
+  // a manifest-less dir) look identical and prove nothing about the sibling
+  // check itself. Do not simplify this manifest away — that would silently
+  // gut the discriminating power of this test.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'solo_worktree_my-slug', { start: 'x' });
+
+  const apps = await discoverApps();
+  const app = apps.find((a) => a.id === 'solo_worktree_my-slug');
+  assert.ok(app);
+  assert.equal(app.isWorktree, false);
+  assert.equal(app.project, 'solo_worktree_my-slug');
+});
+
+test('a dir name containing the delimiter twice resolves to the rightmost sibling match', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  // The sibling `a` dir is what makes this discriminate: without it, a
+  // leftmost-first implementation would also miss `a` and fall through to
+  // `a_worktree_b` by the same "no match, keep going" path — passing for
+  // the wrong reason. With both `a` and `a_worktree_b` present, leftmost
+  // wrongly stops at `a` while rightmost correctly reaches `a_worktree_b`.
+  // Looks removable; isn't.
+  await mkProject(root, 'a', { start: 'x' });
+  await mkProject(root, 'a_worktree_b', { start: 'x' });
+  await mkProject(root, 'a_worktree_b_worktree_c', null);
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'a_worktree_b_worktree_c');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'a_worktree_b');
+});
