@@ -380,6 +380,13 @@ test('a _worktree_-delimited dir with its own manifest but no matching sibling i
 test('a dir name containing the delimiter twice resolves to the rightmost sibling match', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
+  // The sibling `a` dir is what makes this discriminate: without it, a
+  // leftmost-first implementation would also miss `a` and fall through to
+  // `a_worktree_b` by the same "no match, keep going" path — passing for
+  // the wrong reason. With both `a` and `a_worktree_b` present, leftmost
+  // wrongly stops at `a` while rightmost correctly reaches `a_worktree_b`.
+  // Looks removable; isn't.
+  await mkProject(root, 'a', { start: 'x' });
   await mkProject(root, 'a_worktree_b', { start: 'x' });
   await mkProject(root, 'a_worktree_b_worktree_c', null);
 
