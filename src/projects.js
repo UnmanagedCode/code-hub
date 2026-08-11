@@ -16,9 +16,26 @@ export const MANIFEST_FILENAME = '.hub.json';
 export const STORE_DIRNAME = '.code-hub';
 export const REGISTRY_FILENAME = 'registrations.json';
 
-// A worktree dir is a sibling named `<project>_worktree_<hexid>` — the
-// layout code-conductor creates (see ../code-conductor/src/worktrees.js).
-const WORKTREE_RE = /^(.+)_worktree_([0-9a-f]+)$/;
+// A worktree dir is a sibling named `<project>_worktree_<id>` — the layout
+// code-conductor creates (see ../code-conductor/src/worktrees.js). `id`'s
+// charset is conductor's to define and has already changed once (hex
+// shortId -> free-form slug); match on the delimiter only and let
+// sibling-directory existence decide parenthood, so a future id-shape
+// change never desyncs this again.
+const WORKTREE_DELIM = '_worktree_';
+
+// Rightmost-first mirrors the old regex's greedy `.+`, which always
+// preferred the longest possible prefix before the required suffix — only
+// matters if a project name itself ever contains the delimiter literally.
+function worktreeParent(name, dirNames) {
+  let idx = name.length;
+  for (;;) {
+    idx = name.lastIndexOf(WORKTREE_DELIM, idx - 1);
+    if (idx === -1) return null;
+    const candidate = name.slice(0, idx);
+    if (dirNames.has(candidate)) return candidate;
+  }
+}
 
 export function projectsRoot() {
   return process.env.PROJECTS_ROOT ?? DEFAULT_PROJECTS_ROOT;
@@ -241,10 +258,9 @@ export async function discoverApps() {
 
     let manifest = res.manifest;
     let source = res.source;
-    const wt = WORKTREE_RE.exec(e.name);
     // Only treat as a worktree when a matching parent project dir exists,
     // so a legitimately-named project isn't misclassified.
-    const parentName = (wt && dirNames.has(wt[1])) ? wt[1] : null;
+    const parentName = worktreeParent(e.name, dirNames);
 
     if (!manifest && parentName) {
       const parentRes = await resolve(parentName);
