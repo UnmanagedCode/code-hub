@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch } from '../public/shareState.js';
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice } from '../public/shareState.js';
 
 // These cover the client behaviors the server tests can't: how sharePanel
 // resolves the Open link and QR between the in-memory share response (state.
@@ -72,4 +72,51 @@ test('mergeSharePatch: no-op when no share state is on screen', () => {
   mergeSharePatch(cur, { auth: true }); // auth:true is not the clear trigger
   assert.equal(cur.qrSvg, '<svg/>');
   assert.ok(!('authUrl' in cur));
+});
+
+// --- Fixed-port fallback notice ---
+//
+// The asymmetry between the three holder cases is the security-relevant part:
+// only 'other' is an established all-clear, so only 'other' may stay quiet.
+
+const LAN_APP = { port: 3000 };
+const fallback = (fixedPortHolder) => ({ kind: 'lan', fixedPortFallback: true, proxyPort: 51234, fixedPortHolder });
+
+test('resolveFixedPortNotice: an UNKNOWN holder still warns — not knowing must not mean silence', () => {
+  // The regression this exists for: probeWildcardHold can't run at all on a
+  // host with no loopback aliases (macOS/Windows), so it returns inconclusive
+  // for every port. Treating that as an all-clear would silently drop the
+  // warning for an app that genuinely is answering ungated on the LAN.
+  const notice = resolveFixedPortNotice(LAN_APP, fallback('unknown'));
+  assert.equal(notice.level, 'warn');
+  assert.match(notice.text, /NO authentication/);
+  assert.match(notice.text, /3000/);
+  assert.match(notice.text, /51234/);
+  // ...but it must not assert the app IS exposed — only what follows if it is.
+  assert.match(notice.text, /could not identify what holds it/);
+  assert.match(notice.text, /If this app binds all interfaces/);
+});
+
+test('resolveFixedPortNotice: an APP holder warns without overclaiming certainty', () => {
+  const notice = resolveFixedPortNotice(LAN_APP, fallback('app'));
+  assert.equal(notice.level, 'warn');
+  assert.match(notice.text, /NO authentication/);
+  // share() only knows the start command's wrapper is alive, not that the
+  // app's own listener is still up, so this must read as near-certain rather
+  // than as established fact.
+  assert.match(notice.text, /almost certainly/);
+});
+
+test('resolveFixedPortNotice: an OTHER holder is a neutral note making no claim about the app', () => {
+  const notice = resolveFixedPortNotice(LAN_APP, fallback('other'));
+  assert.equal(notice.level, 'note');
+  assert.doesNotMatch(notice.text, /NO authentication/);
+  assert.match(notice.text, /not by this app/);
+});
+
+test('resolveFixedPortNotice: nothing to say without a LAN fixed-port fallback', () => {
+  assert.equal(resolveFixedPortNotice(LAN_APP, null), null);
+  assert.equal(resolveFixedPortNotice(LAN_APP, { kind: 'lan', fixedPortFallback: false, fixedPortHolder: null }), null);
+  // A tunnel share never has a fixed-port fallback to report.
+  assert.equal(resolveFixedPortNotice(LAN_APP, { kind: 'tunnel', fixedPortFallback: true, fixedPortHolder: 'app' }), null);
 });

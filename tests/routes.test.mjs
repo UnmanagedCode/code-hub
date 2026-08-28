@@ -11,7 +11,7 @@ import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
 import net from 'node:net';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
@@ -721,6 +721,9 @@ test('fixed-port LAN share: a loopback-binding app gets the gated share ON its f
 
 test('fixed-port LAN share: a wildcard-binding app falls back to a free port, and says so', async (t) => {
   if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  // Asserting the exact 'app' attribution requires the holder probe to be able
+  // to run at all; the probe-unavailable host class is covered separately below.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
   const root = await mkRoot();
   const port = await freePort();
   // This app binds 0.0.0.0, so it already occupies the fixed port on every LAN
@@ -883,4 +886,47 @@ test('fixed-port LAN share: a THIRD-PARTY listener on the LAN port must not be b
   // The fallback share itself is still a real, gated share.
   const noauth = await fetch(`http://127.0.0.1:${res.body.proxyPort}/`);
   assert.equal(noauth.status, 401);
+});
+
+test('fixed-port LAN share: where the holder probe cannot run, an exposure warning still fires', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  // A genuinely wildcard-binding app: it really IS answering on the LAN at the
+  // fixed port with no gate, so a silent share here would hide a real exposure.
+  await mkProject(root, 'app', { start: fakeAppCmd('wildcard'), port }, { git: true });
+
+  // Simulate a host with no loopback aliases (macOS/Windows), where binding the
+  // probe address fails with EADDRNOTAVAIL before the kernel considers the port
+  // — for every port, held or free. Measured: 192.0.2.1 (RFC 5737 TEST-NET-1)
+  // reproduces exactly that on Linux, so this exercises the real code path
+  // rather than skipping it on the one platform where it can't occur.
+  const prevProbe = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  process.env.CODEHUB_WILDCARD_PROBE_ADDR = '192.0.2.1';
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    if (prevProbe === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prevProbe;
+    await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root);
+  });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fixedPortFallback, true);
+  // The probe couldn't establish anything, so the holder is unreported — but
+  // it must NOT be reported as 'other', which is the one value that licenses
+  // staying quiet. That is the whole failure mode: an all-clear we never earned.
+  assert.equal(res.body.fixedPortHolder, 'unknown');
+  assert.notEqual(res.body.fixedPortHolder, 'other');
+  assert.equal((await appStatus(base)).tunnel.fixedPortHolder, 'unknown');
+
+  // And the exposure is real: the app answers on the LAN at the fixed port
+  // with no credentials at all.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  const ungated = await fetch(`http://${lanIp}:${port}/`);
+  assert.equal(ungated.status, 200);
+  assert.equal(await ungated.text(), 'ok');
 });

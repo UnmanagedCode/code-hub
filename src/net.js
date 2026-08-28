@@ -34,29 +34,38 @@ export function isPortFree(port) {
   });
 }
 
-// The loopback alias the wildcard-hold probe binds. Any 127.0.0.0/8 address is
-// a distinct bind target from 127.0.0.1 while still being purely local, so
-// probing it never touches the network or any real interface.
-const PROBE_ALIAS = '127.0.0.2';
-
 // Answers "is `port` held by a bind covering EVERY address?" — i.e. is the
 // holder a wildcard (0.0.0.0) listener rather than an address-specific one.
 // This is what separates "the app itself binds all interfaces, so it really is
 // reachable on the LAN" from "some unrelated process holds one LAN address".
 //
-// PROBE_ALIAS is covered by a wildcard bind but is a distinct address from
-// 127.0.0.1, so the bind outcome answers it directly:
-//   EADDRINUSE  → something holds the port on all addresses (a wildcard bind)
-//   bound ok    → nothing does; any holder is address-specific
-//   other error → the alias isn't usable here (EADDRNOTAVAIL on some non-Linux
-//                 hosts), so nothing has been established
+// It binds a loopback alias (127.0.0.2): any 127.0.0.0/8 address is a distinct
+// bind target from 127.0.0.1 while still being purely local, so probing it
+// never touches the network or any real interface. A wildcard bind covers it,
+// so the outcome answers the question directly:
+//   'held'         EADDRINUSE → something holds the port on all addresses
+//   'free'         bound ok   → nothing does; any holder is address-specific
+//   'inconclusive' any other error → nothing established. Covers both a
+//                  one-off failure and the permanent case above, where the
+//                  host has no loopback aliases at all.
 // Tri-state on purpose: the caller must be able to report "unknown" rather than
 // assert a cause it hasn't proved. Never throws.
+//
+// IMPORTANT: only Linux configures the whole 127.0.0.0/8 on loopback. macOS and
+// Windows have 127.0.0.1 alone, so the alias bind fails EADDRNOTAVAIL there
+// before the kernel ever considers the port — for every port, held or free.
+// This probe is therefore permanently 'inconclusive' on those hosts, which is
+// exactly why callers must fail safe on that answer instead of reading it as
+// "nothing is wrong" (see appManager.share and public/shareState.js).
+// CODEHUB_WILDCARD_PROBE_ADDR overrides the alias so tests can exercise that
+// host class on Linux; nothing else should set it. Read per call (like
+// projectsRoot's PROJECTS_ROOT) so it doesn't depend on module-load ordering.
 export function probeWildcardHold(port) {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.on('error', (e) => resolve(e.code === 'EADDRINUSE' ? 'held' : 'inconclusive'));
-    srv.listen(port, PROBE_ALIAS, () => srv.close(() => resolve('free')));
+    const alias = process.env.CODEHUB_WILDCARD_PROBE_ADDR || '127.0.0.2';
+    srv.listen(port, alias, () => srv.close(() => resolve('free')));
   });
 }
 

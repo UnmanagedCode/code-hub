@@ -388,17 +388,29 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
         // telling someone their app is already exposed when it isn't invites
         // them to conclude the gate is pointless.
         //
-        // A wildcard hold can only be the app's own: start() proved this port
-        // free on every address before spawning, so the app is its first holder,
-        // and anything arriving later can only take addresses the app left
-        // free — never the wildcard.
+        // A wildcard hold is STRONGLY indicative of the app's own bind, not
+        // proof of it: start() proved this port free on every address before
+        // spawning, so the app was its first holder and anything arriving later
+        // could only take addresses the app left free. That premise is
+        // spawn-time, though, and this is a share-time conclusion — share()'s
+        // liveness gate only establishes that the start command's wrapper
+        // process is alive (rec.pid is the `bash -lc` wrapper, see
+        // runner.spawnChild), not that the app's own listener is still up. A
+        // reloader restarting the server frees the port machine-wide for a
+        // moment, during which something else could take the wildcard. So 'app' means "almost
+        // certainly the app", and every message built from it is phrased to
+        // match (see public/shareState.js).
+        //
+        // 'inconclusive' maps to 'unknown', which callers must treat as
+        // possible exposure rather than as an all-clear: on a host with no
+        // loopback aliases the probe can never run at all.
         const hold = await probeWildcardHold(rec.fixedPort);
         fixedPortHolder = hold === 'held' ? 'app' : hold === 'free' ? 'other' : 'unknown';
         const why = fixedPortHolder === 'app'
-          ? 'the app itself binds all interfaces, so it is already reachable there ungated'
+          ? 'held on every interface, almost certainly by the app itself — if so it is already reachable there ungated'
           : fixedPortHolder === 'other'
             ? 'another process holds a LAN address at that port — not the app, which is not LAN-reachable there'
-            : 'code-hub could not identify what holds it';
+            : 'code-hub could not identify what holds it; if the app binds all interfaces it is already reachable there ungated';
         console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
       }
     }

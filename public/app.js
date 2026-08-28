@@ -1,7 +1,7 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
 // renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch } from './shareState.js';
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice } from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -300,20 +300,11 @@ function sharePanel(app) {
     : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
     : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
 
-  // The gated share couldn't take the app's fixed port on the LAN. Only the
-  // 'app' case is a security warning — that's the one where code-hub actually
-  // established the app itself binds every interface, and is therefore already
-  // answering on the LAN at that port with no gate. The other two make no claim
-  // about the app: saying "it's exposed anyway" when it isn't would invite the
-  // user to conclude the gate is pointless.
-  if (kind === 'lan' && shared.fixedPortFallback) {
-    panel.appendChild(shared.fixedPortHolder === 'app'
-      ? el('div', { class: 'warn' },
-          `\u26a0 Fixed port ${app.port} is held on all interfaces by the app itself, so this gated share is on port ${shared.proxyPort}. The app is also reachable on the LAN at port ${app.port} with NO authentication.`)
-      : el('div', { class: 'cred-note' },
-          shared.fixedPortHolder === 'other'
-            ? `Fixed port ${app.port} is held on the LAN by another process, not by this app, so this gated share is on port ${shared.proxyPort}.`
-            : `Fixed port ${app.port} could not be bound on the LAN — code-hub could not identify what holds it — so this gated share is on port ${shared.proxyPort}.`));
+  // Wording and warn-vs-note live in shareState.js so the fail-safe rule (an
+  // unidentifiable holder still warns) is unit-testable without a DOM.
+  const fixedPortNotice = resolveFixedPortNotice(app, shared);
+  if (fixedPortNotice) {
+    panel.appendChild(el('div', { class: fixedPortNotice.level === 'warn' ? 'warn' : 'cred-note' }, fixedPortNotice.text));
   }
 
   if (shared.urls && shared.urls.length > 1) {
