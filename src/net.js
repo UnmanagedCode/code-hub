@@ -64,9 +64,34 @@ export function probeWildcardHold(port) {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.on('error', (e) => resolve(e.code === 'EADDRINUSE' ? 'held' : 'inconclusive'));
-    const alias = process.env.CODEHUB_WILDCARD_PROBE_ADDR || '127.0.0.2';
-    srv.listen(port, alias, () => srv.close(() => resolve('free')));
+    srv.listen(port, probeAlias(), () => srv.close(() => resolve('free')));
   });
+}
+
+const DEFAULT_PROBE_ALIAS = '127.0.0.2';
+
+// The probe's 'free' answer means "no wildcard holder", and downstream that is
+// the ONLY verdict allowed to stay quiet about a possible ungated LAN exposure.
+// That inference holds only if an IPv4 wildcard (0.0.0.0) bind would necessarily
+// cover the probed address — true of any IPv4 address (an unconfigured one just
+// fails EADDRNOTAVAIL, which is the safe 'inconclusive'), and false across
+// address families. Measured: with a process holding 0.0.0.0:<port>, binding
+// `::1:<port>` SUCCEEDS, so an IPv6 alias would report 'free' for a genuinely
+// wildcard-held port and silence the warning. `localhost` is the same trap — it
+// resolves to ::1 here — so this validates the literal, not a hostname.
+//
+// A rejected value falls back to the default rather than disabling the probe:
+// the default provably supports the inference, so production keeps giving
+// correct verdicts (including the quiet one, when it is genuinely earned)
+// whatever ends up in the environment. Logged, never silent.
+function probeAlias() {
+  const override = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  if (!override) return DEFAULT_PROBE_ALIAS;
+  if (!net.isIPv4(override)) {
+    console.warn(`[code-hub] CODEHUB_WILDCARD_PROBE_ADDR='${override}' is not an IPv4 literal — ignoring it and probing ${DEFAULT_PROBE_ALIAS}. Only an IPv4 alias can show the absence of a wildcard hold; a non-IPv4 one would bind alongside a 0.0.0.0 listener and hide a real LAN exposure.`);
+    return DEFAULT_PROBE_ALIAS;
+  }
+  return override;
 }
 
 // Pure text parser: extracts LAN-reachable IPv4 addresses from `ip -4 addr`

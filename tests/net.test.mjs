@@ -212,3 +212,44 @@ test('probeWildcardHold separates a wildcard holder from an address-specific one
   const untouched = await allocatePort();
   assert.equal(await probeWildcardHold(untouched), 'free');
 });
+
+test('probeWildcardHold: a non-IPv4 alias override can never yield the quiet verdict', async (t) => {
+  // The probe's 'free' answer is the only one downstream may stay quiet on, so
+  // it must only come from an address a 0.0.0.0 holder would necessarily cover.
+  // Measured: `::1` and `localhost` (which resolves to ::1) both BIND happily
+  // alongside a holder on 0.0.0.0 — different address family — so an unvalidated
+  // override returns 'free' → 'other' → a neutral note, for an app that really
+  // is answering ungated on the LAN. That is the under-report this whole signal
+  // exists to prevent, reopened by the seam added to test it.
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+
+  for (const bad of ['::1', 'localhost', '::']) {
+    process.env.CODEHUB_WILDCARD_PROBE_ADDR = bad;
+    const verdict = await probeWildcardHold(port);
+    assert.notEqual(verdict, 'free', `alias '${bad}' must not produce the quiet verdict`);
+    // Rejected values fall back to the IPv4 default, which correctly sees the
+    // wildcard holder — so the warning fires rather than the probe going dark.
+    assert.equal(verdict, 'held', `alias '${bad}' must fall back to the IPv4 default`);
+  }
+});
+
+test('probeWildcardHold: a valid IPv4 override is still honoured', async (t) => {
+  // Validation must reject the wrong address family, not every override — the
+  // probe-unavailable host class is simulated with an unconfigured IPv4 address
+  // (see tests/routes.test.mjs), and that must keep reaching 'inconclusive'.
+  const port = await allocatePort();
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  process.env.CODEHUB_WILDCARD_PROBE_ADDR = '192.0.2.1'; // RFC 5737, never configured
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+  assert.equal(await probeWildcardHold(port), 'inconclusive');
+});
