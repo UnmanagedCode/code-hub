@@ -7,7 +7,7 @@ import {
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
-import { allocatePort, enumerateUrls, routeUrls, localIPv4s } from './net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
@@ -183,6 +183,8 @@ export async function list() {
         tunnelInfo = {
           url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
           proxyPort: rec.tunnel.proxyPort ?? null,
+          fixedPortFallback: rec.tunnel.fixedPortFallback === true,
+          fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
           auth, tls: rec.tunnel.tls === true,
           username, password,
           ...(authUrl ? { authUrl } : {}),
@@ -268,13 +270,33 @@ export async function start(id) {
     const e = new Error(`'${id}' is already running`); e.statusCode = 409; throw e;
   }
   const app = await findDiscovered(id);
-  let port = await allocatePort();
-  const proc = await runner.start(app, port);
-  port = proc.port; // runner.start() may have retried onto a different port
+  // A manifest `port` pins the app's port for this checkout. projects.js already
+  // nulls it for worktrees, so this is only ever set for a default checkout.
+  const fixedPort = app.manifest.port ?? null;
+  const busy = `port ${fixedPort} is already in use — '${id}' declares a fixed port and will not fall back to a free one`;
+  if (fixedPort !== null) {
+    const holder = Object.values(store.apps).find((r) => r.port === fixedPort && state.pidAlive(r.pid));
+    if (holder) { const e = new Error(`${busy} (held by '${holder.id}')`); e.statusCode = 409; throw e; }
+    if (!(await isPortFree(fixedPort))) { const e = new Error(busy); e.statusCode = 409; throw e; }
+  }
+  let port = fixedPort ?? await allocatePort();
+  const proc = await runner.start(app, port, { fixed: fixedPort !== null });
+  port = proc.port; // runner.start() may have retried onto a different port (dynamic only)
+  if (fixedPort !== null) {
+    // Closes the TOCTOU window between the probe above and the child's own
+    // bind — and catches a child that failed to bind for a reason isPortFree
+    // can't see. This is what makes "a fixed port never silently moves" true
+    // rather than merely likely: refuse loudly instead of leaving a dead record.
+    const rt = runner.runtime(id);
+    if (rt?.status === 'crashed' && /EADDRINUSE/.test(rt.error ?? '')) {
+      runner.stop({ id, pgid: proc.pgid });
+      const e = new Error(busy); e.statusCode = 409; throw e;
+    }
+  }
   store.apps[id] = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
-    pid: proc.pid, pgid: proc.pgid, port,
+    pid: proc.pid, pgid: proc.pgid, port, fixedPort,
     urls: enumerateUrls(port),
     startedSha: await headSha(app.path),
     startedAt: proc.startedAt,
@@ -337,28 +359,80 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     // Self-signed cert covering the LAN IPs + loopback, generated per share and
     // held in memory only (via the proxy) — nothing on disk. Browsers show a
     // one-time "not private" warning (self-signed); documented as a limitation.
+    const lanIps = localIPv4s({ lanFallback: true }); // one list for the cert SAN and the bind hosts
     let tlsOpt = null;
     if (useTls) {
-      const ips = localIPv4s({ lanFallback: true });
-      const { key, cert } = generateSelfSigned({ ipAddresses: [...ips, '127.0.0.1'], dnsNames: ['localhost'] });
+      const { key, cert } = generateSelfSigned({ ipAddresses: [...lanIps, '127.0.0.1'], dnsNames: ['localhost'] });
       tlsOpt = { key, cert };
     }
-    const proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth, tls: tlsOpt });
+    // Same-port LAN share: measured on Linux, a proxy CAN bind
+    // <lanIp>:<fixedPort> while the app holds 127.0.0.1:<fixedPort>, but NOT
+    // while the app holds the wildcard (SO_REUSEADDR doesn't permit
+    // overlapping listen binds). code-hub injects only PORT and can't know
+    // which host the child chose, so attempt the bind and let EADDRINUSE
+    // answer — never guess.
+    let proxy = null;
+    let fixedPortFallback = false;
+    let fixedPortHolder = null;
+    if (rec.fixedPort && lanIps.length) {
+      try {
+        proxy = await startAuthProxy(rec.port, { host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
+      } catch (e) {
+        if (e.code !== 'EADDRINUSE') throw e;
+        fixedPortFallback = true;
+        // EADDRINUSE alone does not say WHO holds the port, and the two possible
+        // causes mean opposite things to the user: either the app itself bound
+        // every interface (it really is answering on the LAN, ungated), or an
+        // unrelated process holds a LAN address at that port (the app is not
+        // LAN-reachable at all). Never assert the first without establishing it —
+        // telling someone their app is already exposed when it isn't invites
+        // them to conclude the gate is pointless.
+        //
+        // A wildcard hold is STRONGLY indicative of the app's own bind, not
+        // proof of it: start() proved this port free on every address before
+        // spawning, so the app was its first holder and anything arriving later
+        // could only take addresses the app left free. That premise is
+        // spawn-time, though, and this is a share-time conclusion — share()'s
+        // liveness gate only establishes that the start command's wrapper
+        // process is alive (rec.pid is the `bash -lc` wrapper, see
+        // runner.spawnChild), not that the app's own listener is still up. A
+        // reloader restarting the server frees the port machine-wide for a
+        // moment, during which something else could take the wildcard. So 'app' means "almost
+        // certainly the app", and every message built from it is phrased to
+        // match (see public/shareState.js).
+        //
+        // 'inconclusive' maps to 'unknown', which callers must treat as
+        // possible exposure rather than as an all-clear: on a host with no
+        // loopback aliases the probe can never run at all.
+        const hold = await probeWildcardHold(rec.fixedPort);
+        fixedPortHolder = hold === 'held' ? 'app' : hold === 'free' ? 'other' : 'unknown';
+        const why = fixedPortHolder === 'app'
+          ? 'held on every interface, almost certainly by the app itself — if so it is already reachable there ungated'
+          : fixedPortHolder === 'other'
+            ? 'another process holds a LAN address at that port — not the app, which is not LAN-reachable there'
+            : 'code-hub could not identify what holds it; if the app binds all interfaces it is already reachable there ungated';
+        console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
+      }
+    }
+    if (!proxy) proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth, tls: tlsOpt });
     proxies.set(id, proxy);
     const scheme = useTls ? 'https' : 'http';
-    // Drop the loopback entry — it's not reachable from another device.
+    // Drop the loopback entry — it's not reachable from another device, and in
+    // the fixed-port case that's load-bearing rather than cosmetic: the proxy
+    // isn't bound on loopback at all there, so `<scheme>://localhost:<fixedPort>`
+    // would reach the app DIRECTLY, ungated.
     const loopbackPrefix = `${scheme}://localhost:`;
     const urls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
     const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
-    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls };
+    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
     await persist();
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
-      return { kind: 'lan', url, urls, auth: false, tls: useTls, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
+      return { kind: 'lan', url, urls, auth: false, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, tls: useTls, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
   if (!(await tunnel.available())) {
@@ -466,7 +540,7 @@ async function hasManifestFile(dir) {
 // app, by writing an entry into registrations.json (see projects.js). A dir
 // that already has a `.hub.json` — even a broken one — needs no registration
 // and is rejected outright; it always wins over any registry entry.
-export async function registerApp({ id, start, name, healthPath, readyWhen, routes } = {}) {
+export async function registerApp({ id, start, name, healthPath, readyWhen, port, routes } = {}) {
   if (typeof id !== 'string' || id.length === 0 || id.startsWith('.') || path.basename(id) !== id) {
     const e = new Error('id is required and must be a plain, non-dot-prefixed directory basename (no path separators)'); e.statusCode = 400; throw e;
   }
@@ -483,7 +557,7 @@ export async function registerApp({ id, start, name, healthPath, readyWhen, rout
   if (await hasManifestFile(dir)) {
     const e = new Error(`'${id}' already has a .hub.json — no registration needed`); e.statusCode = 409; throw e;
   }
-  const manifest = validateManifestObject({ start, name, healthPath, readyWhen, routes }, `register_app:${id}`);
+  const manifest = validateManifestObject({ start, name, healthPath, readyWhen, port, routes }, `register_app:${id}`);
   const registry = await readRegistry();
   registry[id] = manifest;
   await writeRegistry(registry);

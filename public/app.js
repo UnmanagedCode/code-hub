@@ -1,7 +1,7 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
 // renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch } from './shareState.js';
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice } from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -299,6 +299,13 @@ function sharePanel(app) {
     : !authEnabled ? 'via LAN, no authentication — anyone on the network can reach this app'
     : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
     : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
+
+  // Wording and warn-vs-note live in shareState.js so the fail-safe rule (an
+  // unidentifiable holder still warns) is unit-testable without a DOM.
+  const fixedPortNotice = resolveFixedPortNotice(app, shared);
+  if (fixedPortNotice) {
+    panel.appendChild(el('div', { class: fixedPortNotice.level === 'warn' ? 'warn' : 'cred-note' }, fixedPortNotice.text));
+  }
 
   if (shared.urls && shared.urls.length > 1) {
     panel.appendChild(el('div', { class: 'lan-links' },

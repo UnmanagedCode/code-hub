@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import https from 'node:https';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive } from './helpers.mjs';
+import net from 'node:net';
+import { localIPv4s } from '../src/net.js';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
@@ -581,4 +584,349 @@ test('init tears down a share orphaned by a code-hub restart (needs-reshare)', a
   assert.equal(demo.tunnel, null, 'orphaned tunnel is cleared → Share reappears');
   await waitFor(() => !pidAlive(tunChild.pid)); // orphaned cloudflared killed
   assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
+});
+
+// --- Fixed port (`port` in the manifest) ---
+
+// Reserve a port the fixed-port tests can claim: allocate then release, so the
+// number is real and currently free rather than a hardcoded guess.
+const freePort = () => new Promise((r) => {
+  const s = net.createServer();
+  s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)); });
+});
+
+const appStatus = async (base, id = 'app') =>
+  (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === id);
+
+test('an app declaring a fixed port starts on exactly that port, and restart keeps it', async (t) => {
+  const root = await mkRoot();
+  const port = await freePort();
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const started = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(started.status, 200);
+  assert.equal(started.body.port, port);
+  assert.equal(started.body.fixedPort, port);
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const app = await appStatus(base);
+  assert.equal(app.port, port);
+  assert.ok(app.urls.includes(`http://localhost:${port}`), 'urls must carry the fixed port');
+  assert.ok(app.routes[0].urls.includes(`http://localhost:${port}`));
+
+  // Restart is stop-then-start, so the port must come back identical — the
+  // whole point of pinning it (a bookmarkable URL survives a restart).
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200);
+  assert.equal(restarted.body.port, port);
+});
+
+test('starting a fixed-port app whose port is busy → 409, never a silent fallback', async (t) => {
+  const root = await mkRoot();
+  const port = await freePort();
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, '127.0.0.1', r));
+  t.after(() => new Promise((r) => blocker.close(r)));
+
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /already in use/);
+  assert.match(res.body.error, /will not fall back to a free one/);
+
+  // Crucially: nothing is left running on some OTHER port.
+  assert.equal((await appStatus(base)).status, 'stopped');
+});
+
+test('a dynamic-port app is unaffected: no fixedPort, still gets a free port', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const started = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(started.status, 200);
+  assert.equal(started.body.fixedPort, null);
+  assert.ok(started.body.port > 0);
+});
+
+test('a worktree of a fixed-port project starts on a FREE port, not the pinned one', async (t) => {
+  const root = await mkRoot();
+  const port = await freePort();
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  // Git carries the parent's .hub.json into the worktree checkout — same file,
+  // fixed port and all. Discovery must strip it so both can run at once.
+  await mkProject(root, 'app_worktree_ab12cd', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    await appManager.stop('app').catch(() => {});
+    await appManager.stop('app_worktree_ab12cd').catch(() => {});
+    server.close(); await rmRoot(root);
+  });
+
+  const parent = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(parent.body.port, port);
+
+  const wt = await j(base, 'POST', '/api/apps/app_worktree_ab12cd/start');
+  assert.equal(wt.status, 200, JSON.stringify(wt.body));
+  assert.equal(wt.body.fixedPort, null);
+  assert.notEqual(wt.body.port, port); // it did not try to take the parent's port
+});
+
+// --- Fixed-port LAN share: the two bind outcomes ---
+//
+// Measured on Linux: a proxy CAN bind <lanIp>:<P> while the app holds
+// 127.0.0.1:<P>, but NOT while the app holds 0.0.0.0:<P> (SO_REUSEADDR does
+// not permit overlapping listen binds). Both branches are asserted below.
+// Skipped where the host has no LAN interface at all, since there is then no
+// specific address for the proxy to bind.
+const HAS_LAN = localIPv4s({ lanFallback: true }).length > 0;
+
+test('fixed-port LAN share: a loopback-binding app gets the gated share ON its fixed port', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  // The default fake-app binds 127.0.0.1 only, leaving the LAN addresses free.
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.proxyPort, port, 'the gated share must land on the fixed port');
+  assert.equal(res.body.fixedPortFallback, false);
+  assert.ok(res.body.urls.every((u) => u.endsWith(`:${port}`)));
+
+  const app = await appStatus(base);
+  assert.equal(app.tunnel.proxyPort, port);
+  assert.equal(app.tunnel.fixedPortFallback, false);
+  assert.equal(app.tunnel.fixedPortHolder, null); // nothing fell back, so no cause to report
+
+  // The proxy really is on the LAN address at that port, and really is gated.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  const noauth = await fetch(`http://${lanIp}:${port}/`);
+  assert.equal(noauth.status, 401);
+  const authed = await fetch(`http://${lanIp}:${port}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
+});
+
+test('fixed-port LAN share: a wildcard-binding app falls back to a free port, and says so', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  // Asserting the exact 'app' attribution requires the holder probe to be able
+  // to run at all; the probe-unavailable host class is covered separately below.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+  const root = await mkRoot();
+  const port = await freePort();
+  // This app binds 0.0.0.0, so it already occupies the fixed port on every LAN
+  // address — the gated proxy cannot take it.
+  await mkProject(root, 'app', { start: fakeAppCmd('wildcard'), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fixedPortFallback, true, 'the fallback must be surfaced, not silent');
+  assert.notEqual(res.body.proxyPort, port);
+  // The app really does hold every interface here, so the exposure claim is
+  // established and the loud warning must fire. This is the under-report guard:
+  // it fails if the cause probe ever stops recognising a genuine wildcard hold.
+  assert.equal(res.body.fixedPortHolder, 'app');
+
+  const app = await appStatus(base);
+  assert.equal(app.tunnel.fixedPortFallback, true);
+  assert.equal(app.tunnel.fixedPortHolder, 'app');
+  assert.equal(app.tunnel.proxyPort, res.body.proxyPort);
+
+  // The fallback share is still a real, gated share.
+  const noauth = await fetch(`http://127.0.0.1:${res.body.proxyPort}/`);
+  assert.equal(noauth.status, 401);
+  const authed = await fetch(`http://127.0.0.1:${res.body.proxyPort}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+});
+
+test('a dynamic-port LAN share reports fixedPortFallback:false (no false alarm)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.body.fixedPortFallback, false);
+  assert.equal(res.body.fixedPortHolder, null);
+  assert.equal((await appStatus(base)).tunnel.fixedPortFallback, false);
+  assert.equal((await appStatus(base)).tunnel.fixedPortHolder, null);
+});
+
+// The pre-check and the post-spawn check are independent defenses that cover
+// different failures. The three tests below each defeat one of them so the
+// other has to carry the case alone — otherwise a regression in either would
+// stay hidden behind the one that still works.
+
+test('a fixed-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', async (t) => {
+  const root = await mkRoot();
+  const port = await freePort();
+  // The port really is free, so the pre-check passes — only the post-spawn
+  // check can catch this. `flaky` fails once with EADDRINUSE and would succeed
+  // on a retry, so a runner that still reallocates would silently start this
+  // app on a DIFFERENT port instead: exactly the outcome a fixed port forbids.
+  const marker = path.join(root, 'flaky-marker');
+  await mkProject(root, 'app', { start: fakeAppCmd('flaky', marker), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 409, `expected a refusal, got ${JSON.stringify(res.body)}`);
+  assert.match(res.body.error, /already in use/);
+
+  const app = await appStatus(base);
+  assert.equal(app.status, 'stopped');
+  assert.equal(app.port, undefined, 'no record may survive a refused fixed-port start');
+});
+
+test('a fixed port held only on a LAN address is refused, though the app could still bind loopback', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  // Held on a LAN address only. The app binds 127.0.0.1, so it would start
+  // happily and the child would never report EADDRINUSE — the post-spawn check
+  // is blind here. Only the 0.0.0.0 pre-check sees this, and it must refuse:
+  // the fixed port is not actually available on this machine.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, lanIp, r));
+  t.after(() => new Promise((r) => blocker.close(r)));
+
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 409, `expected a refusal, got ${JSON.stringify(res.body)}`);
+  assert.match(res.body.error, /already in use/);
+  assert.equal((await appStatus(base)).status, 'stopped');
+});
+
+test('a fixed port already held by another code-hub app is refused, naming the holder', async (t) => {
+  const root = await mkRoot();
+  const port = await freePort();
+  await mkProject(root, 'first', { start: fakeAppCmd(), port }, { git: true });
+  await mkProject(root, 'second', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    await appManager.stop('first').catch(() => {});
+    await appManager.stop('second').catch(() => {});
+    server.close(); await rmRoot(root);
+  });
+
+  assert.equal((await j(base, 'POST', '/api/apps/first/start')).status, 200);
+  const res = await j(base, 'POST', '/api/apps/second/start');
+  assert.equal(res.status, 409);
+  // Naming the holder is the difference between a useful message and a shrug —
+  // the generic probe failure can't say who has the port.
+  assert.match(res.body.error, /held by 'first'/);
+});
+
+test('fixed-port LAN share: a THIRD-PARTY listener on the LAN port must not be blamed on the app', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  // The default fake-app binds 127.0.0.1 only, so it is NOT reachable on the
+  // LAN at all — the exposure claim would be flatly false for it.
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  // An unrelated process grabs the fixed port on a LAN address AFTER the app
+  // started (start()'s 0.0.0.0 probe proved it free machine-wide before that,
+  // so this is the only order in which it can happen). The proxy's LAN bind now
+  // fails with the exact same EADDRINUSE the wildcard-binding app produces.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  // A real HTTP server, so the reachability check below gets an answer rather
+  // than hanging on an accepted-but-silent socket — and so its reply is
+  // distinguishable from the app's.
+  const squatter = http.createServer((req, res) => { res.writeHead(200); res.end('squatter'); });
+  await new Promise((r) => squatter.listen(port, lanIp, r));
+  t.after(() => new Promise((r) => { squatter.closeAllConnections?.(); squatter.close(r); }));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fixedPortFallback, true);
+  // The whole point: code-hub must NOT claim the app is LAN-reachable ungated,
+  // because it isn't. Blaming the app here would tell the user their app is
+  // already exposed and invite them to treat the gate as pointless.
+  assert.equal(res.body.fixedPortHolder, 'other');
+  assert.notEqual(res.body.fixedPortHolder, 'app');
+
+  const app = await appStatus(base);
+  assert.equal(app.tunnel.fixedPortHolder, 'other');
+
+  // And the app genuinely is not reachable on the LAN at the fixed port —
+  // what answers there is the squatter, not the app (which serves 'ok').
+  const viaLan = await fetch(`http://${lanIp}:${port}/`).then((r) => r.text()).catch(() => null);
+  assert.equal(viaLan, 'squatter');
+
+  // The fallback share itself is still a real, gated share.
+  const noauth = await fetch(`http://127.0.0.1:${res.body.proxyPort}/`);
+  assert.equal(noauth.status, 401);
+});
+
+test('fixed-port LAN share: where the holder probe cannot run, an exposure warning still fires', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  // A genuinely wildcard-binding app: it really IS answering on the LAN at the
+  // fixed port with no gate, so a silent share here would hide a real exposure.
+  await mkProject(root, 'app', { start: fakeAppCmd('wildcard'), port }, { git: true });
+
+  // Simulate a host with no loopback aliases (macOS/Windows), where binding the
+  // probe address fails with EADDRNOTAVAIL before the kernel considers the port
+  // — for every port, held or free. Measured: 192.0.2.1 (RFC 5737 TEST-NET-1)
+  // reproduces exactly that on Linux, so this exercises the real code path
+  // rather than skipping it on the one platform where it can't occur.
+  const prevProbe = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  process.env.CODEHUB_WILDCARD_PROBE_ADDR = '192.0.2.1';
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    if (prevProbe === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prevProbe;
+    await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root);
+  });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fixedPortFallback, true);
+  // The probe couldn't establish anything, so the holder is unreported — but
+  // it must NOT be reported as 'other', which is the one value that licenses
+  // staying quiet. That is the whole failure mode: an all-clear we never earned.
+  assert.equal(res.body.fixedPortHolder, 'unknown');
+  assert.notEqual(res.body.fixedPortHolder, 'other');
+  assert.equal((await appStatus(base)).tunnel.fixedPortHolder, 'unknown');
+
+  // And the exposure is real: the app answers on the LAN at the fixed port
+  // with no credentials at all.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  const ungated = await fetch(`http://${lanIp}:${port}/`);
+  assert.equal(ungated.status, 200);
+  assert.equal(await ungated.text(), 'ok');
 });

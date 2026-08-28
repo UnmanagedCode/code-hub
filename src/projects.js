@@ -85,6 +85,11 @@ export function validateManifestObject(obj, file = MANIFEST_FILENAME) {
       throw new Error(`${file}: "${key}" must be a string`);
     }
   }
+  if (obj.port != null) {
+    if (!Number.isInteger(obj.port) || obj.port < 1024 || obj.port > 65535) {
+      throw new Error(`${file}: "port" must be an integer between 1024 and 65535 (got ${JSON.stringify(obj.port)})`);
+    }
+  }
   let routes = null;
   if (obj.routes != null) {
     if (!Array.isArray(obj.routes) || obj.routes.length === 0) {
@@ -108,6 +113,7 @@ export function validateManifestObject(obj, file = MANIFEST_FILENAME) {
     name: obj.name ?? null,
     healthPath: obj.healthPath ?? null,
     readyWhen: obj.readyWhen ?? null,
+    port: obj.port ?? null,
     routes,
   };
 }
@@ -272,7 +278,15 @@ export async function discoverApps() {
     if (!manifest) continue;
 
     if (parentName) {
-      out.push({ id: e.name, project: parentName, path: dir, isWorktree: true, branch: null, manifest, manifestError: null, source });
+      // A fixed port is per-checkout: worktrees keep dynamic allocation and must
+      // never inherit a pinned port — not via the parent fallback above, and not
+      // via the `.hub.json` copy git carried into the worktree checkout (the
+      // common case). Enforcing it here, at discovery, covers both routes at
+      // once. Copy rather than mutate: `manifest` may be the memoized parent
+      // object (see resolve()), and mutating it would strip the PARENT's own
+      // fixed port too.
+      const wtManifest = manifest.port == null ? manifest : { ...manifest, port: null };
+      out.push({ id: e.name, project: parentName, path: dir, isWorktree: true, branch: null, manifest: wtManifest, manifestError: null, source });
     } else {
       out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest, manifestError: null, source });
     }

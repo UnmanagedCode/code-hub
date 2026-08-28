@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
   const port = await allocatePort();
@@ -143,4 +144,148 @@ test('waitForPort resolves once something is listening, rejects otherwise', asyn
   await new Promise((r) => srv.listen(port, '127.0.0.1', r));
   await waitForPort(port, { timeoutMs: 1000 });
   await new Promise((r) => srv.close(r));
+});
+
+// Hold `port` on `host` for the rest of the test, closing it via t.after so a
+// failed assertion can't leave a listening socket keeping the process alive.
+async function hold(t, port, host) {
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, host, r));
+  let open = true;
+  const release = () => (open ? new Promise((r) => { open = false; blocker.close(r); }) : Promise.resolve());
+  t.after(release);
+  return release;
+}
+
+test('isPortFree is true for a released port and false while anything holds it', async (t) => {
+  const port = await allocatePort();
+  assert.equal(await isPortFree(port), true);
+
+  const release = await hold(t, port, '127.0.0.1');
+  assert.equal(await isPortFree(port), false);
+
+  await release();
+  assert.equal(await isPortFree(port), true); // free again once released
+});
+
+test('isPortFree is false for a port held on the wildcard address too', async (t) => {
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+  assert.equal(await isPortFree(port), false);
+});
+
+test('isPortFree is a MACHINE-WIDE probe, not a loopback or connect check', async (t) => {
+  // The discriminating case, and the only one here that pins HOW isPortFree
+  // probes. A holder on 127.0.0.1 or on 0.0.0.0 (the two tests above) is
+  // reported busy by every plausible implementation alike — measured: a
+  // 0.0.0.0 bind, a 127.0.0.1 bind and a connect-based check all say "busy",
+  // so neither of those tests can tell them apart.
+  //
+  // A holder on an address that is neither loopback-proper nor the wildcard
+  // separates them: only the 0.0.0.0 bind sees it. A 127.0.0.1-bind probe
+  // binds fine, and a connect to 127.0.0.1 is refused — both would call this
+  // port FREE and let a fixed-port app start straight into an EADDRINUSE
+  // crash, or hand a fixed port to a second app.
+  //
+  // ALT_LOOPBACK keeps this host-independent: no LAN interface required, so it
+  // still guards the probe on a LAN-less box where the end-to-end LAN tests skip.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+  const port = await allocatePort();
+  await hold(t, port, ALT_LOOPBACK);
+  assert.equal(await isPortFree(port), false);
+});
+
+test('probeWildcardHold separates a wildcard holder from an address-specific one', async (t) => {
+  // This is what lets a fixed-port LAN share name the cause of its fallback
+  // instead of guessing: only a bind covering every address can be the app's
+  // own (see appManager.share), and only then is the app really LAN-exposed.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+
+  const wildcard = await allocatePort();
+  await hold(t, wildcard, '0.0.0.0');
+  assert.equal(await probeWildcardHold(wildcard), 'held');
+
+  const loopbackOnly = await allocatePort();
+  await hold(t, loopbackOnly, '127.0.0.1');
+  assert.equal(await probeWildcardHold(loopbackOnly), 'free', 'an address-specific holder is not a wildcard hold');
+
+  const untouched = await allocatePort();
+  assert.equal(await probeWildcardHold(untouched), 'free');
+});
+
+test('probeWildcardHold: a non-IPv4 alias override can never yield the quiet verdict', async (t) => {
+  // The probe's 'free' answer is the only one downstream may stay quiet on, so
+  // it must only come from an address a 0.0.0.0 holder would necessarily cover.
+  // Measured: `::1` and `localhost` (which resolves to ::1) both BIND happily
+  // alongside a holder on 0.0.0.0 — different address family — so an unvalidated
+  // override returns 'free' → 'other' → a neutral note, for an app that really
+  // is answering ungated on the LAN. That is the under-report this whole signal
+  // exists to prevent, reopened by the seam added to test it.
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+
+  for (const bad of ['::1', 'localhost', '::']) {
+    process.env.CODEHUB_WILDCARD_PROBE_ADDR = bad;
+    const verdict = await probeWildcardHold(port);
+    assert.notEqual(verdict, 'free', `alias '${bad}' must not produce the quiet verdict`);
+    // Rejected values fall back to the IPv4 default, which correctly sees the
+    // wildcard holder — so the warning fires rather than the probe going dark.
+    assert.equal(verdict, 'held', `alias '${bad}' must fall back to the IPv4 default`);
+  }
+});
+
+test('probeWildcardHold: a valid IPv4 override is still honoured', async (t) => {
+  // Validation must reject the wrong address family, not every override — the
+  // probe-unavailable host class is simulated with an unconfigured IPv4 address
+  // (see tests/routes.test.mjs), and that must keep reaching 'inconclusive'.
+  const port = await allocatePort();
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  process.env.CODEHUB_WILDCARD_PROBE_ADDR = '192.0.2.1'; // RFC 5737, never configured
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+  assert.equal(await probeWildcardHold(port), 'inconclusive');
+});
+
+test('probeWildcardHold: an alias that is not a SPECIFIC address cannot yield the loud verdict', async (t) => {
+  // Mirror image of the non-IPv4 case above. 'held' is read downstream as
+  // "almost certainly the app, which is therefore LAN-exposed", so an alias
+  // that reports 'held' without a wildcard holder reopens the over-report.
+  // Measured against a port held ONLY on 127.0.0.1 (no wildcard holder):
+  //   0.0.0.0   IS the wildcard, so it collides with any single-address holder
+  //   127.0.0.1 is what a loopback-only app binds, so it collides with the app
+  // Both pass a bare net.isIPv4() gate, which is why the class — a *specific*
+  // address nothing else is expected to bind — is what gets validated.
+  const port = await allocatePort();
+  await hold(t, port, '127.0.0.1');
+
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+
+  for (const bad of ['0.0.0.0', '127.0.0.1']) {
+    process.env.CODEHUB_WILDCARD_PROBE_ADDR = bad;
+    const verdict = await probeWildcardHold(port);
+    assert.notEqual(verdict, 'held', `alias '${bad}' must not produce the loud verdict without a wildcard holder`);
+    // Falls back to the default alias, which correctly sees no wildcard hold.
+    assert.equal(verdict, 'free', `alias '${bad}' must fall back to the specific-address default`);
+  }
+});
+
+test('probeWildcardHold: the default alias is unaffected by the specific-address rule', async (t) => {
+  // Guards the fallback target itself: 127.0.0.2 must keep reporting a genuine
+  // wildcard hold as 'held', or the validation above would have traded the
+  // over-report for an under-report.
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+  assert.equal(await probeWildcardHold(port), 'held');
 });

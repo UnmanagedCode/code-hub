@@ -47,7 +47,7 @@
       },
       {
         "name": "register_app",
-        "description": "Register a sibling project directory that has no .hub.json as a startable app (machine-local, written to registrations.json). Rejected if the directory already has a .hub.json. Multi-route apps (a routes array) can't be expressed in this schema — register those by hand-editing registrations.json directly.",
+        "description": "Register a sibling project directory that has no .hub.json as a startable app (machine-local, written to registrations.json). Rejected if the directory already has a .hub.json. An optional fixed `port` (1024-65535) pins the app to that port on its default checkout instead of an allocated free one; worktrees ignore it and always get a free port. Multi-route apps (a routes array) can't be expressed in this schema — register those by hand-editing registrations.json directly.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -55,7 +55,8 @@
             "start": { "type": "string", "minLength": 1 },
             "name": { "type": "string" },
             "healthPath": { "type": "string" },
-            "readyWhen": { "type": "string" }
+            "readyWhen": { "type": "string" },
+            "port": { "type": "integer" }
           },
           "required": ["id", "start"]
         }

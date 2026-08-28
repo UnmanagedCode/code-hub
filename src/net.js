@@ -19,6 +19,101 @@ export function allocatePort() {
   });
 }
 
+// True when `port` can be bound right now on every interface. Binding 0.0.0.0
+// is the strictest probe available: it fails if anything holds the port on any
+// single address (measured on Linux — a listener on 127.0.0.1:P makes
+// 0.0.0.0:P EADDRINUSE, since SO_REUSEADDR does not permit overlapping listen
+// binds), which is exactly the question "is this fixed port free?". Same TOCTOU
+// caveat as allocatePort — the child's own bind is the real backstop (see
+// appManager.start, which re-checks after the spawn settles).
+export function isPortFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on('error', () => resolve(false));
+    srv.listen(port, '0.0.0.0', () => srv.close(() => resolve(true)));
+  });
+}
+
+// Answers "is `port` held by a bind covering EVERY address?" — i.e. is the
+// holder a wildcard (0.0.0.0) listener rather than an address-specific one.
+// This is what separates "the app itself binds all interfaces, so it really is
+// reachable on the LAN" from "some unrelated process holds one LAN address".
+//
+// It binds a loopback alias (127.0.0.2): any 127.0.0.0/8 address is a distinct
+// bind target from 127.0.0.1 while still being purely local, so probing it
+// never touches the network or any real interface. A wildcard bind covers it,
+// so the outcome answers the question directly:
+//   'held'         EADDRINUSE → something holds the port on all addresses
+//   'free'         bound ok   → nothing does; any holder is address-specific
+//   'inconclusive' any other error → nothing established. Covers both a
+//                  one-off failure and the permanent case above, where the
+//                  host has no loopback aliases at all.
+// Tri-state on purpose: the caller must be able to report "unknown" rather than
+// assert a cause it hasn't proved. Never throws.
+//
+// IMPORTANT: only Linux configures the whole 127.0.0.0/8 on loopback. macOS and
+// Windows have 127.0.0.1 alone, so the alias bind fails EADDRNOTAVAIL there
+// before the kernel ever considers the port — for every port, held or free.
+// This probe is therefore permanently 'inconclusive' on those hosts, which is
+// exactly why callers must fail safe on that answer instead of reading it as
+// "nothing is wrong" (see appManager.share and public/shareState.js).
+// CODEHUB_WILDCARD_PROBE_ADDR overrides the alias so tests can exercise that
+// host class on Linux; nothing else should set it. Read per call (like
+// projectsRoot's PROJECTS_ROOT) so it doesn't depend on module-load ordering.
+export function probeWildcardHold(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on('error', (e) => resolve(e.code === 'EADDRINUSE' ? 'held' : 'inconclusive'));
+    srv.listen(port, probeAlias(), () => srv.close(() => resolve('free')));
+  });
+}
+
+const DEFAULT_PROBE_ALIAS = '127.0.0.2';
+const LOOPBACK_PROPER = '127.0.0.1';
+
+// Both of the probe's decisive answers rest on one biconditional: binding the
+// alias must fail EADDRINUSE *if and only if* a wildcard holder exists. 'free'
+// (⇒ no wildcard holder) is the only verdict downstream may stay quiet on, and
+// 'held' (⇒ almost certainly the app) is the one that shouts — so an alias that
+// breaks the biconditional in either direction is dangerous, and the two
+// directions fail in opposite ways.
+//
+// An alias qualifies only if it is (a) IPv4 — an IPv4 wildcard bind cannot
+// cover another address family — and (b) a *specific* address that no listener
+// here is expected to bind on its own account. Measured on this host, against a
+// port held only on 127.0.0.1 (i.e. no wildcard holder at all):
+//   ::1 / localhost   bind OK  → false 'free'  → silent on a real exposure
+//   0.0.0.0           EADDRINUSE → false 'held' → 0.0.0.0 IS the wildcard, so it
+//                     collides with a holder on ANY single address; 'held' would
+//                     mean "somebody, somewhere", not "a wildcard holder"
+//   127.0.0.1         EADDRINUSE → false 'held' → it is exactly what a
+//                     loopback-only app binds, so it collides with the very app
+//                     being probed
+// The rest of the IPv4 space is safe: an unconfigured address (0.0.0.0/8,
+// 192.0.2.1) only ever yields EADDRNOTAVAIL ⇒ the fail-safe 'inconclusive', and
+// broadcast/multicast literals were measured to satisfy the biconditional.
+//
+// A rejected value falls back to the default rather than disabling the probe:
+// the default provably supports the inference, so production keeps giving
+// correct verdicts (including the quiet one, when it is genuinely earned)
+// whatever ends up in the environment. Logged, never silent.
+function probeAlias() {
+  const override = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  if (!override) return DEFAULT_PROBE_ALIAS;
+  const why = !net.isIPv4(override)
+    ? 'not an IPv4 literal (it could not be covered by a 0.0.0.0 bind, so a wildcard hold would read as free)'
+    : Number(override.split('.')[0]) === 0
+      ? 'in 0.0.0.0/8 — the unspecified address is itself the wildcard, so it collides with a holder on any single address'
+      : override === LOOPBACK_PROPER
+        ? 'the loopback address a loopback-only app binds itself, so it collides with the app being probed'
+        : null;
+  if (why) {
+    console.warn(`[code-hub] CODEHUB_WILDCARD_PROBE_ADDR='${override}' is ${why} — ignoring it and probing ${DEFAULT_PROBE_ALIAS}. The alias must be a specific IPv4 address nothing else is expected to bind.`);
+    return DEFAULT_PROBE_ALIAS;
+  }
+  return override;
+}
+
 // Pure text parser: extracts LAN-reachable IPv4 addresses from `ip -4 addr`
 // or `ifconfig -a` output (either GNU/net-tools or busybox/toybox style).
 // Excludes loopback (127.0.0.0/8) and point-to-point addresses (a /32

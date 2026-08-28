@@ -114,6 +114,10 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 .err { color: var(--danger); font-size: 12px; margin-top: 8px; white-space: pre-wrap;
   font-family: var(--mono); max-height: 120px; overflow: auto; }
 
+/* Amber sibling of .err: a degraded-but-working outcome, not a failure
+   (e.g. a fixed-port LAN share that had to fall back to a free port). */
+.warn { color: var(--amber); font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+
 /* Shared action buttons — content-width, compact (ro-hub .actions) */
 .controls { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .controls button, .route .open, .share-actions button, .share-actions .btn-link {

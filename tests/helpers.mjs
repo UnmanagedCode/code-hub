@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -7,10 +8,28 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
 
-export const fakeAppCmd = (mode) =>
-  `${mode ? `FAKE_APP_MODE=${mode} ` : ''}node ${JSON.stringify(path.join(FIXTURES, 'fake-app.mjs'))}`;
+// `marker` is only used by FAKE_APP_MODE=flaky, which fails once with
+// EADDRINUSE and then succeeds — the marker file is what makes "first run vs
+// later run" deterministic instead of timing-dependent.
+export const fakeAppCmd = (mode, marker) =>
+  `${mode ? `FAKE_APP_MODE=${mode} ` : ''}${marker ? `FAKE_APP_MARKER=${JSON.stringify(marker)} ` : ''}node ${JSON.stringify(path.join(FIXTURES, 'fake-app.mjs'))}`;
 
 export const fakeCloudflaredBin = path.join(FIXTURES, 'fake-cloudflared.mjs');
+
+// A loopback alias used as a "third address" in bind tests: distinct from
+// 127.0.0.1, still covered by a 0.0.0.0 wildcard bind, and purely local (it
+// never touches a real interface, so tests using it stay host-independent —
+// they work on a box with no LAN at all). Not bindable on every OS, so callers
+// guard with altLoopbackBindable().
+export const ALT_LOOPBACK = '127.0.0.2';
+
+export function altLoopbackBindable() {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.on('error', () => resolve(false));
+    s.listen(0, ALT_LOOPBACK, () => s.close(() => resolve(true)));
+  });
+}
 
 // Fresh temp projects root; sets PROJECTS_ROOT so all modules resolve to it.
 export async function mkRoot() {

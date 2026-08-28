@@ -5,7 +5,7 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 ## What it does
 
 - **Discovers** every sibling project that declares a `.hub.json` manifest (plus their `code-conductor` worktrees). A sibling dir with no `.hub.json` can still be made startable via **machine-local registration** — see below. A worktree with no manifest/registration of its own inherits its parent project's, so worktrees of a registration-only project (e.g. the embedded host `code-conductor`) still show up.
-- **Starts** an app: runs its `start` command as a child process with a free `PORT` injected, and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone. Apps can declare multiple named `routes` (e.g. a main page + an editor), each opened separately.
+- **Starts** an app: runs its `start` command as a child process with a `PORT` injected — a free ephemeral one by default, or the manifest's fixed `port` when it declares one — and shows every URL that serves it (localhost + LAN IPs) so you can open it from the phone. Apps can declare multiple named `routes` (e.g. a main page + an editor), each opened separately.
 - **Sorts by recency**: a flat card list sorted by **Last edited** (each app's last git commit date, shown as an "edited X ago" label), Name, or Status.
 - **Owns the lifecycle**: code-hub tracks the child's pid/process-group, so **Stop / Restart** work by killing that group — even if the project's source or worktree has since been deleted.
 - **Out-of-date detection**: records the project's git HEAD at launch; flags a running app when HEAD has since moved and offers a one-tap **Restart**.
@@ -31,6 +31,9 @@ Place a `.hub.json` at a project's root to make it servable:
   "name": "My App",         // optional display name (default: directory name)
   "healthPath": "/",        // optional HTTP path polled for readiness
   "readyWhen": "listening", // optional regex matched against stdout/stderr
+  "port": 3000,             // optional FIXED port for this checkout (1024-65535);
+                            //   omit for a free port. Worktrees always get a free
+                            //   port. A busy fixed port refuses the start.
   "routes": [               // optional named URLs the app serves (default: one implicit "/")
     { "name": "Main",   "path": "/" },
     { "name": "Editor", "path": "/editor.html" }
@@ -38,17 +41,18 @@ Place a `.hub.json` at a project's root to make it servable:
 }
 ```
 
-- `start` must **bind `$PORT`** (injected by code-hub — a free port) and **stay up until killed**. code-hub launches it via `bash -lc` in its own process group; there is no separate stop command — code-hub stops the app by killing that group (SIGTERM, then SIGKILL after a 3s grace period).
+- `start` must **bind `$PORT`** (injected by code-hub — a free port, or the manifest's `port` when set) and **stay up until killed**. code-hub launches it via `bash -lc` in its own process group; there is no separate stop command — code-hub stops the app by killing that group (SIGTERM, then SIGKILL after a 3s grace period).
 - **Readiness**: `readyWhen` (stdout/stderr regex) → else `healthPath` (any HTTP response) → else a default TCP connect probe on `$PORT`. Bounded to 30s; on timeout the app stays running but is flagged readiness-unconfirmed.
 
 ## Machine-local registration (no `.hub.json` needed)
 
-For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it instead: `<projectsRoot>/.code-hub/registrations.json` is a hand-editable JSON object keyed by directory basename (the same `id` a real `.hub.json` would use), each value the same shape as a `.hub.json` body (`start` required; `name`/`healthPath`/`readyWhen`/`routes` optional). It's consulted only for a dir that has **no** `.hub.json` of its own — a real manifest, even a broken one, always wins over a registration. Two MCP tools manage it: `register_app` (`{ id, start, name?, healthPath?, readyWhen? }` — `routes` isn't expressible in the tool's schema, add it by hand-editing the file directly) and `unregister_app` (`{ id }`). Apps sourced from the registry are otherwise identical to manifest-based ones (worktree classification, discovery, start/stop all behave the same). See `docs/protocol.md` for the full schema and precedence rules.
+For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it instead: `<projectsRoot>/.code-hub/registrations.json` is a hand-editable JSON object keyed by directory basename (the same `id` a real `.hub.json` would use), each value the same shape as a `.hub.json` body (`start` required; `name`/`healthPath`/`readyWhen`/`port`/`routes` optional). It's consulted only for a dir that has **no** `.hub.json` of its own — a real manifest, even a broken one, always wins over a registration. Two MCP tools manage it: `register_app` (`{ id, start, name?, healthPath?, readyWhen?, port? }` — `routes` isn't expressible in the tool's schema, add it by hand-editing the file directly) and `unregister_app` (`{ id }`). Apps sourced from the registry are otherwise identical to manifest-based ones (worktree classification, discovery, start/stop all behave the same). See `docs/protocol.md` for the full schema and precedence rules.
 
 ## Key defaults
 
 | Setting | Default | Override |
 |---|---|---|
+| App port | a free ephemeral port | optional `port` in `.hub.json` / `registrations.json` (default checkout only; worktrees always get a free port, and a busy fixed port refuses the start rather than moving) |
 | UI port | `7000` | `PORT` |
 | UI host | `127.0.0.1` | `HOST` |
 | Projects root | parent dir of this repo | `PROJECTS_ROOT` (the conductor injects this when embedded, so the hub scans the conductor's own root) |
@@ -62,6 +66,10 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 - **Single-user, local, no auth, no DB.** code-hub runs the `start` command of any discovered `.hub.json` — treat the workspace as trusted code you own. Don't expose the code-hub UI itself to untrusted networks.
 - code-hub only **reads** other projects and **runs their `start` command**; it never edits them.
 - Sharing is **gated by default** in both modes: opening the share link exchanges a one-time token (in the URL) for an httpOnly `hub_auth` session cookie, so the shared document's own URL never carries credentials. HTTP Basic Auth (username `hub` + a per-share random password, both editable live from the UI) remains available as a fallback for curl/API clients that can't hold cookies. **Tunnel mode**: TLS is terminated by Cloudflare, so the token exchange, cookie, and any Basic Auth are encrypted in transit; authentication cannot be disabled for a tunnel share. **LAN mode**: **TLS is on by default** — the proxy serves HTTPS with a per-share self-signed certificate (kept in memory only), so the token/cookie/Basic-Auth are encrypted on the LAN hop, and the session cookie is marked `Secure`. Because the cert is self-signed, browsers show a one-time "connection is not private" warning to click through (no public CA can vouch for a LAN IP) — this is the expected first-visit UX. TLS can be turned off (falling back to **cleartext** plain HTTP) from the **Edit** form's **TLS (HTTPS)** toggle, or a per-share `tls: false`; only do that on a network you trust. Because http↔https can't switch on a live proxy, flipping the toggle **re-shares** the app — a fresh URL/QR and a reset password — unlike the authentication toggle, which flips the same share in place. A LAN share can also opt out of the gate entirely (a per-share checkbox) — no token, no cookie, no Basic Auth, every request/upgrade forwards straight through; only do this on a network you fully trust. Tokens/passwords live in server memory for the lifetime of the share (a page refresh re-reveals the password, the QR, and the Open magic-link; nothing is written to disk) and a share does not survive a code-hub restart (re-share for a fresh URL).
+- **Fixed ports** (`port` in `.hub.json`) are per-checkout and deliberately strict:
+  - The default checkout binds exactly the declared port. If that port is busy, **the start is refused** (`409`) — code-hub never falls back to a free one, since a fixed port that quietly moves is worse than no fixed port at all. A consequence worth knowing: a **rapid restart can hit `EADDRINUSE`** while the previous child's socket is still draining, and it refuses rather than moving. Retry a moment later.
+  - **Worktrees never inherit a fixed port** — they always get a free one, so a worktree and its parent checkout can run side by side. This holds even though git carries the parent's `.hub.json` (fixed port included) into the worktree.
+  - **LAN share on the fixed port depends on how the app binds**, which code-hub can't control (it injects only `$PORT`). An app that binds **loopback only** leaves the LAN addresses free, so the gated LAN share takes the app's own port. An app that binds **all interfaces** (`0.0.0.0` — what a plain `app.listen(PORT)` does) already holds that port on every address; its gated share **falls back to a free port**, with a warning in the share panel. That warning matters: such an app is already answering on the LAN at the fixed port with **no authentication** — a fixed port doesn't create that exposure, it just makes it predictable. Bind loopback-only if you want the gate to be the only way in. The same fallback can also be caused by an *unrelated* process holding that LAN port, which means something quite different (your app isn't LAN-reachable at all), so code-hub tries to establish which case it is. It errs toward warning: it stays quiet only when it positively shows the holder is *not* your app, and warns whenever it can't tell — including on macOS and Windows, where the check it relies on can't run at all. It never claims exact attribution; a squatter and your app look identical at the socket level.
 
 ## Running under code-conductor
 
