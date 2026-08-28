@@ -69,16 +69,29 @@ export function probeWildcardHold(port) {
 }
 
 const DEFAULT_PROBE_ALIAS = '127.0.0.2';
+const LOOPBACK_PROPER = '127.0.0.1';
 
-// The probe's 'free' answer means "no wildcard holder", and downstream that is
-// the ONLY verdict allowed to stay quiet about a possible ungated LAN exposure.
-// That inference holds only if an IPv4 wildcard (0.0.0.0) bind would necessarily
-// cover the probed address — true of any IPv4 address (an unconfigured one just
-// fails EADDRNOTAVAIL, which is the safe 'inconclusive'), and false across
-// address families. Measured: with a process holding 0.0.0.0:<port>, binding
-// `::1:<port>` SUCCEEDS, so an IPv6 alias would report 'free' for a genuinely
-// wildcard-held port and silence the warning. `localhost` is the same trap — it
-// resolves to ::1 here — so this validates the literal, not a hostname.
+// Both of the probe's decisive answers rest on one biconditional: binding the
+// alias must fail EADDRINUSE *if and only if* a wildcard holder exists. 'free'
+// (⇒ no wildcard holder) is the only verdict downstream may stay quiet on, and
+// 'held' (⇒ almost certainly the app) is the one that shouts — so an alias that
+// breaks the biconditional in either direction is dangerous, and the two
+// directions fail in opposite ways.
+//
+// An alias qualifies only if it is (a) IPv4 — an IPv4 wildcard bind cannot
+// cover another address family — and (b) a *specific* address that no listener
+// here is expected to bind on its own account. Measured on this host, against a
+// port held only on 127.0.0.1 (i.e. no wildcard holder at all):
+//   ::1 / localhost   bind OK  → false 'free'  → silent on a real exposure
+//   0.0.0.0           EADDRINUSE → false 'held' → 0.0.0.0 IS the wildcard, so it
+//                     collides with a holder on ANY single address; 'held' would
+//                     mean "somebody, somewhere", not "a wildcard holder"
+//   127.0.0.1         EADDRINUSE → false 'held' → it is exactly what a
+//                     loopback-only app binds, so it collides with the very app
+//                     being probed
+// The rest of the IPv4 space is safe: an unconfigured address (0.0.0.0/8,
+// 192.0.2.1) only ever yields EADDRNOTAVAIL ⇒ the fail-safe 'inconclusive', and
+// broadcast/multicast literals were measured to satisfy the biconditional.
 //
 // A rejected value falls back to the default rather than disabling the probe:
 // the default provably supports the inference, so production keeps giving
@@ -87,8 +100,15 @@ const DEFAULT_PROBE_ALIAS = '127.0.0.2';
 function probeAlias() {
   const override = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
   if (!override) return DEFAULT_PROBE_ALIAS;
-  if (!net.isIPv4(override)) {
-    console.warn(`[code-hub] CODEHUB_WILDCARD_PROBE_ADDR='${override}' is not an IPv4 literal — ignoring it and probing ${DEFAULT_PROBE_ALIAS}. Only an IPv4 alias can show the absence of a wildcard hold; a non-IPv4 one would bind alongside a 0.0.0.0 listener and hide a real LAN exposure.`);
+  const why = !net.isIPv4(override)
+    ? 'not an IPv4 literal (it could not be covered by a 0.0.0.0 bind, so a wildcard hold would read as free)'
+    : Number(override.split('.')[0]) === 0
+      ? 'in 0.0.0.0/8 — the unspecified address is itself the wildcard, so it collides with a holder on any single address'
+      : override === LOOPBACK_PROPER
+        ? 'the loopback address a loopback-only app binds itself, so it collides with the app being probed'
+        : null;
+  if (why) {
+    console.warn(`[code-hub] CODEHUB_WILDCARD_PROBE_ADDR='${override}' is ${why} — ignoring it and probing ${DEFAULT_PROBE_ALIAS}. The alias must be a specific IPv4 address nothing else is expected to bind.`);
     return DEFAULT_PROBE_ALIAS;
   }
   return override;

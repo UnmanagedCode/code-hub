@@ -253,3 +253,39 @@ test('probeWildcardHold: a valid IPv4 override is still honoured', async (t) => 
   });
   assert.equal(await probeWildcardHold(port), 'inconclusive');
 });
+
+test('probeWildcardHold: an alias that is not a SPECIFIC address cannot yield the loud verdict', async (t) => {
+  // Mirror image of the non-IPv4 case above. 'held' is read downstream as
+  // "almost certainly the app, which is therefore LAN-exposed", so an alias
+  // that reports 'held' without a wildcard holder reopens the over-report.
+  // Measured against a port held ONLY on 127.0.0.1 (no wildcard holder):
+  //   0.0.0.0   IS the wildcard, so it collides with any single-address holder
+  //   127.0.0.1 is what a loopback-only app binds, so it collides with the app
+  // Both pass a bare net.isIPv4() gate, which is why the class — a *specific*
+  // address nothing else is expected to bind — is what gets validated.
+  const port = await allocatePort();
+  await hold(t, port, '127.0.0.1');
+
+  const prev = process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CODEHUB_WILDCARD_PROBE_ADDR;
+    else process.env.CODEHUB_WILDCARD_PROBE_ADDR = prev;
+  });
+
+  for (const bad of ['0.0.0.0', '127.0.0.1']) {
+    process.env.CODEHUB_WILDCARD_PROBE_ADDR = bad;
+    const verdict = await probeWildcardHold(port);
+    assert.notEqual(verdict, 'held', `alias '${bad}' must not produce the loud verdict without a wildcard holder`);
+    // Falls back to the default alias, which correctly sees no wildcard hold.
+    assert.equal(verdict, 'free', `alias '${bad}' must fall back to the specific-address default`);
+  }
+});
+
+test('probeWildcardHold: the default alias is unaffected by the specific-address rule', async (t) => {
+  // Guards the fallback target itself: 127.0.0.2 must keep reporting a genuine
+  // wildcard hold as 'held', or the validation above would have traded the
+  // over-report for an under-report.
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+  assert.equal(await probeWildcardHold(port), 'held');
+});
