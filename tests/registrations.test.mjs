@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
 import * as appManager from '../src/appManager.js';
-import { discoverApps } from '../src/projects.js';
+import { discoverApps, registryFile } from '../src/projects.js';
 import { mkRoot, rmRoot, mkProject } from './helpers.mjs';
 
 test('registerApp: happy path makes a manifest-less dir startable', async (t) => {
@@ -88,4 +89,55 @@ test('unregisterApp: rejects an id that is not registered', async (t) => {
   t.after(() => rmRoot(root));
 
   await assert.rejects(() => appManager.unregisterApp('never-registered'), /is not registered/);
+});
+
+test('registerApp: an optional fixed port is persisted and surfaces on the discovered app', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+
+  const app = await appManager.registerApp({ id: 'tool', start: 'npm start', port: 3100 });
+  assert.equal(app.manifest.port, 3100);
+
+  // It must actually reach registrations.json — `port` has to survive BOTH the
+  // destructure allow-list in registerApp and validateManifestObject's
+  // whitelist rebuild, either of which would silently drop it.
+  const onDisk = JSON.parse(await fs.readFile(registryFile(), 'utf8'));
+  assert.equal(onDisk.tool.port, 3100);
+
+  assert.equal((await discoverApps()).find((a) => a.id === 'tool').manifest.port, 3100);
+});
+
+test('registerApp: omitting port stores null, not undefined', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+
+  const app = await appManager.registerApp({ id: 'tool', start: 'npm start' });
+  assert.equal(app.manifest.port, null);
+});
+
+test('registerApp: rejects an out-of-range port, naming the range', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'tool', start: 'npm start', port: 80 }),
+    /register_app:tool: "port" must be an integer between 1024 and 65535 \(got 80\)/,
+  );
+  // ...and nothing was written.
+  await assert.rejects(() => fs.readFile(registryFile(), 'utf8'));
+});
+
+test('a registry entry\'s fixed port is stripped from that project\'s worktrees', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+  await mkProject(root, 'tool_worktree_ab12cd', null);
+  await appManager.registerApp({ id: 'tool', start: 'npm start', port: 3100 });
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'tool').manifest.port, 3100);
+  assert.equal(apps.find((a) => a.id === 'tool_worktree_ab12cd').manifest.port, null);
 });

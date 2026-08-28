@@ -75,7 +75,12 @@ function raceSettle(c, ms) {
 // almost immediately with EADDRINUSE — the free port `allocatePort()` handed
 // out got claimed by something else before this bind — retry on a new port
 // a bounded number of times before giving up.
-export async function start(app, port) {
+//
+// `fixed: true` means the caller pinned this port (a manifest `port`), so
+// moving to a free one would silently defeat the whole point: the retry is
+// skipped and the EADDRINUSE surfaces as a crash on the requested port, which
+// appManager.start turns into a 409.
+export async function start(app, port, { fixed = false } = {}) {
   for (let attempt = 1; ; attempt++) {
     const c = spawnChild(app, port);
     children.set(app.id, c);
@@ -83,12 +88,14 @@ export async function start(app, port) {
     await raceSettle(c, SPAWN_SETTLE_MS);
 
     const isPortRace = c.status === 'crashed' && /EADDRINUSE/.test(c.error ?? '');
-    if (isPortRace && attempt <= EADDRINUSE_RETRIES) {
+    if (isPortRace && fixed) {
+      console.error(`[runner] ${app.id}: fixed port ${port} is already in use — not retrying on another port`);
+    } else if (isPortRace && attempt <= EADDRINUSE_RETRIES) {
       console.error(`[runner] ${app.id}: port ${port} was claimed before bind (attempt ${attempt}/${EADDRINUSE_RETRIES}) — retrying on a new port`);
       port = await allocatePort();
       continue;
     }
-    if (isPortRace) {
+    if (isPortRace && !fixed) {
       console.error(`[runner] ${app.id}: still hitting EADDRINUSE after ${EADDRINUSE_RETRIES} retries — giving up`);
     }
 

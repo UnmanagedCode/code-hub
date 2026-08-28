@@ -7,8 +7,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
 
-export const fakeAppCmd = (mode) =>
-  `${mode ? `FAKE_APP_MODE=${mode} ` : ''}node ${JSON.stringify(path.join(FIXTURES, 'fake-app.mjs'))}`;
+// `marker` is only used by FAKE_APP_MODE=flaky, which fails once with
+// EADDRINUSE and then succeeds — the marker file is what makes "first run vs
+// later run" deterministic instead of timing-dependent.
+export const fakeAppCmd = (mode, marker) =>
+  `${mode ? `FAKE_APP_MODE=${mode} ` : ''}${marker ? `FAKE_APP_MARKER=${JSON.stringify(marker)} ` : ''}node ${JSON.stringify(path.join(FIXTURES, 'fake-app.mjs'))}`;
 
 export const fakeCloudflaredBin = path.join(FIXTURES, 'fake-cloudflared.mjs');
 

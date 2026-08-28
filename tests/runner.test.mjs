@@ -88,3 +88,39 @@ test('EADDRINUSE that never clears still surfaces as crashed after the retry bud
   assert.equal(runner.runtime('stuck').status, 'crashed');
   assert.match(runner.runtime('stuck').error, /EADDRINUSE/);
 });
+
+test('a pinned port that is busy does NOT move — no retry, surfaces as crashed', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd() });
+  const app = { id: 'pinned', path: dir, manifest: { start: fakeAppCmd(), healthPath: null, readyWhen: null } };
+
+  const port = await allocatePort();
+  // Same deliberate-blocker setup as the retry test above — the only difference
+  // is `{ fixed: true }`, so this pins exactly the behaviour that flag buys:
+  // the retry path would have returned a DIFFERENT port here.
+  const blocker = net.createServer();
+  await new Promise((resolve) => blocker.listen(port, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => blocker.close(resolve)));
+
+  const rec = await runner.start(app, port, { fixed: true });
+  assert.equal(rec.port, port, 'a fixed port must never be silently reallocated');
+  assert.equal(runner.runtime('pinned').status, 'crashed');
+  assert.match(runner.runtime('pinned').error, /EADDRINUSE/);
+});
+
+test('a pinned port that is free starts normally', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd() });
+  const app = { id: 'pinned-ok', path: dir, manifest: { start: fakeAppCmd(), healthPath: null, readyWhen: null } };
+
+  const port = await allocatePort();
+  const rec = await runner.start(app, port, { fixed: true });
+  assert.equal(rec.port, port);
+  await waitFor(() => runner.runtime('pinned-ok')?.status === 'ready');
+  assert.equal(await get(port), 200);
+
+  runner.stop({ id: 'pinned-ok', pgid: rec.pgid });
+  await waitFor(() => !pidAlive(rec.pgid));
+});

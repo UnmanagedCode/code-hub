@@ -388,3 +388,76 @@ test('no tls (tunnel/plain-LAN hop): token cookie omits Secure', async (t) => {
   const setCookie = res.headers.get('set-cookie') || '';
   assert.doesNotMatch(setCookie, /Secure/);
 });
+
+// --- Pinned port + multi-address bind (backs the fixed-port LAN share) ---
+
+// Two loopback aliases keep these host-independent: 127.0.0.2 behaves like a
+// distinct address on Linux without needing a real LAN interface.
+const ALT_LOOPBACK = '127.0.0.2';
+async function altLoopbackBindable() {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.on('error', () => resolve(false));
+    s.listen(0, ALT_LOOPBACK, () => s.close(() => resolve(true)));
+  });
+}
+
+test('startAuthProxy listens on exactly the requested port', async (t) => {
+  const up = await upstream();
+  const free = await new Promise((r) => {
+    const s = net.createServer();
+    s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)); });
+  });
+  const proxy = await startAuthProxy(up.port, { port: free });
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  assert.equal(proxy.port, free);
+  const res = await fetch(`http://127.0.0.1:${free}/?__hubauth=${proxy.token}`, { redirect: 'manual' });
+  assert.equal(res.status, 302); // it really is our proxy on that port
+});
+
+test('an array of hosts serves ONE shared port on every address, and close() stops them all', async (t) => {
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { host: ['127.0.0.1', ALT_LOOPBACK] });
+  t.after(() => up.server.close());
+
+  assert.deepEqual(proxy.hosts, ['127.0.0.1', ALT_LOOPBACK]);
+  // The kernel-assigned port from the FIRST bind must be reused for the rest —
+  // a per-address port would make the share URL wrong on all but one address.
+  const creds = { authorization: basic(proxy.username, proxy.password) };
+  for (const h of ['127.0.0.1', ALT_LOOPBACK]) {
+    const res = await fetch(`http://${h}:${proxy.port}/`, { headers: creds });
+    assert.equal(res.status, 200, `${h} must serve on the shared port`);
+    assert.equal(await res.text(), 'ok');
+  }
+
+  proxy.close();
+  await assert.rejects(fetch(`http://127.0.0.1:${proxy.port}/`, { headers: creds }));
+  await assert.rejects(fetch(`http://${ALT_LOOPBACK}:${proxy.port}/`, { headers: creds }));
+});
+
+test('a pinned port already held rejects with EADDRINUSE and leaves nothing listening', async (t) => {
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+  const up = await upstream();
+  t.after(() => up.server.close());
+
+  // Hold the port on the SECOND address only, so the first bind succeeds and
+  // the second fails — the partial-bind case. Without the cleanup pass, the
+  // first server would be left listening and orphaned.
+  const blocker = net.createServer();
+  const port = await new Promise((r) => blocker.listen(0, ALT_LOOPBACK, () => r(blocker.address().port)));
+  t.after(() => new Promise((r) => blocker.close(r)));
+
+  await assert.rejects(
+    () => startAuthProxy(up.port, { host: ['127.0.0.1', ALT_LOOPBACK], port }),
+    (e) => e.code === 'EADDRINUSE',
+  );
+  // 127.0.0.1:port must be free again — nothing was leaked.
+  const probe = net.createServer();
+  await new Promise((resolve, reject) => {
+    probe.once('error', reject);
+    probe.listen(port, '127.0.0.1', resolve);
+  });
+  await new Promise((r) => probe.close(r));
+});

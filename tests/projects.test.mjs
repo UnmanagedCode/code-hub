@@ -396,3 +396,65 @@ test('a dir name containing the delimiter twice resolves to the rightmost siblin
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'a_worktree_b');
 });
+
+// A fixed port is per-checkout. These three cases cover every route by which a
+// worktree could otherwise acquire one: inheriting the parent's manifest, its
+// own git-carried copy of that `.hub.json`, and — the discriminating one — the
+// memoized parent object being mutated rather than copied.
+test('a worktree inheriting its parent\'s manifest never inherits the fixed port', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'pinned', { start: 'x', port: 3000 });
+  await mkProject(root, 'pinned_worktree_ab12cd', null); // no manifest of its own → inherits
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'pinned').manifest.port, 3000);
+  const wt = apps.find((a) => a.id === 'pinned_worktree_ab12cd');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.manifest.port, null);
+  assert.equal(wt.manifest.start, 'x'); // everything else still inherited
+});
+
+test('a worktree with its OWN .hub.json carrying a port still reports null', async (t) => {
+  // The common case: git carries the parent's tracked `.hub.json` into the
+  // worktree checkout, so the worktree resolves its own manifest and never
+  // touches the inheritance branch at all.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'pinned', { start: 'x', port: 3000 });
+  await mkProject(root, 'pinned_worktree_ab12cd', { start: 'x', port: 3000 });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'pinned_worktree_ab12cd');
+  assert.equal(wt.manifest.port, null);
+  assert.equal(wt.manifest.start, 'x');
+});
+
+test('stripping a worktree\'s port copies the manifest — the parent keeps its own', async (t) => {
+  // `resolve()` memoizes one object per dir name and hands the SAME object to
+  // both the parent's row and its worktrees'. Mutating it in place to strip the
+  // worktree's port would also strip the parent's. Discovery order puts the
+  // worktree AFTER the parent (readdir + sort), so a mutating implementation
+  // corrupts the parent entry that was already pushed — this asserts on the
+  // parent read back out of the final result, which is where that shows up.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'pinned', { start: 'x', port: 3000 });
+  await mkProject(root, 'pinned_worktree_aa', null);
+  await mkProject(root, 'pinned_worktree_bb', null);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'pinned').manifest.port, 3000);
+  assert.equal(apps.find((a) => a.id === 'pinned_worktree_aa').manifest.port, null);
+  assert.equal(apps.find((a) => a.id === 'pinned_worktree_bb').manifest.port, null);
+});
+
+test('a worktree of an unpinned parent is unaffected (no spurious copy)', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'plain', { start: 'x' });
+  await mkProject(root, 'plain_worktree_ab12cd', null);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'plain_worktree_ab12cd').manifest.port, null);
+});

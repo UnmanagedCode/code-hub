@@ -148,3 +148,28 @@ test('malformed JSON body → 400', async (t) => {
   const body = await r.json();
   assert.ok(body.error);
 });
+
+test('register_app: an optional fixed port round-trips through the MCP envelope', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'tool', null);
+  const { server, base } = await boot();
+  t.after(async () => { server.close(); await rmRoot(root); });
+
+  const res = await mcp(base, 'register_app', { id: 'tool', start: 'npm start', port: 3100 });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.result.manifest.port, 3100);
+
+  const listed = await mcp(base, 'list_apps', {});
+  assert.ok(listed.body.result.apps.some((a) => a.id === 'tool'));
+});
+
+test('register_app: an out-of-range port is a tool-level error (200 with {error})', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'tool', null);
+  const { server, base } = await boot();
+  t.after(async () => { server.close(); await rmRoot(root); });
+
+  const res = await mcp(base, 'register_app', { id: 'tool', start: 'npm start', port: 80 });
+  assert.equal(res.status, 200); // a bad argument is a normal MCP outcome, not a transport failure
+  assert.match(res.body.error, /"port" must be an integer between 1024 and 65535/);
+});

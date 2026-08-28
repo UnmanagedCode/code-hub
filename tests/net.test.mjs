@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { allocatePort, isPortFree, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
   const port = await allocatePort();
@@ -143,4 +143,37 @@ test('waitForPort resolves once something is listening, rejects otherwise', asyn
   await new Promise((r) => srv.listen(port, '127.0.0.1', r));
   await waitForPort(port, { timeoutMs: 1000 });
   await new Promise((r) => srv.close(r));
+});
+
+// Hold `port` on `host` for the rest of the test, closing it via t.after so a
+// failed assertion can't leave a listening socket keeping the process alive.
+async function hold(t, port, host) {
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(port, host, r));
+  let open = true;
+  const release = () => (open ? new Promise((r) => { open = false; blocker.close(r); }) : Promise.resolve());
+  t.after(release);
+  return release;
+}
+
+test('isPortFree is true for a released port and false while anything holds it', async (t) => {
+  const port = await allocatePort();
+  assert.equal(await isPortFree(port), true);
+
+  // Deliberately a LOOPBACK-only holder. This is the whole point of probing
+  // 0.0.0.0: on Linux SO_REUSEADDR does not permit overlapping listen binds, so
+  // a wildcard bind fails when the port is held on ANY single address. A laxer
+  // probe (e.g. binding 127.0.0.1, or a connect-based check) would call this
+  // port free and let a fixed-port app start straight into an EADDRINUSE crash.
+  const release = await hold(t, port, '127.0.0.1');
+  assert.equal(await isPortFree(port), false);
+
+  await release();
+  assert.equal(await isPortFree(port), true); // free again once released
+});
+
+test('isPortFree is false for a port held on the wildcard address too', async (t) => {
+  const port = await allocatePort();
+  await hold(t, port, '0.0.0.0');
+  assert.equal(await isPortFree(port), false);
 });

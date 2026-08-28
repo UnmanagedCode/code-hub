@@ -80,12 +80,19 @@ function rawHeaderLines(rawHeaders) {
 }
 
 // Start an auth proxy in front of `targetPort`. Resolves once it is listening.
-// Returns { port, auth, username, password, token, setCredentials(), setAuth(), close() }.
+// Returns { port, hosts, auth, username, password, token, setCredentials(), setAuth(), close() }.
 // Secrets are generated with a CSPRNG per call and held in memory only
 // (never logged/persisted; the cookie secret is never even returned — only
 // its cookie form matters). `host` defaults to loopback-only (cloudflared
 // share); a LAN share passes '0.0.0.0' so other devices on the network can
-// reach the proxy directly.
+// reach the proxy directly, or an ARRAY of specific LAN IPs when it needs to
+// leave a particular port free on the other addresses (the fixed-port LAN
+// share — see appManager.share). Every address in the array gets its own
+// server sharing one handler/credentials/token, all listening on the SAME
+// port: `port` defaults to 0 (kernel-assigned, resolved from the first bind
+// and reused for the rest), or pins a specific port. A bind that fails
+// rejects with Node's error (`code: 'EADDRINUSE'`) after closing any servers
+// already bound, so a partial bind is never leaked.
 //
 // Secrets (password/token/cookie secret) are ALWAYS generated, even when
 // starting with `auth: false` — this is what lets `setAuth(true)` gate the
@@ -94,7 +101,7 @@ function rawHeaderLines(rawHeaders) {
 // lifetime. `auth: false` only skips the gate itself: every HTTP request and
 // WS upgrade is forwarded unconditionally, and `username`/`password` read as
 // `null` (they're hidden, not absent) until auth is turned on.
-export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', auth = true, tls = null } = {}) {
+export async function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', port = 0, auth = true, tls = null } = {}) {
   let currentUsername = username;
   let currentPassword = crypto.randomBytes(18).toString('base64url');
   let currentAuth = auth;
@@ -157,67 +164,93 @@ export function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1
   // https server transparently hands the `upgrade` handler a TLS-wrapped
   // inbound socket, and the upstream leg is always a plain net.connect to
   // localhost.
-  const server = tls ? https.createServer(tls, handler) : http.createServer(handler);
+  //
+  // One server per bind address, all sharing the single `handler`, the
+  // credentials/token/cookie secret closed over above, and the `sockets` set —
+  // one proxy identity, N listeners.
+  const makeServer = () => {
+    const server = tls ? https.createServer(tls, handler) : http.createServer(handler);
 
-  // WebSocket / other upgrades: gate (cookie or Basic — no token handling),
-  // then pipe raw sockets to the upstream.
-  server.on('upgrade', (req, socket, head) => {
-    if (currentAuth && !isGateAuthed(req)) {
-      socket.write(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\nConnection: close\r\n\r\n`);
-      socket.destroy();
-      return;
-    }
-    const up = net.connect(targetPort, '127.0.0.1', () => {
-      up.write(`${req.method} ${req.url} HTTP/1.1\r\n${rawHeaderLines(req.rawHeaders)}\r\n`);
-      if (head && head.length) up.write(head);
-      up.pipe(socket);
-      socket.pipe(up);
-    });
-    // Tear the pair down together so neither side lingers (and close() drops both).
-    up.on('error', () => socket.destroy());
-    socket.on('error', () => up.destroy());
-    up.on('close', () => socket.destroy());
-    socket.on('close', () => up.destroy());
-  });
-
-  // Track connections so close() can drop lingering (e.g. WS) sockets promptly.
-  server.on('connection', (s) => {
-    sockets.add(s);
-    s.on('close', () => sockets.delete(s));
-  });
-
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, host, () => {
-      server.removeListener('error', reject);
-      resolve({
-        port: server.address().port,
-        get auth() { return currentAuth; },
-        get username() { return currentAuth ? currentUsername : null; },
-        get password() { return currentAuth ? currentPassword : null; },
-        token,
-        // Mutates the expected Basic-Auth creds in place — no restart, so
-        // the share URL/token/proxy port never change. Only meaningful when
-        // `auth` is true; the caller (appManager) guards against calling
-        // this on a no-auth share.
-        setCredentials({ username: u, password: p } = {}) {
-          if (u) currentUsername = u;
-          if (p) currentPassword = p;
-        },
-        // Flips the gate itself in place — no restart, no new token/creds.
-        // The token is never regenerated on a toggle, so a token URL (and its
-        // QR) issued while gated keeps working after the gate turns off; a
-        // plain URL/QR issued while ungated does NOT work after re-gating (no
-        // token → 401) — which is why `setShareAuth` regenerates the QR on
-        // toggle. The caller (appManager) persists the new state and only
-        // allows this for LAN shares (tunnel is always gated).
-        setAuth(enabled) { currentAuth = !!enabled; },
-        close() {
-          for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
-          sockets.clear();
-          server.close();
-        },
+    // WebSocket / other upgrades: gate (cookie or Basic — no token handling),
+    // then pipe raw sockets to the upstream.
+    server.on('upgrade', (req, socket, head) => {
+      if (currentAuth && !isGateAuthed(req)) {
+        socket.write(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${REALM}"\r\nConnection: close\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+      const up = net.connect(targetPort, '127.0.0.1', () => {
+        up.write(`${req.method} ${req.url} HTTP/1.1\r\n${rawHeaderLines(req.rawHeaders)}\r\n`);
+        if (head && head.length) up.write(head);
+        up.pipe(socket);
+        socket.pipe(up);
       });
+      // Tear the pair down together so neither side lingers (and close() drops both).
+      up.on('error', () => socket.destroy());
+      socket.on('error', () => up.destroy());
+      up.on('close', () => socket.destroy());
+      socket.on('close', () => up.destroy());
+    });
+
+    // Track connections so close() can drop lingering (e.g. WS) sockets promptly.
+    server.on('connection', (s) => {
+      sockets.add(s);
+      s.on('close', () => sockets.delete(s));
+    });
+    return server;
+  };
+
+  const listenOn = (server, h, p) => new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(p, h, () => {
+      server.removeListener('error', reject);
+      resolve(server.address().port);
     });
   });
+
+  const hosts = Array.isArray(host) ? host : [host];
+  const servers = [];
+  // `bound` starts as the requested port and becomes the kernel-assigned one
+  // after the first listen, so every subsequent address reuses that same port.
+  let bound = port;
+  try {
+    for (const h of hosts) {
+      const s = makeServer();
+      servers.push(s);
+      bound = await listenOn(s, h, bound);
+    }
+  } catch (e) {
+    for (const s of servers) s.close(); // never leak a partial bind
+    throw e;
+  }
+
+  return {
+    port: bound,
+    hosts,
+    get auth() { return currentAuth; },
+    get username() { return currentAuth ? currentUsername : null; },
+    get password() { return currentAuth ? currentPassword : null; },
+    token,
+    // Mutates the expected Basic-Auth creds in place — no restart, so
+    // the share URL/token/proxy port never change. Only meaningful when
+    // `auth` is true; the caller (appManager) guards against calling
+    // this on a no-auth share.
+    setCredentials({ username: u, password: p } = {}) {
+      if (u) currentUsername = u;
+      if (p) currentPassword = p;
+    },
+    // Flips the gate itself in place — no restart, no new token/creds.
+    // The token is never regenerated on a toggle, so a token URL (and its
+    // QR) issued while gated keeps working after the gate turns off; a
+    // plain URL/QR issued while ungated does NOT work after re-gating (no
+    // token → 401) — which is why `setShareAuth` regenerates the QR on
+    // toggle. The caller (appManager) persists the new state and only
+    // allows this for LAN shares (tunnel is always gated).
+    setAuth(enabled) { currentAuth = !!enabled; },
+    close() {
+      for (const s of servers) s.close();
+      for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
+      sockets.clear();
+    },
+  };
 }

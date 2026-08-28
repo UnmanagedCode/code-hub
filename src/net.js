@@ -19,6 +19,21 @@ export function allocatePort() {
   });
 }
 
+// True when `port` can be bound right now on every interface. Binding 0.0.0.0
+// is the strictest probe available: it fails if anything holds the port on any
+// single address (measured on Linux — a listener on 127.0.0.1:P makes
+// 0.0.0.0:P EADDRINUSE, since SO_REUSEADDR does not permit overlapping listen
+// binds), which is exactly the question "is this fixed port free?". Same TOCTOU
+// caveat as allocatePort — the child's own bind is the real backstop (see
+// appManager.start, which re-checks after the spawn settles).
+export function isPortFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on('error', () => resolve(false));
+    srv.listen(port, '0.0.0.0', () => srv.close(() => resolve(true)));
+  });
+}
+
 // Pure text parser: extracts LAN-reachable IPv4 addresses from `ip -4 addr`
 // or `ifconfig -a` output (either GNU/net-tools or busybox/toybox style).
 // Excludes loopback (127.0.0.0/8) and point-to-point addresses (a /32

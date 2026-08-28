@@ -300,6 +300,15 @@ function sharePanel(app) {
     : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
     : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
 
+  // The app pinned a fixed port but binds all interfaces, so the gated proxy
+  // couldn't take that port on the LAN and fell back to a free one. Say both
+  // halves plainly: where the gated share actually is, and that the app itself
+  // is already answering on the LAN at the fixed port with no gate at all.
+  if (kind === 'lan' && shared.fixedPortFallback) {
+    panel.appendChild(el('div', { class: 'warn' },
+      `\u26a0 Fixed port ${app.port} is held on all interfaces by the app itself, so this gated share is on port ${shared.proxyPort}. The app is also reachable on the LAN at port ${app.port} with NO authentication.`));
+  }
+
   if (shared.urls && shared.urls.length > 1) {
     panel.appendChild(el('div', { class: 'lan-links' },
       ...shared.urls.slice(1).map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));

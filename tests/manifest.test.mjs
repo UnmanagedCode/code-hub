@@ -51,3 +51,23 @@ test('rejects malformed JSON and non-objects', () => {
   assert.throws(() => parseManifest('not json'), /invalid JSON/);
   assert.throws(() => parseManifest('[1,2]'), /must be a JSON object/);
 });
+
+test('accepts an optional fixed port, defaulting to null', () => {
+  assert.equal(parseManifest('{"start":"x","port":3000}').port, 3000);
+  assert.equal(parseManifest('{"start":"x"}').port, null);
+  assert.equal(parseManifest('{"start":"x","port":null}').port, null);
+  // Range edges are inclusive.
+  assert.equal(parseManifest('{"start":"x","port":1024}').port, 1024);
+  assert.equal(parseManifest('{"start":"x","port":65535}').port, 65535);
+});
+
+test('rejects a port outside 1024-65535 or of the wrong type, naming value + range', () => {
+  const F = 'proj/.hub.json';
+  for (const bad of ['0', '80', '1023', '65536', '70000', '"3000"', '3000.5', '-1', 'true']) {
+    assert.throws(
+      () => parseManifest(`{"start":"x","port":${bad}}`, F),
+      (e) => e.message.startsWith(`${F}: "port" must be an integer between 1024 and 65535 (got ${bad})`),
+      `port ${bad} must be rejected`,
+    );
+  }
+});
