@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, isPortFree, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
   const port = await allocatePort();
@@ -160,11 +161,6 @@ test('isPortFree is true for a released port and false while anything holds it',
   const port = await allocatePort();
   assert.equal(await isPortFree(port), true);
 
-  // Deliberately a LOOPBACK-only holder. This is the whole point of probing
-  // 0.0.0.0: on Linux SO_REUSEADDR does not permit overlapping listen binds, so
-  // a wildcard bind fails when the port is held on ANY single address. A laxer
-  // probe (e.g. binding 127.0.0.1, or a connect-based check) would call this
-  // port free and let a fixed-port app start straight into an EADDRINUSE crash.
   const release = await hold(t, port, '127.0.0.1');
   assert.equal(await isPortFree(port), false);
 
@@ -176,4 +172,43 @@ test('isPortFree is false for a port held on the wildcard address too', async (t
   const port = await allocatePort();
   await hold(t, port, '0.0.0.0');
   assert.equal(await isPortFree(port), false);
+});
+
+test('isPortFree is a MACHINE-WIDE probe, not a loopback or connect check', async (t) => {
+  // The discriminating case, and the only one here that pins HOW isPortFree
+  // probes. A holder on 127.0.0.1 or on 0.0.0.0 (the two tests above) is
+  // reported busy by every plausible implementation alike — measured: a
+  // 0.0.0.0 bind, a 127.0.0.1 bind and a connect-based check all say "busy",
+  // so neither of those tests can tell them apart.
+  //
+  // A holder on an address that is neither loopback-proper nor the wildcard
+  // separates them: only the 0.0.0.0 bind sees it. A 127.0.0.1-bind probe
+  // binds fine, and a connect to 127.0.0.1 is refused — both would call this
+  // port FREE and let a fixed-port app start straight into an EADDRINUSE
+  // crash, or hand a fixed port to a second app.
+  //
+  // ALT_LOOPBACK keeps this host-independent: no LAN interface required, so it
+  // still guards the probe on a LAN-less box where the end-to-end LAN tests skip.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+  const port = await allocatePort();
+  await hold(t, port, ALT_LOOPBACK);
+  assert.equal(await isPortFree(port), false);
+});
+
+test('probeWildcardHold separates a wildcard holder from an address-specific one', async (t) => {
+  // This is what lets a fixed-port LAN share name the cause of its fallback
+  // instead of guessing: only a bind covering every address can be the app's
+  // own (see appManager.share), and only then is the app really LAN-exposed.
+  if (!(await altLoopbackBindable())) return t.skip(`${ALT_LOOPBACK} is not bindable on this host`);
+
+  const wildcard = await allocatePort();
+  await hold(t, wildcard, '0.0.0.0');
+  assert.equal(await probeWildcardHold(wildcard), 'held');
+
+  const loopbackOnly = await allocatePort();
+  await hold(t, loopbackOnly, '127.0.0.1');
+  assert.equal(await probeWildcardHold(loopbackOnly), 'free', 'an address-specific holder is not a wildcard hold');
+
+  const untouched = await allocatePort();
+  assert.equal(await probeWildcardHold(untouched), 'free');
 });

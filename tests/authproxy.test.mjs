@@ -6,6 +6,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { startAuthProxy } from '../src/authproxy.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
+import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 // A tiny raw upstream: serves "ok" for normal requests, and on a WS-style
 // upgrade replies 101 then echoes bytes. Lets us prove the auth gate + the
@@ -390,17 +391,6 @@ test('no tls (tunnel/plain-LAN hop): token cookie omits Secure', async (t) => {
 });
 
 // --- Pinned port + multi-address bind (backs the fixed-port LAN share) ---
-
-// Two loopback aliases keep these host-independent: 127.0.0.2 behaves like a
-// distinct address on Linux without needing a real LAN interface.
-const ALT_LOOPBACK = '127.0.0.2';
-async function altLoopbackBindable() {
-  return new Promise((resolve) => {
-    const s = net.createServer();
-    s.on('error', () => resolve(false));
-    s.listen(0, ALT_LOOPBACK, () => s.close(() => resolve(true)));
-  });
-}
 
 test('startAuthProxy listens on exactly the requested port', async (t) => {
   const up = await upstream();

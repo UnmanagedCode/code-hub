@@ -7,7 +7,7 @@ import {
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
-import { allocatePort, isPortFree, enumerateUrls, routeUrls, localIPv4s } from './net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
@@ -184,6 +184,7 @@ export async function list() {
           url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
           proxyPort: rec.tunnel.proxyPort ?? null,
           fixedPortFallback: rec.tunnel.fixedPortFallback === true,
+          fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
           auth, tls: rec.tunnel.tls === true,
           username, password,
           ...(authUrl ? { authUrl } : {}),
@@ -372,13 +373,33 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     // answer — never guess.
     let proxy = null;
     let fixedPortFallback = false;
+    let fixedPortHolder = null;
     if (rec.fixedPort && lanIps.length) {
       try {
         proxy = await startAuthProxy(rec.port, { host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
       } catch (e) {
         if (e.code !== 'EADDRINUSE') throw e;
         fixedPortFallback = true;
-        console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — the app binds all interfaces, so it is already reachable there ungated; gated share falling back to a free port`);
+        // EADDRINUSE alone does not say WHO holds the port, and the two possible
+        // causes mean opposite things to the user: either the app itself bound
+        // every interface (it really is answering on the LAN, ungated), or an
+        // unrelated process holds a LAN address at that port (the app is not
+        // LAN-reachable at all). Never assert the first without establishing it —
+        // telling someone their app is already exposed when it isn't invites
+        // them to conclude the gate is pointless.
+        //
+        // A wildcard hold can only be the app's own: start() proved this port
+        // free on every address before spawning, so the app is its first holder,
+        // and anything arriving later can only take addresses the app left
+        // free — never the wildcard.
+        const hold = await probeWildcardHold(rec.fixedPort);
+        fixedPortHolder = hold === 'held' ? 'app' : hold === 'free' ? 'other' : 'unknown';
+        const why = fixedPortHolder === 'app'
+          ? 'the app itself binds all interfaces, so it is already reachable there ungated'
+          : fixedPortHolder === 'other'
+            ? 'another process holds a LAN address at that port — not the app, which is not LAN-reachable there'
+            : 'code-hub could not identify what holds it';
+        console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
       }
     }
     if (!proxy) proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth, tls: tlsOpt });
@@ -391,15 +412,15 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     const loopbackPrefix = `${scheme}://localhost:`;
     const urls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
     const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
-    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback };
+    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
     await persist();
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
-      return { kind: 'lan', url, urls, auth: false, tls: useTls, proxyPort: proxy.port, fixedPortFallback, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
+      return { kind: 'lan', url, urls, auth: false, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
   if (!(await tunnel.available())) {

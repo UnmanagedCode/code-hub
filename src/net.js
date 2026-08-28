@@ -34,6 +34,32 @@ export function isPortFree(port) {
   });
 }
 
+// The loopback alias the wildcard-hold probe binds. Any 127.0.0.0/8 address is
+// a distinct bind target from 127.0.0.1 while still being purely local, so
+// probing it never touches the network or any real interface.
+const PROBE_ALIAS = '127.0.0.2';
+
+// Answers "is `port` held by a bind covering EVERY address?" — i.e. is the
+// holder a wildcard (0.0.0.0) listener rather than an address-specific one.
+// This is what separates "the app itself binds all interfaces, so it really is
+// reachable on the LAN" from "some unrelated process holds one LAN address".
+//
+// PROBE_ALIAS is covered by a wildcard bind but is a distinct address from
+// 127.0.0.1, so the bind outcome answers it directly:
+//   EADDRINUSE  → something holds the port on all addresses (a wildcard bind)
+//   bound ok    → nothing does; any holder is address-specific
+//   other error → the alias isn't usable here (EADDRNOTAVAIL on some non-Linux
+//                 hosts), so nothing has been established
+// Tri-state on purpose: the caller must be able to report "unknown" rather than
+// assert a cause it hasn't proved. Never throws.
+export function probeWildcardHold(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on('error', (e) => resolve(e.code === 'EADDRINUSE' ? 'held' : 'inconclusive'));
+    srv.listen(port, PROBE_ALIAS, () => srv.close(() => resolve('free')));
+  });
+}
+
 // Pure text parser: extracts LAN-reachable IPv4 addresses from `ip -4 addr`
 // or `ifconfig -a` output (either GNU/net-tools or busybox/toybox style).
 // Excludes loopback (127.0.0.0/8) and point-to-point addresses (a /32

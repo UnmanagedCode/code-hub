@@ -300,13 +300,20 @@ function sharePanel(app) {
     : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
     : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
 
-  // The app pinned a fixed port but binds all interfaces, so the gated proxy
-  // couldn't take that port on the LAN and fell back to a free one. Say both
-  // halves plainly: where the gated share actually is, and that the app itself
-  // is already answering on the LAN at the fixed port with no gate at all.
+  // The gated share couldn't take the app's fixed port on the LAN. Only the
+  // 'app' case is a security warning — that's the one where code-hub actually
+  // established the app itself binds every interface, and is therefore already
+  // answering on the LAN at that port with no gate. The other two make no claim
+  // about the app: saying "it's exposed anyway" when it isn't would invite the
+  // user to conclude the gate is pointless.
   if (kind === 'lan' && shared.fixedPortFallback) {
-    panel.appendChild(el('div', { class: 'warn' },
-      `\u26a0 Fixed port ${app.port} is held on all interfaces by the app itself, so this gated share is on port ${shared.proxyPort}. The app is also reachable on the LAN at port ${app.port} with NO authentication.`));
+    panel.appendChild(shared.fixedPortHolder === 'app'
+      ? el('div', { class: 'warn' },
+          `\u26a0 Fixed port ${app.port} is held on all interfaces by the app itself, so this gated share is on port ${shared.proxyPort}. The app is also reachable on the LAN at port ${app.port} with NO authentication.`)
+      : el('div', { class: 'cred-note' },
+          shared.fixedPortHolder === 'other'
+            ? `Fixed port ${app.port} is held on the LAN by another process, not by this app, so this gated share is on port ${shared.proxyPort}.`
+            : `Fixed port ${app.port} could not be bound on the LAN — code-hub could not identify what holds it — so this gated share is on port ${shared.proxyPort}.`));
   }
 
   if (shared.urls && shared.urls.length > 1) {

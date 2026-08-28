@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import https from 'node:https';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
@@ -707,6 +708,7 @@ test('fixed-port LAN share: a loopback-binding app gets the gated share ON its f
   const app = await appStatus(base);
   assert.equal(app.tunnel.proxyPort, port);
   assert.equal(app.tunnel.fixedPortFallback, false);
+  assert.equal(app.tunnel.fixedPortHolder, null); // nothing fell back, so no cause to report
 
   // The proxy really is on the LAN address at that port, and really is gated.
   const lanIp = localIPv4s({ lanFallback: true })[0];
@@ -734,9 +736,14 @@ test('fixed-port LAN share: a wildcard-binding app falls back to a free port, an
   assert.equal(res.status, 200);
   assert.equal(res.body.fixedPortFallback, true, 'the fallback must be surfaced, not silent');
   assert.notEqual(res.body.proxyPort, port);
+  // The app really does hold every interface here, so the exposure claim is
+  // established and the loud warning must fire. This is the under-report guard:
+  // it fails if the cause probe ever stops recognising a genuine wildcard hold.
+  assert.equal(res.body.fixedPortHolder, 'app');
 
   const app = await appStatus(base);
   assert.equal(app.tunnel.fixedPortFallback, true);
+  assert.equal(app.tunnel.fixedPortHolder, 'app');
   assert.equal(app.tunnel.proxyPort, res.body.proxyPort);
 
   // The fallback share is still a real, gated share.
@@ -757,7 +764,9 @@ test('a dynamic-port LAN share reports fixedPortFallback:false (no false alarm)'
 
   const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
   assert.equal(res.body.fixedPortFallback, false);
+  assert.equal(res.body.fixedPortHolder, null);
   assert.equal((await appStatus(base)).tunnel.fixedPortFallback, false);
+  assert.equal((await appStatus(base)).tunnel.fixedPortHolder, null);
 });
 
 // The pre-check and the post-spawn check are independent defenses that cover
@@ -827,4 +836,51 @@ test('a fixed port already held by another code-hub app is refused, naming the h
   // Naming the holder is the difference between a useful message and a shrug —
   // the generic probe failure can't say who has the port.
   assert.match(res.body.error, /held by 'first'/);
+});
+
+test('fixed-port LAN share: a THIRD-PARTY listener on the LAN port must not be blamed on the app', async (t) => {
+  if (!HAS_LAN) return t.skip('no LAN interface on this host');
+  const root = await mkRoot();
+  const port = await freePort();
+  // The default fake-app binds 127.0.0.1 only, so it is NOT reachable on the
+  // LAN at all — the exposure claim would be flatly false for it.
+  await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+
+  // An unrelated process grabs the fixed port on a LAN address AFTER the app
+  // started (start()'s 0.0.0.0 probe proved it free machine-wide before that,
+  // so this is the only order in which it can happen). The proxy's LAN bind now
+  // fails with the exact same EADDRINUSE the wildcard-binding app produces.
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  // A real HTTP server, so the reachability check below gets an answer rather
+  // than hanging on an accepted-but-silent socket — and so its reply is
+  // distinguishable from the app's.
+  const squatter = http.createServer((req, res) => { res.writeHead(200); res.end('squatter'); });
+  await new Promise((r) => squatter.listen(port, lanIp, r));
+  t.after(() => new Promise((r) => { squatter.closeAllConnections?.(); squatter.close(r); }));
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.fixedPortFallback, true);
+  // The whole point: code-hub must NOT claim the app is LAN-reachable ungated,
+  // because it isn't. Blaming the app here would tell the user their app is
+  // already exposed and invite them to treat the gate as pointless.
+  assert.equal(res.body.fixedPortHolder, 'other');
+  assert.notEqual(res.body.fixedPortHolder, 'app');
+
+  const app = await appStatus(base);
+  assert.equal(app.tunnel.fixedPortHolder, 'other');
+
+  // And the app genuinely is not reachable on the LAN at the fixed port —
+  // what answers there is the squatter, not the app (which serves 'ok').
+  const viaLan = await fetch(`http://${lanIp}:${port}/`).then((r) => r.text()).catch(() => null);
+  assert.equal(viaLan, 'squatter');
+
+  // The fallback share itself is still a real, gated share.
+  const noauth = await fetch(`http://127.0.0.1:${res.body.proxyPort}/`);
+  assert.equal(noauth.status, 401);
 });
