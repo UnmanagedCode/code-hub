@@ -19,6 +19,8 @@
 //   slow-exit   funnel takes ~300ms to exit after SIGTERM — long enough for a
 //               re-share to visibly race it if it does not wait
 //   ignore-sigterm  funnel never exits on SIGTERM, so only a SIGKILL reaps it
+//   slow-start  funnel takes ~400ms to announce itself, so a test can act on
+//               the app while a share is still in flight
 //
 // FAKE_TAILSCALE_ARGV_LOG: append one timestamped JSON line per invocation, and
 //   another when a funnel exits — so a test can assert WHICH port was funnelled
@@ -79,14 +81,25 @@ if (args[0] === 'funnel') {
     writeFileSync(process.env.FAKE_TAILSCALE_CHILD_PID_FILE, String(child.pid));
   }
 
-  process.stdout.write('Available on the internet:\n\n');
-  process.stdout.write(`https://${DNS_NAME.replace(/\.$/, '')}/\n`);
-  process.stdout.write(`|-- proxy ${target}\n\n`);
-  process.stdout.write('Press Ctrl+C to exit.\n');
+  // Handlers first: a funnel killed during a slow-start delay must still exit
+  // (and log that it did), which is exactly what the in-flight tests check.
   const quit = () => { logEvent({ event: 'exit', argv: args }); process.exit(0); };
-  if (mode === 'ignore-sigterm') process.on('SIGTERM', () => {});      // only SIGKILL reaps it
-  else if (mode === 'slow-exit') process.on('SIGTERM', () => setTimeout(quit, 300));
-  else process.on('SIGTERM', quit);
+  // 'sigterm' is logged on RECEIPT, separately from 'exit', so a test can see
+  // the moment teardown fired as distinct from the moment the child went away.
+  process.on('SIGTERM', () => {
+    logEvent({ event: 'sigterm', argv: args });
+    if (mode === 'ignore-sigterm') return;                 // only SIGKILL reaps it
+    if (mode === 'slow-exit') setTimeout(quit, 300); else quit();
+  });
+
+  const announce = () => {
+    process.stdout.write('Available on the internet:\n\n');
+    process.stdout.write(`https://${DNS_NAME.replace(/\.$/, '')}/\n`);
+    process.stdout.write(`|-- proxy ${target}\n\n`);
+    process.stdout.write('Press Ctrl+C to exit.\n');
+  };
+  if (mode === 'slow-start') setTimeout(announce, 400);
+  else announce();
   setInterval(() => {}, 1 << 30); // block
 } else {
   die(`unexpected subcommand ${JSON.stringify(args[0])}`);

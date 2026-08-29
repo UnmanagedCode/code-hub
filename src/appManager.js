@@ -588,6 +588,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     // this line, so two concurrent requests cannot both get here.
     const prior = funnelSlot; // null, or this app's own held slot (a re-share)
     funnelSlot = { id, pid: null, pending: true };
+    let committed = false;
     try {
       if (!(await tailscale.available())) throw tailscaleUnavailable();
       teardownShare(id, rec); // replace any existing share
@@ -610,9 +611,28 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
         proxy.close(); // don't leak the proxy if the funnel failed to come up
         throw e;
       }
+      // This flight has been in the air for as long as the readiness backstop
+      // allows, and `rec` is the record object captured before any of it. While
+      // the slot was `pending` it carried NO pid, so killShareChild's pid match
+      // could not protect it — meanwhile stop(), list()'s prune and start() are
+      // all free to drop or replace store.apps[id]. Writing on regardless would
+      // attach a LIVE public funnel to an object the store no longer holds:
+      // referenced by nothing, so unshare/stop cannot reach it, never persisted
+      // so a restart loses it entirely, and — being alive — never reaped by
+      // funnelBlockedBy, which would 409 every future share on every app.
+      if (store.apps[id] !== rec) {
+        tailscale.stopFunnel(pid);
+        expiringFunnelPid = pid;
+        proxy.close();
+        const e = new Error(`'${id}' was stopped or replaced while its tailscale share was starting — share it again`);
+        e.statusCode = 409; throw e;
+      }
       proxies.set(id, proxy);
       rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
       funnelSlot = { id, pid, pending: false };
+      // Past this point the funnel is up and recorded, so the slot names
+      // reality: a later failure (persist, QR render) must NOT hand it back.
+      committed = true;
       await persist();
 
       const authUrl = withToken(url, proxy.token);
@@ -623,7 +643,9 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
       // leaves the previous share fully intact, and freeing the slot there
       // would let another app start a competing funnel in front of it. If the
       // old funnel is gone — torn down above, or it was never there — free it.
-      funnelSlot = (prior && !prior.pending && state.pidAlive(prior.pid)) ? prior : null;
+      // Once `committed`, neither applies: THIS flight's funnel is live and
+      // recorded, so the slot already names reality and must be left alone.
+      if (!committed) funnelSlot = (prior && !prior.pending && state.pidAlive(prior.pid)) ? prior : null;
       throw e;
     }
   }
