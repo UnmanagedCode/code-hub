@@ -50,15 +50,29 @@ export function pidAlive(pid) {
 }
 
 // Reconcile persisted records against reality: drop apps whose pid is dead,
-// clear tunnels whose pid is dead. Returns the pruned state (also saved).
+// clear tunnels whose pid is dead. Saves, then returns
+// `{ state, strandedTunnels }`.
+//
+// `strandedTunnels` is `[{ id, tunnel }]` for every dropped app whose OWN
+// share child is still ALIVE. Dropping such a record silently strands that
+// child: the record was the only thing holding its pid, so after the delete
+// nothing anywhere can ever kill it — for a tailscale funnel that means a
+// public URL left serving 443 in front of a proxy that no longer exists.
+// This module can't kill them itself (it doesn't know a share's kind, and
+// must not grow a dependency on the integrations to find out), so it hands
+// them back and the caller tears them down. The invariant callers must
+// uphold: no path drops a record carrying a LIVE share pid without first
+// killing that pid.
 export async function reconcile(state) {
+  const strandedTunnels = [];
   for (const [id, rec] of Object.entries(state.apps)) {
     if (!pidAlive(rec.pid)) {
+      if (rec.tunnel && pidAlive(rec.tunnel.pid)) strandedTunnels.push({ id, tunnel: rec.tunnel });
       delete state.apps[id];
       continue;
     }
     if (rec.tunnel && !pidAlive(rec.tunnel.pid)) rec.tunnel = null;
   }
   await save(state);
-  return state;
+  return { state, strandedTunnels };
 }

@@ -1,9 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as tailscale from '../src/tailscale.js';
 import { fakeTailscaleBin, waitFor, pidAlive } from './helpers.mjs';
 
-test('available() reflects a running daemon with a MagicDNS name', async () => {
+// Fresh temp file per use, cleaned up by the caller's t.after.
+const tmpFile = async (name) => path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-ts-')), name);
+
+test('available() is true only for a running daemon that also has a MagicDNS name', async (t) => {
+  t.after(() => { delete process.env.FAKE_TAILSCALE_MODE; });
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   delete process.env.FAKE_TAILSCALE_MODE;
   assert.equal(await tailscale.available(), true);
@@ -11,12 +18,21 @@ test('available() reflects a running daemon with a MagicDNS name', async () => {
   process.env.CODEHUB_TAILSCALE_BIN = '/no/such/tailscale-xyz';
   assert.equal(await tailscale.available(), false);
 
-  // Daemon reachable but not logged in: no MagicDNS name, so no URL exists —
-  // this must read as unavailable, not as available-with-a-broken-URL.
+  // The two conjuncts are isolated deliberately: each of these fixtures fails
+  // exactly ONE of them, so neither arm of the check can be dropped unnoticed.
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+
+  // Not logged in, but the node's name is still cached — only BackendState
+  // disqualifies it.
   process.env.FAKE_TAILSCALE_MODE = 'logged-out';
   assert.equal(await tailscale.available(), false);
-  delete process.env.FAKE_TAILSCALE_MODE;
+
+  // Daemon up and Running, but MagicDNS is off, so no URL exists at all.
+  // Reading this as available would mint a share URL of `https://null`.
+  process.env.FAKE_TAILSCALE_MODE = 'no-magicdns';
+  assert.equal(await tailscale.available(), false);
+  assert.equal(await tailscale.magicDnsName(), null);
+  await assert.rejects(tailscale.startFunnel(12345), /not ready/);
 });
 
 test('magicDnsName strips the trailing dot tailscale reports', async () => {
@@ -59,4 +75,69 @@ test('startFunnel rejects, carrying tailscale stderr, when the funnel is refused
   );
   assert.equal(resolved, null, 'no URL is handed back for a refused funnel');
   delete process.env.FAKE_TAILSCALE_MODE;
+});
+
+// The funnel must point at the port it was HANDED (the gated auth proxy), not
+// at some other port. Asserted from the argv the fake actually received —
+// the banner it prints is canned and would say the right thing regardless.
+test('startFunnel funnels exactly the port it was given', async (t) => {
+  const log = await tmpFile('argv.log');
+  t.after(async () => { delete process.env.FAKE_TAILSCALE_ARGV_LOG; await fs.rm(path.dirname(log), { recursive: true, force: true }); });
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  delete process.env.FAKE_TAILSCALE_MODE;
+  process.env.FAKE_TAILSCALE_ARGV_LOG = log;
+
+  const { pid } = await tailscale.startFunnel(54321);
+  tailscale.stopFunnel(pid);
+  await waitFor(() => !pidAlive(pid));
+
+  const funnelArgv = (await fs.readFile(log, 'utf8')).trim().split('\n')
+    .map((l) => JSON.parse(l)).find((a) => a[0] === 'funnel');
+  assert.ok(funnelArgv, 'the funnel subcommand was invoked');
+  assert.equal(funnelArgv[funnelArgv.length - 1], 'http://localhost:54321');
+});
+
+// stopFunnel signals the process GROUP (`kill(-pid)`), not just the leader.
+// The real `tailscale funnel` is a single process today, so the difference is
+// invisible against a childless fake — this fixture spawns a child in the same
+// group that outlives its parent, so signalling only the leader would leave it.
+test('stopFunnel kills the whole process group, not just the leader', async (t) => {
+  const pidFile = await tmpFile('child.pid');
+  let childPid = null;
+  t.after(async () => {
+    if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* gone */ } }
+    delete process.env.FAKE_TAILSCALE_CHILD_PID_FILE;
+    await fs.rm(path.dirname(pidFile), { recursive: true, force: true });
+  });
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  delete process.env.FAKE_TAILSCALE_MODE;
+  process.env.FAKE_TAILSCALE_CHILD_PID_FILE = pidFile;
+
+  const { pid } = await tailscale.startFunnel(12345);
+  await waitFor(async () => !!(await fs.readFile(pidFile, 'utf8').catch(() => '')).trim());
+  childPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+  assert.ok(pidAlive(childPid), 'the fixture spawned a live child in the funnel process group');
+
+  tailscale.stopFunnel(pid);
+  await waitFor(() => !pidAlive(pid));
+  await waitFor(() => !pidAlive(childPid)); // fails if only the leader was signalled
+  childPid = null;
+});
+
+// waitForExit is what keeps a re-share from racing the previous funnel's exit,
+// since a foreground CLI reverts the node's whole serve config as it goes.
+test('waitForExit returns only once the funnel child is actually gone', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  delete process.env.FAKE_TAILSCALE_MODE;
+  const { pid } = await tailscale.startFunnel(12345);
+  t.after(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } });
+
+  tailscale.stopFunnel(pid);
+  await tailscale.waitForExit(pid);
+  assert.equal(pidAlive(pid), false, 'the child is dead by the time waitForExit resolves');
+
+  // A pid that is already gone (or absent) resolves rather than spinning to
+  // the timeout — every teardown path calls this.
+  await tailscale.waitForExit(pid);
+  await tailscale.waitForExit(null);
 });

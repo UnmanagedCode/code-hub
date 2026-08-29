@@ -1,4 +1,5 @@
 import { spawn, execFile } from 'node:child_process';
+import { pidAlive } from './state.js';
 
 // Binary is overridable so tests can inject a fake that prints canned status
 // JSON and a canned funnel banner.
@@ -7,6 +8,7 @@ function bin() {
 }
 
 const START_TIMEOUT_MS = 15000;
+const EXIT_TIMEOUT_MS = 5000;
 
 // `tailscale status --json`, parsed — or null if the binary is missing, the
 // daemon isn't answering, or the output isn't JSON. `--peers=false` keeps the
@@ -88,6 +90,10 @@ export function startFunnel(port) {
       };
       proc.stdout.on('data', onData);
       proc.stderr.on('data', onData);
+      // Catch-all for a failed spawn. A MISSING binary does not reach here in
+      // practice — magicDnsName() above runs the same binary first and has
+      // already rejected — so this is the guard for the rest (EACCES, a binary
+      // that vanished between the two calls, resource exhaustion).
       proc.on('error', (e) => finish(reject, new Error(
         e.code === 'ENOENT' ? 'tailscale binary not found in PATH' : e.message)));
       // The funnel being refused (ACL/nodeAttr missing, HTTPS off, 443 already
@@ -112,4 +118,22 @@ export function startFunnel(port) {
 export function stopFunnel(pid) {
   if (!pid) return;
   try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
+}
+
+// Wait for a SIGTERMed funnel child to actually be GONE, SIGKILLing the group
+// if it overstays. Callers need this because the CLI reverts the node's whole
+// serve config when it exits: spawning a replacement while the old one is
+// still shutting down means the old one's exit can revoke the new one's URL.
+// Polls rather than awaiting an exit event — after a code-hub restart the
+// child is ours only by pid, there is no ChildProcess to listen to.
+export async function waitForExit(pid, { timeoutMs = EXIT_TIMEOUT_MS, intervalMs = 25 } = {}) {
+  if (!pid) return;
+  const deadline = Date.now() + timeoutMs;
+  while (pidAlive(pid)) {
+    if (Date.now() >= deadline) {
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      return;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
 }

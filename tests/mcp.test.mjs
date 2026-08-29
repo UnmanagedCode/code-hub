@@ -34,7 +34,11 @@ test('list_apps: happy path matches GET /api/apps shape', async (t) => {
   const app0 = res.body.result.apps.find((a) => a.id === 'app');
   assert.equal(app0.status, 'stopped');
   assert.equal(typeof res.body.result.cloudflaredAvailable, 'boolean');
-  assert.equal(typeof res.body.result.tailscaleAvailable, 'boolean');
+  // Asserted TRUE, not merely boolean: boot() injects the fake tailscale, so
+  // this is deterministic here — and a hardcoded false would disable the share
+  // mode everywhere while still typechecking. (cloudflared stays a typeof
+  // check: no fake is injected in this file, so it is host-dependent.)
+  assert.equal(res.body.result.tailscaleAvailable, true);
 });
 
 test('start_app then stop_app: happy path', async (t) => {
