@@ -16,6 +16,11 @@ export const fakeAppCmd = (mode, marker) =>
 
 export const fakeCloudflaredBin = path.join(FIXTURES, 'fake-cloudflared.mjs');
 
+// Tailscale is genuinely installed and Running on some dev machines, so every
+// test that boots the server must inject this — otherwise list() shells out to
+// the real binary on every poll and `tailscaleAvailable` becomes host-dependent.
+export const fakeTailscaleBin = path.join(FIXTURES, 'fake-tailscale.mjs');
+
 // A loopback alias used as a "third address" in bind tests: distinct from
 // 127.0.0.1, still covered by a 0.0.0.0 wildcard bind, and purely local (it
 // never touches a real interface, so tests using it stay host-independent —

@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
-import { mkRoot, rmRoot, mkProject, waitFor, fakeAppCmd } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, waitFor, fakeAppCmd, fakeTailscaleBin } from './helpers.mjs';
 
 async function boot() {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   await appManager.init();
   const server = createServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -33,6 +34,7 @@ test('list_apps: happy path matches GET /api/apps shape', async (t) => {
   const app0 = res.body.result.apps.find((a) => a.id === 'app');
   assert.equal(app0.status, 'stopped');
   assert.equal(typeof res.body.result.cloudflaredAvailable, 'boolean');
+  assert.equal(typeof res.body.result.tailscaleAvailable, 'boolean');
 });
 
 test('start_app then stop_app: happy path', async (t) => {

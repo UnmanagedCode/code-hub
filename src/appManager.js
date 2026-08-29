@@ -7,6 +7,7 @@ import {
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
+import * as tailscale from './tailscale.js';
 import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
@@ -35,13 +36,15 @@ function isUnderRoot(root, dir) {
 export async function init() {
   store = await state.load();
   await state.reconcile(store); // drop dead pids / tunnels; adopt live ones
-  // A persisted tunnel from before a restart points at an auth proxy that no
+  // A persisted share from before a restart points at an auth proxy that no
   // longer exists (in-process, gone with the old code-hub). Tear the orphaned
-  // cloudflared tunnel down so it can't serve a broken URL — the share simply
-  // needs re-creating (the UI's Share button reappears).
+  // child down so it can't serve a broken URL — the share simply needs
+  // re-creating (the UI's Share button reappears). Routed through
+  // teardownShare so the per-kind kill lives in one place; at init the
+  // proxies/qrCache maps are empty, so it does exactly the same thing.
   let mutated = false;
-  for (const rec of Object.values(store.apps)) {
-    if (rec.tunnel) { tunnel.stopTunnel(rec.tunnel.pid); rec.tunnel = null; mutated = true; }
+  for (const [id, rec] of Object.entries(store.apps)) {
+    if (rec.tunnel) { teardownShare(id, rec); mutated = true; }
   }
   // Embedded as a code-conductor plugin: the host conductor is already
   // running (started by something else), so synthesize a record for it with
@@ -97,12 +100,19 @@ export async function init() {
   if (mutated) await persist();
 }
 
-// Tear down a share: close the auth proxy (if any) and kill the cloudflared
-// tunnel. Leaves rec.tunnel null. Safe to call when nothing is shared.
+// Tear down a share: close the auth proxy (if any) and kill the child that
+// publishes it. Leaves rec.tunnel null. Safe to call when nothing is shared.
+// A tailscale funnel runs in the foreground, so SIGTERM is the whole teardown
+// — the CLI removes its own funnel config on exit (see src/tailscale.js).
+// Stays synchronous: nothing awaits an external command, so re-sharing an app
+// can never race its own pending teardown.
 function teardownShare(id, rec) {
   const proxy = proxies.get(id);
   if (proxy) { proxy.close(); proxies.delete(id); }
-  if (rec?.tunnel) tunnel.stopTunnel(rec.tunnel.pid);
+  if (rec?.tunnel) {
+    if (rec.tunnel.kind === 'tailscale') tailscale.stopFunnel(rec.tunnel.pid);
+    else tunnel.stopTunnel(rec.tunnel.pid);
+  }
   if (rec) rec.tunnel = null;
   qrCache.delete(id);
 }
@@ -251,7 +261,7 @@ export async function list() {
   if (mutated) await persist();
 
   entries.sort((a, b) => a.id.localeCompare(b.id));
-  return { cloudflaredAvailable: await tunnel.available(), apps: entries };
+  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), apps: entries };
 }
 
 async function findDiscovered(id) {
@@ -324,7 +334,7 @@ export async function restart(id) {
   return start(id);
 }
 
-// Share a running app behind a local auth proxy. Two modes:
+// Share a running app behind a local auth proxy. Three modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
 //   so the public *.trycloudflare.com URL goes through it. Always gated.
 // - 'lan': the auth proxy itself binds 0.0.0.0 instead of loopback, so other
@@ -334,6 +344,11 @@ export async function restart(id) {
 //   URL is the plain proxy URL. `tls` (LAN only, default on — see
 //   lanTlsDefault) wraps the proxy in HTTPS with a per-share self-signed cert
 //   so the LAN hop is encrypted; set it false for plain HTTP.
+// - 'tailscale': a Tailscale Funnel points at the auth proxy, publishing the
+//   node's MagicDNS name (https://<machine>.<tailnet>.ts.net) — public, and
+//   unlike cloudflared's random hostname it is stable across restarts. Always
+//   gated. Funnel occupies port 443 machine-wide, so only ONE tailscale share
+//   can exist at a time (409 naming the holder).
 // For a gated share, a fresh token + password are generated per share, kept
 // in memory only (see the `proxies` map). The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
@@ -341,12 +356,12 @@ export async function restart(id) {
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
 export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
-  if (mode !== 'tunnel' && mode !== 'lan') {
-    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
+  if (mode !== 'tunnel' && mode !== 'lan' && mode !== 'tailscale') {
+    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel', 'lan' or 'tailscale'`); e.statusCode = 400; throw e;
   }
   if (typeof auth !== 'boolean') { const e = new Error("'auth' must be a boolean"); e.statusCode = 400; throw e; }
-  if (mode === 'tunnel' && auth === false) {
-    const e = new Error('authentication cannot be disabled for tunnel shares'); e.statusCode = 400; throw e;
+  if ((mode === 'tunnel' || mode === 'tailscale') && auth === false) {
+    const e = new Error(`authentication cannot be disabled for ${mode} shares`); e.statusCode = 400; throw e;
   }
   if (tls !== undefined && typeof tls !== 'boolean') { const e = new Error("'tls' must be a boolean"); e.statusCode = 400; throw e; }
   const rec = store.apps[id];
@@ -435,6 +450,40 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
+  if (mode === 'tailscale') {
+    if (!(await tailscale.available())) {
+      const e = new Error('tailscale is not available — start tailscaled and log in to share via a Tailscale Funnel URL');
+      e.statusCode = 501; throw e;
+    }
+    // Funnel publishes on port 443 of the node itself, which is a machine-wide
+    // resource: a second funnel would replace the first one's config rather
+    // than coexist with it. Refuse before tearing anything down, and exclude
+    // this app's own record so re-sharing it still replaces normally.
+    const holder = Object.entries(store.apps).find(([hid, r]) => hid !== id && r.tunnel?.kind === 'tailscale');
+    if (holder) {
+      const e = new Error(`'${holder[0]}' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide, so only one is possible at a time; unshare it first`);
+      e.statusCode = 409; throw e;
+    }
+    teardownShare(id, rec); // replace any existing share
+
+    // No `tls` option: tailscaled terminates TLS on-machine and forwards plain
+    // HTTP here, exactly as cloudflared does (see authproxy.js).
+    const proxy = await startAuthProxy(rec.port);
+    let url, pid;
+    try {
+      ({ url, pid } = await tailscale.startFunnel(proxy.port));
+    } catch (e) {
+      proxy.close(); // don't leak the proxy if the funnel failed to come up
+      throw e;
+    }
+    proxies.set(id, proxy);
+    rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
+    await persist();
+
+    const authUrl = withToken(url, proxy.token);
+    return { kind: 'tailscale', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+  }
+
   if (!(await tunnel.available())) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
@@ -496,16 +545,16 @@ export async function updateShareCredentials(id, { username, password } = {}) {
 
 // Flip a live LAN share's auth gate in place — mutates the proxy (see
 // authproxy.js's setAuth), so the share URL/token/proxy port never change.
-// Tunnel shares are always gated and reject this (mirrors the mode==='tunnel'
-// guard in share()); a token/authUrl handed out earlier stays valid either
-// way since the proxy never regenerates them on a toggle.
+// Tunnel and tailscale shares are always gated and reject this (mirrors the
+// same guard in share()); a token/authUrl handed out earlier stays valid
+// either way since the proxy never regenerates them on a toggle.
 export async function setShareAuth(id, enabled) {
   if (typeof enabled !== 'boolean') { const e = new Error("'enabled' must be a boolean"); e.statusCode = 400; throw e; }
   const rec = store.apps[id];
   const proxy = proxies.get(id);
   if (!rec?.tunnel || !proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
   if (rec.tunnel.kind !== 'lan') {
-    const e = new Error('authentication cannot be toggled for tunnel shares — tunnel shares are always gated'); e.statusCode = 400; throw e;
+    const e = new Error(`authentication cannot be toggled for '${rec.tunnel.kind}' shares — they are always gated`); e.statusCode = 400; throw e;
   }
   proxy.setAuth(enabled);
   rec.tunnel.auth = enabled;

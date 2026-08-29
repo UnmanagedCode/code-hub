@@ -11,7 +11,7 @@ import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
 import net from 'node:net';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
@@ -28,6 +28,7 @@ const httpsGet = (port, path, headers = {}) => new Promise((resolve, reject) => 
 
 async function boot(root) {
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   await appManager.init();
   const server = createServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -529,6 +530,183 @@ test('share with an invalid mode → 400', async (t) => {
 
   const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'bogus' });
   assert.equal(res.status, 400);
+});
+
+// --- Tailscale Funnel share (mode: 'tailscale') ---
+
+// Bring an app up and wait for it to serve, so a share has something behind it.
+const startApp = async (base, id = 'app') => {
+  await j(base, 'POST', `/api/apps/${id}/start`);
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === id).status));
+};
+
+test('share mode=tailscale publishes the MagicDNS URL through a gated proxy', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.kind, 'tailscale');
+  // The node's MagicDNS name, trailing dot stripped and no path appended —
+  // NOT a trycloudflare hostname.
+  assert.match(res.body.url, /^https:\/\/[^/]+\.ts\.net$/);
+  assert.equal(res.body.auth, true);
+  assert.match(res.body.authUrl, /^https:\/\/[^/]+\.ts\.net\?__hubauth=[\w-]+$/);
+  assert.match(res.body.qrSvg, /<svg/);
+
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.kind, 'tailscale');
+  assert.equal(app.tunnel.url, res.body.url);
+  assert.equal(app.tunnel.username, 'hub');
+  assert.equal(app.tunnel.password, res.body.password);
+
+  // The proxy tailscaled points at is gated AND plain HTTP: a tailscale share
+  // never passes `tls` (tailscaled terminates TLS on-machine and forwards
+  // http here, where a `Secure` cookie would be dropped).
+  const pp = app.tunnel.proxyPort;
+  const anon = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(anon.status, 401);
+  assert.match(anon.headers.get('www-authenticate') || '', /Basic/);
+  const authed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
+});
+
+// Funnel occupies port 443 of the node, machine-wide: a second one would
+// replace the first rather than coexist. Re-sharing the SAME app must still
+// replace normally, though — the guard excludes its own record.
+test('a second tailscale share is refused with 409 naming the holder; re-sharing the same app is not', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+
+  const clash = await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' });
+  assert.equal(clash.status, 409);
+  assert.match(clash.body.error, /'app'/); // names the holder, so the user knows what to unshare
+
+  // The refusal must not have torn the holder's share down.
+  const held = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(held.tunnel.kind, 'tailscale');
+
+  const reshare = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(reshare.status, 200, 're-sharing the holder replaces its own share instead of colliding with it');
+});
+
+test('share mode=tailscale, auth=false → 400 (tailscale shares are always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale', auth: false });
+  assert.equal(res.status, 400);
+  // No share was created by the refused call.
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel, null);
+});
+
+test('PATCH share/auth on a tailscale share → 400 (always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const res = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false });
+  assert.equal(res.status, 400);
+  // Still gated afterwards — the refusal didn't half-apply.
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.auth, true);
+});
+
+test('tailscale unavailable → share 501 and tailscaleAvailable:false', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  process.env.CODEHUB_TAILSCALE_BIN = '/nonexistent/tailscale';
+  t.after(async () => {
+    process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+    await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root);
+  });
+
+  await startApp(base);
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(res.status, 501);
+  assert.equal((await j(base, 'GET', '/api/apps')).body.tailscaleAvailable, false);
+});
+
+// The funnel child is the ONLY thing holding the node's funnel config, so a
+// teardown that leaves it alive leaves a public URL live in front of a dead
+// proxy. Both teardown routes must kill it.
+test('unshare and stop each kill the tailscale funnel child', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const funnelPid = async () => {
+    const raw = await fs.readFile(path.join(storeRoot(), 'state.json'), 'utf8');
+    return JSON.parse(raw).apps.app.tunnel.pid;
+  };
+
+  await startApp(base);
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const pid1 = await funnelPid();
+  assert.ok(pidAlive(pid1));
+  await j(base, 'DELETE', '/api/apps/app/share');
+  await waitFor(() => !pidAlive(pid1));
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel, null);
+
+  // Same again, torn down via stop() rather than unshare().
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const pid2 = await funnelPid();
+  assert.ok(pidAlive(pid2));
+  await j(base, 'POST', '/api/apps/app/stop');
+  await waitFor(() => !pidAlive(pid2));
+});
+
+// Twin of the cloudflared orphan test: a funnel child survives a code-hub
+// restart (it is detached), so init() must kill it — otherwise the node keeps
+// a public funnel pointed at a proxy that died with the old process.
+test('init tears down a tailscale funnel orphaned by a code-hub restart', async (t) => {
+  const root = await mkRoot();
+  const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  const funnelChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(async () => {
+    for (const c of [appChild, funnelChild]) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
+    await rmRoot(root);
+  });
+
+  const store = { apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: appChild.pid, pgid: appChild.pid, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { kind: 'tailscale', url: 'https://node.tailnet.ts.net', pid: funnelChild.pid, username: 'hub', proxyPort: 5001 },
+  } } };
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify(store));
+
+  await appManager.init(); // simulates a fresh code-hub after restart
+
+  const { apps } = await appManager.list();
+  const demo = apps.find((a) => a.id === 'demo');
+  assert.ok(demo, 'app with a live pid is kept');
+  assert.equal(demo.tunnel, null, 'orphaned funnel record is cleared → Share reappears');
+  await waitFor(() => !pidAlive(funnelChild.pid)); // orphaned funnel killed
+  assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
 });
 
 test('init tears down a LAN share orphaned by a code-hub restart (pid: null)', async (t) => {

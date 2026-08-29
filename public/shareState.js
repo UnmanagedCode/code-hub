@@ -83,3 +83,23 @@ export function resolveFixedPortNotice(app, shared) {
     text: `⚠ Fixed port ${fixed} could not be bound on the LAN and code-hub could not identify what holds it, so this gated share is on port ${actual}. If this app binds all interfaces, ${exposure}`,
   };
 }
+
+// Resolve the share panel's mode/credentials note — the one line under the URL
+// saying how this share is reachable. Extracted from app.js's render so the
+// wording is unit-testable without a DOM (there are no DOM tests).
+//
+// `kind` drives the split, NOT "is it LAN": a tailscale share is public like a
+// tunnel but is NOT a cloudflared tunnel, and calling it one would misdescribe
+// where TLS terminates and how stable the URL is. Anything unrecognised falls
+// through to the tunnel wording, which is the pre-existing default.
+export function resolveCredNote(shared) {
+  const kind = (shared && shared.kind) || 'tunnel';
+  if (kind === 'tailscale') return 'via Tailscale Funnel — public URL';
+  if (kind !== 'lan') return 'via public tunnel';
+  const authEnabled = shared.auth !== false;
+  const lanTls = String(shared.url).startsWith('https:');
+  if (!authEnabled && lanTls) return 'via LAN (HTTPS, self-signed — your browser warns on first visit), no authentication — anyone on the network can reach this app';
+  if (!authEnabled) return 'via LAN, no authentication — anyone on the network can reach this app';
+  if (lanTls) return 'via LAN (HTTPS, self-signed — your browser warns on first visit)';
+  return 'via LAN (plain HTTP — credentials are not encrypted in transit)';
+}

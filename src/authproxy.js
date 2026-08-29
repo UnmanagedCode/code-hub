@@ -5,11 +5,12 @@ import crypto from 'node:crypto';
 
 // A local HTTP reverse proxy that fronts a shared app and forwards
 // authenticated traffic (including WebSocket upgrades) to a target port on
-// localhost. It sits between cloudflared/LAN clients and the app. In-process
-// (not a child): a single fixed localhost upstream is a tiny surface, and the
-// WS-upgrade → raw-socket pipe is a well-known pattern — this keeps deps at
-// express+qrcode. The proxy does NOT survive a code-hub restart (by design;
-// the caller tears down the orphaned tunnel and the user re-shares).
+// localhost. It sits between cloudflared/tailscaled/LAN clients and the app.
+// In-process (not a child): a single fixed localhost upstream is a tiny
+// surface, and the WS-upgrade → raw-socket pipe is a well-known pattern —
+// this keeps deps at express+qrcode. The proxy does NOT survive a code-hub
+// restart (by design; the caller tears down the orphaned child and the user
+// re-shares).
 //
 // Per-request auth resolves in order: a valid `?__hubauth=` token (query)
 // sets an httpOnly session cookie and 302-redirects to the token-stripped
@@ -25,9 +26,11 @@ import crypto from 'node:crypto';
 //
 // `tls: { key, cert }` (LAN shares only) makes the proxy serve HTTPS instead of
 // plain HTTP, so the token/cookie/Basic-Auth are encrypted on the LAN hop; the
-// session cookie then also gets the `Secure` attribute. Tunnel-mode shares
-// never pass `tls` — cloudflared terminates TLS upstream and forwards plain
-// HTTP to this proxy, so a `Secure` cookie would be silently dropped there.
+// session cookie then also gets the `Secure` attribute. Tunnel AND tailscale
+// shares never pass `tls` — cloudflared (off-machine) and tailscaled (on this
+// machine) each terminate TLS upstream and forward plain HTTP to this proxy,
+// so a `Secure` cookie would be silently dropped there. Same reasoning, two
+// causes.
 
 const REALM = 'code-hub share';
 const COOKIE_NAME = 'hub_auth';
@@ -83,8 +86,8 @@ function rawHeaderLines(rawHeaders) {
 // Returns { port, hosts, auth, username, password, token, setCredentials(), setAuth(), close() }.
 // Secrets are generated with a CSPRNG per call and held in memory only
 // (never logged/persisted; the cookie secret is never even returned — only
-// its cookie form matters). `host` defaults to loopback-only (cloudflared
-// share); a LAN share passes '0.0.0.0' so other devices on the network can
+// its cookie form matters). `host` defaults to loopback-only (cloudflared and
+// tailscale shares); a LAN share passes '0.0.0.0' so other devices can
 // reach the proxy directly, or an ARRAY of specific LAN IPs when it needs to
 // leave a particular port free on the other addresses (the fixed-port LAN
 // share — see appManager.share). Every address in the array gets its own
@@ -135,10 +138,10 @@ export async function startAuthProxy(targetPort, { username = 'hub', host = '127
     if (providedToken !== null && credsMatch(providedToken, token)) {
       reqUrl.searchParams.delete('__hubauth');
       // `Secure` is added only for an HTTPS proxy (LAN TLS): the browser talks
-      // https directly, so the cookie rides an encrypted hop. Plain-LAN and
-      // tunnel-mode shares serve http on this hop (cloudflared terminates TLS
-      // upstream and forwards http here), where `Secure` would make the browser
-      // silently drop the cookie.
+      // https directly, so the cookie rides an encrypted hop. Plain-LAN,
+      // tunnel and tailscale shares serve http on this hop (cloudflared and
+      // tailscaled both terminate TLS upstream and forward http here), where
+      // `Secure` would make the browser silently drop the cookie.
       const cookie = `${COOKIE_NAME}=${cookieSecret}; Path=/; HttpOnly; SameSite=Lax${secureCookie ? '; Secure' : ''}`;
       res.writeHead(302, {
         'Set-Cookie': cookie,
