@@ -16,9 +16,13 @@
 //   logged-out  BackendState NeedsLogin, name still cached → available() false
 //   no-magicdns BackendState Running but NO MagicDNS name → available() false
 //   denied      funnel refused by the tailnet: stderr + exit 1, NO URL
+//   slow-exit   funnel takes ~300ms to exit after SIGTERM — long enough for a
+//               re-share to visibly race it if it does not wait
+//   ignore-sigterm  funnel never exits on SIGTERM, so only a SIGKILL reaps it
 //
-// FAKE_TAILSCALE_ARGV_LOG: append each invocation's argv as a JSON line, so a
-//   test can assert WHICH port was funnelled rather than trusting the banner.
+// FAKE_TAILSCALE_ARGV_LOG: append one timestamped JSON line per invocation, and
+//   another when a funnel exits — so a test can assert WHICH port was funnelled
+//   and that a replacement funnel did not start before the old one was gone.
 // FAKE_TAILSCALE_CHILD_PID_FILE: the funnel spawns a child of its own (in the
 //   same process group) and writes its pid here — that child only dies if the
 //   whole GROUP is signalled, which is what pins stopFunnel's `kill(-pid)`.
@@ -28,9 +32,11 @@ import { spawn } from 'node:child_process';
 const args = process.argv.slice(2);
 const mode = process.env.FAKE_TAILSCALE_MODE || '';
 
-if (process.env.FAKE_TAILSCALE_ARGV_LOG) {
-  appendFileSync(process.env.FAKE_TAILSCALE_ARGV_LOG, JSON.stringify(args) + '\n');
-}
+const logEvent = (ev) => {
+  if (!process.env.FAKE_TAILSCALE_ARGV_LOG) return;
+  appendFileSync(process.env.FAKE_TAILSCALE_ARGV_LOG, JSON.stringify({ t: Date.now(), pid: process.pid, ...ev }) + '\n');
+};
+logEvent({ event: 'invoke', argv: args });
 
 // Trailing dot included on purpose — the real CLI reports the name
 // fully-qualified, and stripping it is what code-hub's derivation must do.
@@ -77,7 +83,10 @@ if (args[0] === 'funnel') {
   process.stdout.write(`https://${DNS_NAME.replace(/\.$/, '')}/\n`);
   process.stdout.write(`|-- proxy ${target}\n\n`);
   process.stdout.write('Press Ctrl+C to exit.\n');
-  process.on('SIGTERM', () => process.exit(0));
+  const quit = () => { logEvent({ event: 'exit', argv: args }); process.exit(0); };
+  if (mode === 'ignore-sigterm') process.on('SIGTERM', () => {});      // only SIGKILL reaps it
+  else if (mode === 'slow-exit') process.on('SIGTERM', () => setTimeout(quit, 300));
+  else process.on('SIGTERM', quit);
   setInterval(() => {}, 1 << 30); // block
 } else {
   die(`unexpected subcommand ${JSON.stringify(args[0])}`);

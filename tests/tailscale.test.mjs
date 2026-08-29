@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as tailscale from '../src/tailscale.js';
-import { fakeTailscaleBin, waitFor, pidAlive } from './helpers.mjs';
+import { fakeTailscaleBin, waitFor, pidAlive, tailscaleEvents, funnelEvents } from './helpers.mjs';
 
 // Fresh temp file per use, cleaned up by the caller's t.after.
 const tmpFile = async (name) => path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-ts-')), name);
@@ -91,10 +91,9 @@ test('startFunnel funnels exactly the port it was given', async (t) => {
   tailscale.stopFunnel(pid);
   await waitFor(() => !pidAlive(pid));
 
-  const funnelArgv = (await fs.readFile(log, 'utf8')).trim().split('\n')
-    .map((l) => JSON.parse(l)).find((a) => a[0] === 'funnel');
-  assert.ok(funnelArgv, 'the funnel subcommand was invoked');
-  assert.equal(funnelArgv[funnelArgv.length - 1], 'http://localhost:54321');
+  const [invoked] = funnelEvents(await tailscaleEvents(log), 'invoke');
+  assert.ok(invoked, 'the funnel subcommand was invoked');
+  assert.equal(invoked.argv[invoked.argv.length - 1], 'http://localhost:54321');
 });
 
 // stopFunnel signals the process GROUP (`kill(-pid)`), not just the leader.
@@ -136,8 +135,42 @@ test('waitForExit returns only once the funnel child is actually gone', async (t
   await tailscale.waitForExit(pid);
   assert.equal(pidAlive(pid), false, 'the child is dead by the time waitForExit resolves');
 
-  // A pid that is already gone (or absent) resolves rather than spinning to
-  // the timeout — every teardown path calls this.
+  // A pid that is already gone (or absent) resolves PROMPTLY rather than
+  // spinning to the 5s timeout — share() awaits this on every re-share, so a
+  // full-timeout wait would stall the request by five seconds.
+  const t0 = Date.now();
   await tailscale.waitForExit(pid);
   await tailscale.waitForExit(null);
+  assert.ok(Date.now() - t0 < 500, `returned promptly for a dead/absent pid (took ${Date.now() - t0}ms)`);
+});
+
+// A funnel that ignores SIGTERM must not be waited on forever: the caller is
+// about to spawn a replacement, and the old process still owns the node's
+// serve config until it dies.
+test('waitForExit escalates to SIGKILL when the funnel ignores SIGTERM', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  process.env.FAKE_TAILSCALE_MODE = 'ignore-sigterm';
+  t.after(() => { delete process.env.FAKE_TAILSCALE_MODE; });
+
+  const { pid } = await tailscale.startFunnel(12345);
+  t.after(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } });
+
+  tailscale.stopFunnel(pid);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(pidAlive(pid), 'the fixture really does ignore SIGTERM');
+
+  await tailscale.waitForExit(pid, { timeoutMs: 200 });
+  await waitFor(() => !pidAlive(pid)); // only a SIGKILL can have done this
+});
+
+// The guard on the one path that signals a pid this process did not spawn.
+test('looksLikeFunnel tells a funnel child from an unrelated process', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  delete process.env.FAKE_TAILSCALE_MODE;
+  const { pid } = await tailscale.startFunnel(12345);
+  t.after(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } });
+
+  assert.equal(tailscale.looksLikeFunnel(pid), true);
+  assert.equal(tailscale.looksLikeFunnel(process.pid), false, 'this test runner is not a funnel');
+  assert.equal(tailscale.looksLikeFunnel(null), false);
 });

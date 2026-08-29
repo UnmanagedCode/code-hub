@@ -86,10 +86,13 @@ When embedded, code-hub surfaces the host `code-conductor` checkout as an **alwa
 ```sh
 npm test                   # node:test suite (no network, uses fakes)
 RUN_REAL_CLOUDFLARED=1 npm test   # also runs the real-cloudflared smoke test
-RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke test — this
-                                  #   opens a REAL public Funnel on this node for a
-                                  #   few seconds (it pins that killing the funnel
-                                  #   process removes the funnel config)
+RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke tests — these
+                                  #   open a REAL public Funnel on this node for a
+                                  #   few seconds (they pin that killing the funnel
+                                  #   process removes the funnel config). The
+                                  #   end-to-end gate check additionally needs this
+                                  #   host to resolve its own MagicDNS name, and
+                                  #   skips with a reason when it can't.
 ```
 
 ## Docs

@@ -1,4 +1,5 @@
 import { spawn, execFile } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
 import { pidAlive } from './state.js';
 
 // Binary is overridable so tests can inject a fake that prints canned status
@@ -109,6 +110,30 @@ export function startFunnel(port) {
       timer.unref();
     }, reject);
   });
+}
+
+// Whether `pid` really is a tailscale funnel child, used to guard the one path
+// that signals a pid this process did not spawn: pids read back from
+// state.json can have been recycled since the code-hub that wrote them died,
+// and signalling a recycled pid means SIGTERMing (and, if it doesn't die,
+// SIGKILLing) an unrelated process group on the user's machine.
+//
+// Answers TRUE when it cannot tell — a host with no /proc (macOS, Windows).
+// That direction is deliberate: failing closed there would mean never reaping
+// a genuinely orphaned funnel on those hosts, leaving a PUBLIC URL up, which
+// is the worse of the two outcomes and is the entire reason the sweep exists.
+// On Linux — where code-hub actually runs Tailscale today — the check is real.
+const HAS_PROC = existsSync('/proc/self/cmdline');
+export function looksLikeFunnel(pid) {
+  if (!pid) return false;
+  if (!HAS_PROC) return true;
+  let argv;
+  try {
+    argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+  } catch {
+    return false; // gone, or unreadable — either way, don't signal a stranger
+  }
+  return argv.includes('funnel') && argv.some((a) => a.includes('tailscale'));
 }
 
 // SIGTERM to the process group. A twin of tunnel.stopTunnel by design rather

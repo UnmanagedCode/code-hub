@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +20,25 @@ export const fakeCloudflaredBin = path.join(FIXTURES, 'fake-cloudflared.mjs');
 // test that boots the server must inject this — otherwise list() shells out to
 // the real binary on every poll and `tailscaleAvailable` becomes host-dependent.
 export const fakeTailscaleBin = path.join(FIXTURES, 'fake-tailscale.mjs');
+
+// A detached stand-in for an orphaned tailscale funnel. Deliberately the REAL
+// fixture rather than a `sleep`: appManager verifies a persisted pid really is
+// a funnel before signalling it (pids can be recycled across a reboot), so a
+// generic process would — correctly — not be killed.
+export function spawnFakeFunnel(port = 39999, env = {}) {
+  return spawn(fakeTailscaleBin, ['funnel', '--bg=false', '--yes', `http://localhost:${port}`],
+    { detached: true, stdio: 'ignore', env: { ...process.env, ...env } });
+}
+
+// Parse a FAKE_TAILSCALE_ARGV_LOG: one JSON line per event,
+// `{ t, pid, event: 'invoke'|'exit', argv }`.
+export async function tailscaleEvents(logPath) {
+  const raw = await fs.readFile(logPath, 'utf8').catch(() => '');
+  return raw.trim() ? raw.trim().split('\n').map((l) => JSON.parse(l)) : [];
+}
+
+export const funnelEvents = (events, event) =>
+  events.filter((e) => e.event === event && e.argv?.[0] === 'funnel');
 
 // A loopback alias used as a "third address" in bind tests: distinct from
 // 127.0.0.1, still covered by a 0.0.0.0 wildcard bind, and purely local (it
