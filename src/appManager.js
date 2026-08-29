@@ -7,6 +7,7 @@ import {
 import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
+import * as tailscale from './tailscale.js';
 import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s } from './net.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
@@ -34,14 +35,25 @@ function isUnderRoot(root, dir) {
 
 export async function init() {
   store = await state.load();
-  await state.reconcile(store); // drop dead pids / tunnels; adopt live ones
-  // A persisted tunnel from before a restart points at an auth proxy that no
+  // reconcile drops records whose app pid is dead — which, for an app that
+  // died in the same window code-hub did, would delete the only record of a
+  // still-running share child. It hands those back instead of stranding them
+  // (see state.reconcile) and they are killed here, BEFORE the sweep below,
+  // because their records no longer exist to be swept.
+  const { strandedTunnels } = await state.reconcile(store);
+  for (const { id, tunnel: t } of strandedTunnels) killShareChild(id, t, { verify: true });
+  // A persisted share from before a restart points at an auth proxy that no
   // longer exists (in-process, gone with the old code-hub). Tear the orphaned
-  // cloudflared tunnel down so it can't serve a broken URL — the share simply
-  // needs re-creating (the UI's Share button reappears).
+  // child down so it can't serve a broken URL — the share simply needs
+  // re-creating (the UI's Share button reappears). Routed through
+  // teardownShare so the per-kind kill lives in one place; at init the
+  // proxies/qrCache maps are empty, so it does exactly the same thing.
   let mutated = false;
-  for (const rec of Object.values(store.apps)) {
-    if (rec.tunnel) { tunnel.stopTunnel(rec.tunnel.pid); rec.tunnel = null; mutated = true; }
+  for (const [id, rec] of Object.entries(store.apps)) {
+    // `verify`: these pids come off disk, so they may have been recycled since
+    // the process that wrote them died — every other teardown site signals a
+    // child this process spawned and needs no check.
+    if (rec.tunnel) { teardownShare(id, rec, { verify: true }); mutated = true; }
   }
   // Embedded as a code-conductor plugin: the host conductor is already
   // running (started by something else), so synthesize a record for it with
@@ -97,14 +109,111 @@ export async function init() {
   if (mutated) await persist();
 }
 
-// Tear down a share: close the auth proxy (if any) and kill the cloudflared
-// tunnel. Leaves rec.tunnel null. Safe to call when nothing is shared.
-function teardownShare(id, rec) {
+// THE authority for "which app holds the node's Tailscale Funnel". Funnel
+// occupies port 443 machine-wide, so exactly one can exist, and every 409 is
+// derived from this — nothing scans the app records for a holder. Two sources
+// of truth is precisely what went wrong before: any site that dropped a record
+// without telling the slot left it naming a share that no longer existed,
+// wedging the feature until a restart.
+//
+//   { id, pid, pending }
+//     pending — the share is still coming up: no pid yet, no record yet.
+//               share() claims this SYNCHRONOUSLY before its first await,
+//               because rec.tunnel isn't written until the funnel is up (up to
+//               the full readiness backstop), so two concurrent requests would
+//               otherwise both pass any records-based check. A pending slot
+//               blocks its OWN app too — a second concurrent share of A would
+//               orphan the first one's proxy and funnel child.
+//     pid     — the funnel child this slot names, once it is up.
+//
+// Released precisely when the child it NAMES is killed (see killShareChild),
+// never on an id match: share() claims the slot and then tears down that same
+// app's previous funnel, so an id-keyed release would drop the claim it just
+// made. Keying on pid makes teardownShare the single release point, which is
+// what lets "route every record-dropping site through teardownShare" close the
+// whole class rather than three instances of it.
+let funnelSlot = null;
+
+// pid of the most recently SIGTERMed tailscale funnel, while it may still be
+// exiting. The CLI reverts the node's WHOLE serve config when it exits, not
+// just its own registration, so a funnel spawned while an older one is still
+// shutting down can have its URL torn out from under it moments later. The
+// next tailscale share waits this out (see share()). Covers both re-sharing
+// one app and unsharing A then sharing B.
+let expiringFunnelPid = null;
+
+// SIGTERM the child publishing a share, dispatching on its kind. Split out of
+// teardownShare so init() can also kill a child whose record reconcile already
+// dropped — at that point there is no record left to tear down, only a pid.
+//
+// `verify` guards the ONLY case where the pid did not come from a child we
+// spawned in this process: pids read back from state.json can have been
+// recycled across a reboot, and signalling a recycled pid would SIGTERM (and,
+// on an unresponsive one, SIGKILL) an unrelated process group on the user's
+// machine. See tailscale.looksLikeFunnel.
+function killShareChild(id, t, { verify = false } = {}) {
+  if (!t) return;
+  if (t.kind === 'tailscale') {
+    if (verify && !tailscale.looksLikeFunnel(t.pid)) {
+      console.error(`[appManager] ${id}: persisted funnel pid ${t.pid} is not a tailscale funnel (recycled?) — not signalling it`);
+    } else {
+      tailscale.stopFunnel(t.pid);
+      if (t.pid) expiringFunnelPid = t.pid;
+    }
+    if (funnelSlot && !funnelSlot.pending && funnelSlot.pid === t.pid) funnelSlot = null;
+  } else {
+    tunnel.stopTunnel(t.pid);
+  }
+}
+
+// Tear down a share: close the auth proxy (if any) and kill the child that
+// publishes it. Leaves rec.tunnel null. Safe to call when nothing is shared.
+// A tailscale funnel runs in the foreground, so SIGTERM is the whole teardown
+// — the CLI removes its own funnel config on exit (see src/tailscale.js).
+//
+// EVERY site that drops or replaces a record carrying a share must come
+// through here — init's sweep, list()'s prune and reap, stop(), start()'s
+// replacement of a dead app's record, unshare(). That is the single-authority
+// rule that keeps funnelSlot from ever naming a share that no longer exists.
+//
+// Synchronous, so the in-memory maps are consistent the instant it returns.
+// The SIGTERM it sends is NOT awaited, though, so the killed child may still
+// be exiting afterwards — which matters only for tailscale, where a lingering
+// exit would revert the node's serve config: `expiringFunnelPid` records it
+// and the next tailscale share waits for it.
+function teardownShare(id, rec, opts) {
   const proxy = proxies.get(id);
   if (proxy) { proxy.close(); proxies.delete(id); }
-  if (rec?.tunnel) tunnel.stopTunnel(rec.tunnel.pid);
+  if (rec?.tunnel) killShareChild(id, rec.tunnel, opts);
   if (rec) rec.tunnel = null;
   qrCache.delete(id);
+}
+
+// Free the slot when the funnel it names has died on its own (an OOM kill, a
+// stray kill) — refusing every other app on behalf of a funnel that no longer
+// exists would wedge the feature until a restart. A pending claim is never
+// stale: its share() call is still running.
+function reapFunnelSlot() {
+  if (!funnelSlot || funnelSlot.pending || state.pidAlive(funnelSlot.pid)) return;
+  const rec = store.apps[funnelSlot.id];
+  if (rec?.tunnel) teardownShare(funnelSlot.id, rec); // drops the stale URL/creds/QR too
+  funnelSlot = null;
+}
+
+function tailscaleUnavailable() {
+  const e = new Error('tailscale is not available — start tailscaled and log in to share via a Tailscale Funnel URL');
+  e.statusCode = 501;
+  return e;
+}
+
+// Which app blocks a tailscale share of `id`, or null when nothing does.
+// Reads funnelSlot ONLY. A slot held by this same app does not block — that is
+// a re-share, which replaces it.
+function funnelBlockedBy(id) {
+  reapFunnelSlot();
+  if (!funnelSlot) return null;
+  if (funnelSlot.pending) return funnelSlot.id; // blocks everyone, its own app included
+  return funnelSlot.id === id ? null : funnelSlot.id;
 }
 
 async function persist() {
@@ -172,6 +281,16 @@ export async function list() {
       // share/creds-edit/auth-toggle, not per poll) — so a full UI refresh (which
       // wipes the client's in-memory state.share) still shows the QR and Open's
       // magic-link. Omitted for a no-auth share (no token path) or a gone proxy.
+      // A tailscale funnel that died on its own (OOM kill, a stray kill) leaves
+      // a record advertising a public URL that answers nothing — and keeps
+      // refusing every other app's tailscale share on behalf of a holder that
+      // holds nothing. Reap it on the poll that notices, before anything is
+      // built from it. (A LAN share has pid null by design and a cloudflared
+      // tunnel is untouched here — only the tailscale slot has a machine-wide
+      // consequence worth a per-poll probe.)
+      if (rec.tunnel?.kind === 'tailscale' && !state.pidAlive(rec.tunnel.pid)) {
+        teardownShare(base.id, rec); mutated = true;
+      }
       if (rec.tunnel) {
         const proxy = proxies.get(base.id);
         const url = rec.tunnel.url;
@@ -203,6 +322,12 @@ export async function list() {
           status = rt ? rt.status : 'running'; // no runtime ⇒ adopted after restart
         } else {
           // Died without our runtime noticing (e.g. after a code-hub restart).
+          // Tear the share down BEFORE dropping the record: the record holds
+          // the only copy of the share child's pid, so deleting it first would
+          // strand that child with nothing left able to kill it — a tailscale
+          // funnel would keep 443 published in front of a proxy that is about
+          // to close, and would block every other app's share forever.
+          teardownShare(base.id, rec);
           delete store.apps[base.id]; mutated = true;
           status = 'stopped'; port = urls = startedSha = undefined; tunnelInfo = null;
         }
@@ -251,7 +376,7 @@ export async function list() {
   if (mutated) await persist();
 
   entries.sort((a, b) => a.id.localeCompare(b.id));
-  return { cloudflaredAvailable: await tunnel.available(), apps: entries };
+  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), apps: entries };
 }
 
 async function findDiscovered(id) {
@@ -269,6 +394,13 @@ export async function start(id) {
   if (existing && state.pidAlive(existing.pid)) {
     const e = new Error(`'${id}' is already running`); e.statusCode = 409; throw e;
   }
+  // Past that guard the app's pid is dead, but its SHARE child may not be:
+  // the record below is overwritten wholesale with `tunnel: null`, which would
+  // drop the only reference to a live funnel — orphaning it on 443 and leaving
+  // the slot naming an app with no share, blocking every future tailscale
+  // share until a restart. Same single-authority rule as every other site that
+  // drops a record: tear the share down first.
+  if (existing?.tunnel) teardownShare(id, existing);
   const app = await findDiscovered(id);
   // A manifest `port` pins the app's port for this checkout. projects.js already
   // nulls it for worktrees, so this is only ever set for a default checkout.
@@ -324,7 +456,7 @@ export async function restart(id) {
   return start(id);
 }
 
-// Share a running app behind a local auth proxy. Two modes:
+// Share a running app behind a local auth proxy. Three modes:
 // - 'tunnel' (default): cloudflared points at the auth proxy (not the app),
 //   so the public *.trycloudflare.com URL goes through it. Always gated.
 // - 'lan': the auth proxy itself binds 0.0.0.0 instead of loopback, so other
@@ -334,6 +466,11 @@ export async function restart(id) {
 //   URL is the plain proxy URL. `tls` (LAN only, default on — see
 //   lanTlsDefault) wraps the proxy in HTTPS with a per-share self-signed cert
 //   so the LAN hop is encrypted; set it false for plain HTTP.
+// - 'tailscale': a Tailscale Funnel points at the auth proxy, publishing the
+//   node's MagicDNS name (https://<machine>.<tailnet>.ts.net) — public, and
+//   unlike cloudflared's random hostname it is stable across restarts. Always
+//   gated. Funnel occupies port 443 machine-wide, so only ONE tailscale share
+//   can exist at a time (409 naming the holder).
 // For a gated share, a fresh token + password are generated per share, kept
 // in memory only (see the `proxies` map). The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
@@ -341,12 +478,12 @@ export async function restart(id) {
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
 export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
-  if (mode !== 'tunnel' && mode !== 'lan') {
-    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel' or 'lan'`); e.statusCode = 400; throw e;
+  if (mode !== 'tunnel' && mode !== 'lan' && mode !== 'tailscale') {
+    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel', 'lan' or 'tailscale'`); e.statusCode = 400; throw e;
   }
   if (typeof auth !== 'boolean') { const e = new Error("'auth' must be a boolean"); e.statusCode = 400; throw e; }
-  if (mode === 'tunnel' && auth === false) {
-    const e = new Error('authentication cannot be disabled for tunnel shares'); e.statusCode = 400; throw e;
+  if ((mode === 'tunnel' || mode === 'tailscale') && auth === false) {
+    const e = new Error(`authentication cannot be disabled for ${mode} shares`); e.statusCode = 400; throw e;
   }
   if (tls !== undefined && typeof tls !== 'boolean') { const e = new Error("'tls' must be a boolean"); e.statusCode = 400; throw e; }
   const rec = store.apps[id];
@@ -435,6 +572,84 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
+  if (mode === 'tailscale') {
+    const blocker = funnelBlockedBy(id);
+    if (blocker) {
+      // No claim is made on this path, so this await races nothing — and
+      // "tailscale isn't available" is the more actionable message when both
+      // are true, so it is reported in preference to the 409.
+      if (!(await tailscale.available())) throw tailscaleUnavailable();
+      const e = new Error(blocker === id
+        ? `'${id}' already has a tailscale share starting — wait for it to come up before sharing again`
+        : `'${blocker}' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide, so only one is possible at a time; unshare it first`);
+      e.statusCode = 409; throw e;
+    }
+    // Claim the slot SYNCHRONOUSLY — no await between the check above and
+    // this line, so two concurrent requests cannot both get here.
+    const prior = funnelSlot; // null, or this app's own held slot (a re-share)
+    funnelSlot = { id, pid: null, pending: true };
+    let committed = false;
+    try {
+      if (!(await tailscale.available())) throw tailscaleUnavailable();
+      teardownShare(id, rec); // replace any existing share
+
+      // A funnel still shutting down reverts the node's WHOLE serve config
+      // when it finally exits, which would silently take the new funnel's URL
+      // with it. Wait it out rather than racing it.
+      if (expiringFunnelPid) {
+        await tailscale.waitForExit(expiringFunnelPid);
+        expiringFunnelPid = null;
+      }
+
+      // No `tls` option: tailscaled terminates TLS on-machine and forwards plain
+      // HTTP here, exactly as cloudflared does (see authproxy.js).
+      const proxy = await startAuthProxy(rec.port);
+      let url, pid;
+      try {
+        ({ url, pid } = await tailscale.startFunnel(proxy.port));
+      } catch (e) {
+        proxy.close(); // don't leak the proxy if the funnel failed to come up
+        throw e;
+      }
+      // This flight has been in the air for as long as the readiness backstop
+      // allows, and `rec` is the record object captured before any of it. While
+      // the slot was `pending` it carried NO pid, so killShareChild's pid match
+      // could not protect it — meanwhile stop(), list()'s prune and start() are
+      // all free to drop or replace store.apps[id]. Writing on regardless would
+      // attach a LIVE public funnel to an object the store no longer holds:
+      // referenced by nothing, so unshare/stop cannot reach it, never persisted
+      // so a restart loses it entirely, and — being alive — never reaped by
+      // funnelBlockedBy, which would 409 every future share on every app.
+      if (store.apps[id] !== rec) {
+        tailscale.stopFunnel(pid);
+        expiringFunnelPid = pid;
+        proxy.close();
+        const e = new Error(`'${id}' was stopped or replaced while its tailscale share was starting — share it again`);
+        e.statusCode = 409; throw e;
+      }
+      proxies.set(id, proxy);
+      rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
+      funnelSlot = { id, pid, pending: false };
+      // Past this point the funnel is up and recorded, so the slot names
+      // reality: a later failure (persist, QR render) must NOT hand it back.
+      committed = true;
+      await persist();
+
+      const authUrl = withToken(url, proxy.token);
+      return { kind: 'tailscale', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+    } catch (e) {
+      // Hand the slot back to whoever held it, if their funnel survived this
+      // attempt: a refusal thrown BEFORE teardownShare (an unavailable daemon)
+      // leaves the previous share fully intact, and freeing the slot there
+      // would let another app start a competing funnel in front of it. If the
+      // old funnel is gone — torn down above, or it was never there — free it.
+      // Once `committed`, neither applies: THIS flight's funnel is live and
+      // recorded, so the slot already names reality and must be left alone.
+      if (!committed) funnelSlot = (prior && !prior.pending && state.pidAlive(prior.pid)) ? prior : null;
+      throw e;
+    }
+  }
+
   if (!(await tunnel.available())) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
@@ -496,16 +711,16 @@ export async function updateShareCredentials(id, { username, password } = {}) {
 
 // Flip a live LAN share's auth gate in place — mutates the proxy (see
 // authproxy.js's setAuth), so the share URL/token/proxy port never change.
-// Tunnel shares are always gated and reject this (mirrors the mode==='tunnel'
-// guard in share()); a token/authUrl handed out earlier stays valid either
-// way since the proxy never regenerates them on a toggle.
+// Tunnel and tailscale shares are always gated and reject this (mirrors the
+// same guard in share()); a token/authUrl handed out earlier stays valid
+// either way since the proxy never regenerates them on a toggle.
 export async function setShareAuth(id, enabled) {
   if (typeof enabled !== 'boolean') { const e = new Error("'enabled' must be a boolean"); e.statusCode = 400; throw e; }
   const rec = store.apps[id];
   const proxy = proxies.get(id);
   if (!rec?.tunnel || !proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
   if (rec.tunnel.kind !== 'lan') {
-    const e = new Error('authentication cannot be toggled for tunnel shares — tunnel shares are always gated'); e.statusCode = 400; throw e;
+    const e = new Error(`authentication cannot be toggled for '${rec.tunnel.kind}' shares — they are always gated`); e.statusCode = 400; throw e;
   }
   proxy.setAuth(enabled);
   rec.tunnel.auth = enabled;

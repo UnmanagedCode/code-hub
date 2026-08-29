@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice } from '../public/shareState.js';
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote } from '../public/shareState.js';
 
 // These cover the client behaviors the server tests can't: how sharePanel
 // resolves the Open link and QR between the in-memory share response (state.
@@ -119,4 +119,36 @@ test('resolveFixedPortNotice: nothing to say without a LAN fixed-port fallback',
   assert.equal(resolveFixedPortNotice(LAN_APP, { kind: 'lan', fixedPortFallback: false, fixedPortHolder: null }), null);
   // A tunnel share never has a fixed-port fallback to report.
   assert.equal(resolveFixedPortNotice(LAN_APP, { kind: 'tunnel', fixedPortFallback: true, fixedPortHolder: 'app' }), null);
+});
+
+// --- resolveCredNote: the panel's "how is this reachable" line ---
+
+// The regression this feature exists to avoid: before resolveCredNote, the
+// panel branched on `kind !== 'lan'`, so a tailscale share rendered as a
+// cloudflared tunnel — wrong about who terminates TLS and wrong about whether
+// the URL survives a re-share.
+test('resolveCredNote: a tailscale share names Tailscale, never "via public tunnel"', () => {
+  const note = resolveCredNote({ kind: 'tailscale', url: 'https://node.tailnet.ts.net', auth: true });
+  assert.doesNotMatch(note, /public tunnel/);
+  assert.match(note, /Tailscale Funnel/);
+});
+
+test('resolveCredNote: a cloudflared tunnel share still reads "via public tunnel"', () => {
+  assert.equal(resolveCredNote({ kind: 'tunnel', url: 'https://x.trycloudflare.com', auth: true }), 'via public tunnel');
+  // Kind absent (a pre-kind share response) keeps the historical default.
+  assert.equal(resolveCredNote({ url: 'https://x.trycloudflare.com' }), 'via public tunnel');
+});
+
+// The four LAN arms (auth x tls), pinned exactly as they read today: the
+// no-auth ones must keep saying anyone on the network can reach the app, and
+// the plain-HTTP one must keep saying credentials are not encrypted.
+test('resolveCredNote: the four LAN arms are unchanged by the tailscale split', () => {
+  assert.equal(resolveCredNote({ kind: 'lan', url: 'https://192.0.2.1:5001', auth: true }),
+    'via LAN (HTTPS, self-signed — your browser warns on first visit)');
+  assert.equal(resolveCredNote({ kind: 'lan', url: 'http://192.0.2.1:5001', auth: true }),
+    'via LAN (plain HTTP — credentials are not encrypted in transit)');
+  assert.equal(resolveCredNote({ kind: 'lan', url: 'https://192.0.2.1:5001', auth: false }),
+    'via LAN (HTTPS, self-signed — your browser warns on first visit), no authentication — anyone on the network can reach this app');
+  assert.equal(resolveCredNote({ kind: 'lan', url: 'http://192.0.2.1:5001', auth: false }),
+    'via LAN, no authentication — anyone on the network can reach this app');
 });

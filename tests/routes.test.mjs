@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import { createServer } from '../server.js';
@@ -11,7 +12,7 @@ import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
 import net from 'node:net';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, spawnFakeFunnel, tailscaleEvents, funnelEvents, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
@@ -28,6 +29,7 @@ const httpsGet = (port, path, headers = {}) => new Promise((resolve, reject) => 
 
 async function boot(root) {
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   await appManager.init();
   const server = createServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -531,6 +533,209 @@ test('share with an invalid mode → 400', async (t) => {
   assert.equal(res.status, 400);
 });
 
+// --- Tailscale Funnel share (mode: 'tailscale') ---
+
+// Bring an app up and wait for it to serve, so a share has something behind it.
+const startApp = async (base, id = 'app') => {
+  await j(base, 'POST', `/api/apps/${id}/start`);
+  await waitFor(async () => ['ready', 'running'].includes((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === id).status));
+};
+
+test('share mode=tailscale publishes the MagicDNS URL through a gated proxy', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+
+  // The pill and the tailscale Share button are gated on this being true; a
+  // hardcoded false would disable the whole feature on every host, silently.
+  assert.equal((await j(base, 'GET', '/api/apps')).body.tailscaleAvailable, true);
+
+  const argvLog = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-argv-')), 'argv.log');
+  process.env.FAKE_TAILSCALE_ARGV_LOG = argvLog;
+  t.after(async () => { delete process.env.FAKE_TAILSCALE_ARGV_LOG; await fs.rm(path.dirname(argvLog), { recursive: true, force: true }); });
+
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.kind, 'tailscale');
+  // The node's MagicDNS name, trailing dot stripped and no path appended —
+  // NOT a trycloudflare hostname.
+  assert.match(res.body.url, /^https:\/\/[^/]+\.ts\.net$/);
+  assert.equal(res.body.auth, true);
+  assert.match(res.body.authUrl, /^https:\/\/[^/]+\.ts\.net\?__hubauth=[\w-]+$/);
+  assert.match(res.body.qrSvg, /<svg/);
+
+  const app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel.kind, 'tailscale');
+  assert.equal(app.tunnel.url, res.body.url);
+  assert.equal(app.tunnel.username, 'hub');
+  assert.equal(app.tunnel.password, res.body.password);
+
+  // The proxy tailscaled points at is gated AND plain HTTP: a tailscale share
+  // never passes `tls` (tailscaled terminates TLS on-machine and forwards
+  // http here, where a `Secure` cookie would be dropped).
+  const pp = app.tunnel.proxyPort;
+  const anon = await fetch(`http://127.0.0.1:${pp}/`);
+  assert.equal(anon.status, 401);
+  assert.match(anon.headers.get('www-authenticate') || '', /Basic/);
+  const authed = await fetch(`http://127.0.0.1:${pp}/`, { headers: { authorization: basicAuth('hub', res.body.password) } });
+  assert.equal(authed.status, 200);
+  assert.equal(await authed.text(), 'ok');
+
+  // The funnel must point at the GATED proxy, not at the app — funnelling the
+  // app's own port would publish it with no gate at all. Read from the argv the
+  // fake received, since every assertion above works off proxyPort directly and
+  // would pass even if the funnel targeted something else entirely.
+  const [invoked] = funnelEvents(await tailscaleEvents(argvLog), 'invoke');
+  assert.ok(invoked, 'the funnel subcommand was invoked');
+  assert.equal(invoked.argv[invoked.argv.length - 1], `http://localhost:${pp}`);
+  assert.notEqual(pp, app.port, 'the gated proxy is on its own port, not the app port');
+});
+
+// Funnel occupies port 443 of the node, machine-wide: a second one would
+// replace the first rather than coexist. Re-sharing the SAME app must still
+// replace normally, though — the guard excludes its own record.
+test('a second tailscale share is refused with 409 naming the holder; re-sharing the same app is not', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+
+  const clash = await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' });
+  assert.equal(clash.status, 409);
+  assert.match(clash.body.error, /'app'/); // names the holder, so the user knows what to unshare
+
+  // The refusal must not have torn the holder's share down.
+  const held = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+  assert.equal(held.tunnel.kind, 'tailscale');
+
+  const reshare = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(reshare.status, 200, 're-sharing the holder replaces its own share instead of colliding with it');
+});
+
+test('share mode=tailscale, auth=false → 400 (tailscale shares are always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale', auth: false });
+  assert.equal(res.status, 400);
+  // No share was created by the refused call.
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel, null);
+});
+
+test('PATCH share/auth on a tailscale share → 400 (always gated)', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  await startApp(base);
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const res = await j(base, 'PATCH', '/api/apps/app/share/auth', { enabled: false });
+  assert.equal(res.status, 400);
+  // Still gated afterwards — the refusal didn't half-apply.
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel.auth, true);
+});
+
+test('tailscale unavailable → share 501 and tailscaleAvailable:false', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  process.env.CODEHUB_TAILSCALE_BIN = '/nonexistent/tailscale';
+  t.after(async () => {
+    process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base);
+  await startApp(base, 'other');
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(res.status, 501);
+  assert.equal((await j(base, 'GET', '/api/apps')).body.tailscaleAvailable, false);
+
+  // The refused attempt must not leave the Funnel slot claimed: it never got
+  // one, and holding it would lock every app out until a code-hub restart.
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' })).status, 200);
+  await appManager.unshare('other');
+});
+
+// The funnel child is the ONLY thing holding the node's funnel config, so a
+// teardown that leaves it alive leaves a public URL live in front of a dead
+// proxy. Both teardown routes must kill it.
+test('unshare and stop each kill the tailscale funnel child', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const funnelPid = async () => {
+    const raw = await fs.readFile(path.join(storeRoot(), 'state.json'), 'utf8');
+    return JSON.parse(raw).apps.app.tunnel.pid;
+  };
+
+  await startApp(base);
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const pid1 = await funnelPid();
+  assert.ok(pidAlive(pid1));
+  await j(base, 'DELETE', '/api/apps/app/share');
+  await waitFor(() => !pidAlive(pid1));
+  assert.equal((await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app').tunnel, null);
+
+  // Same again, torn down via stop() rather than unshare().
+  await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  const pid2 = await funnelPid();
+  assert.ok(pidAlive(pid2));
+  await j(base, 'POST', '/api/apps/app/stop');
+  await waitFor(() => !pidAlive(pid2));
+});
+
+// Twin of the cloudflared orphan test: a funnel child survives a code-hub
+// restart (it is detached), so init() must kill it — otherwise the node keeps
+// a public funnel pointed at a proxy that died with the old process.
+test('init tears down a tailscale funnel orphaned by a code-hub restart', async (t) => {
+  const root = await mkRoot();
+  const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  const funnelChild = spawnFakeFunnel();
+  t.after(async () => {
+    for (const c of [appChild, funnelChild]) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
+    await rmRoot(root);
+  });
+
+  const store = { apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: appChild.pid, pgid: appChild.pid, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { kind: 'tailscale', url: 'https://node.tailnet.ts.net', pid: funnelChild.pid, username: 'hub', proxyPort: 5001 },
+  } } };
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify(store));
+
+  await appManager.init(); // simulates a fresh code-hub after restart
+
+  const { apps } = await appManager.list();
+  const demo = apps.find((a) => a.id === 'demo');
+  assert.ok(demo, 'app with a live pid is kept');
+  assert.equal(demo.tunnel, null, 'orphaned funnel record is cleared → Share reappears');
+  await waitFor(() => !pidAlive(funnelChild.pid)); // orphaned funnel killed
+  assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
+});
+
 test('init tears down a LAN share orphaned by a code-hub restart (pid: null)', async (t) => {
   const root = await mkRoot();
   // Stand-in for the app process only — a LAN share has no cloudflared child.
@@ -584,6 +789,402 @@ test('init tears down a share orphaned by a code-hub restart (needs-reshare)', a
   assert.equal(demo.tunnel, null, 'orphaned tunnel is cleared → Share reappears');
   await waitFor(() => !pidAlive(tunChild.pid)); // orphaned cloudflared killed
   assert.ok(pidAlive(appChild.pid), 'the app process itself is untouched');
+});
+
+// --- Tailscale funnel lifecycle: no path may strand a live funnel child ---
+
+// Reading the funnel pid off disk rather than from any API response — the pid
+// is deliberately not exposed in the App shape.
+const funnelPidOf = async (id) => {
+  const raw = await fs.readFile(path.join(storeRoot(), 'state.json'), 'utf8');
+  return JSON.parse(raw).apps[id]?.tunnel?.pid ?? null;
+};
+
+// The record is the ONLY place a funnel child's pid is written down. list()
+// dropping a dead app's record without tearing the share down first would
+// strand the funnel with nothing left able to kill it — 443 published in front
+// of a proxy that just closed, and every later tailscale share refused by a
+// holder that no longer exists. Driven through an ADOPTED record (live pid, no
+// runner runtime), which is what reaches that branch: an app started in this
+// process reports 'crashed'/'exited' instead.
+test('list() kills the funnel before dropping the record of an app that died unnoticed', async (t) => {
+  const root = await mkRoot();
+  const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(async () => {
+    try { process.kill(-appChild.pid, 'SIGKILL'); } catch { /* gone */ }
+    await rmRoot(root);
+  });
+
+  // A record code-hub adopts at startup: pid alive, no runtime, no share yet.
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify({ apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: appChild.pid, pgid: appChild.pid, port: 5000, urls: [], startedSha: null, startedAt: '', tunnel: null,
+  } } }));
+  const { server, base } = await boot(root);
+  t.after(() => server.close());
+
+  assert.equal((await j(base, 'POST', '/api/apps/demo/share', { mode: 'tailscale' })).status, 200);
+  const fpid = await funnelPidOf('demo');
+  assert.ok(pidAlive(fpid));
+
+  // The app dies on its own. The next poll notices and drops the record.
+  process.kill(-appChild.pid, 'SIGKILL');
+  await waitFor(() => !pidAlive(appChild.pid));
+  const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'demo');
+  assert.ok(!after || after.status === 'stopped', 'the dead app is no longer reported running');
+  await waitFor(() => !pidAlive(fpid)); // the funnel went with it
+
+  // And the slot it held is free again, not wedged by a vanished holder.
+  assert.equal((await funnelPidOf('demo')), null);
+});
+
+// reconcile drops a record whose APP pid is dead before init's sweep ever sees
+// it — so a code-hub killed alongside its app would leave the funnel with no
+// record anywhere holding its pid. Permanent public orphan.
+test('init kills a funnel whose record reconcile is about to drop (app died too)', async (t) => {
+  const root = await mkRoot();
+  const funnelChild = spawnFakeFunnel();
+  t.after(async () => {
+    try { process.kill(-funnelChild.pid, 'SIGKILL'); } catch { /* gone */ }
+    await rmRoot(root);
+  });
+
+  // A dead app pid (99 999 999 is not a live process) with a LIVE funnel pid.
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify({ apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: 99999999, pgid: 99999999, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { kind: 'tailscale', url: 'https://node.tailnet.ts.net', pid: funnelChild.pid, proxyPort: 5001 },
+  } } }));
+
+  await appManager.init(); // simulates a fresh code-hub after both died
+
+  const { apps } = await appManager.list();
+  assert.equal(apps.find((a) => a.id === 'demo'), undefined, 'the dead app record is dropped');
+  await waitFor(() => !pidAlive(funnelChild.pid)); // ...but not before its funnel was killed
+});
+
+// rec.tunnel isn't assigned until the funnel is up, so a guard that only
+// scanned the persisted records would let two concurrent requests both pass it
+// and both start a funnel — Funnel replaces rather than coexists, so one app's
+// panel would advertise a dead public URL with live credentials.
+test('two concurrent tailscale shares: exactly one wins, the other 409s', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+
+  const [a, b] = await Promise.all([
+    j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' }),
+    j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' }),
+  ]);
+  const codes = [a.status, b.status].sort();
+  assert.deepEqual(codes, [200, 409], 'one share wins the Funnel slot, the other is refused');
+
+  // Exactly one funnel record exists — the loser left nothing behind.
+  const apps = (await j(base, 'GET', '/api/apps')).body.apps;
+  const shared = apps.filter((x) => x.tunnel?.kind === 'tailscale');
+  assert.equal(shared.length, 1);
+});
+
+// A funnel can die on its own (OOM kill, a stray kill). Left unnoticed, list()
+// keeps serving credentials and a QR for a URL that answers nothing, and every
+// other app is refused on behalf of a holder that holds nothing.
+test('a funnel that dies on its own is reaped, and frees the slot for another app', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+
+  const fpid = await funnelPidOf('app');
+  process.kill(-fpid, 'SIGKILL'); // the funnel dies without code-hub doing it
+  await waitFor(() => !pidAlive(fpid));
+
+  // The stale share stops being advertised.
+  const holder = (await j(base, 'GET', '/api/apps')).body.apps.find((x) => x.id === 'app');
+  assert.equal(holder.tunnel, null, 'no URL/credentials/QR served for a funnel that is gone');
+});
+
+// share() must reap a dead holder ITSELF, not rely on a poll having happened
+// first — the UI can post a share between polls, and a 409 citing a funnel
+// that no longer exists would wedge the feature until a restart. Deliberately
+// no GET /api/apps anywhere in this test.
+test('a dead holder does not block the next share even with no poll in between', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+
+  const fpid = await funnelPidOf('app');
+  process.kill(-fpid, 'SIGKILL');
+  await waitFor(() => !pidAlive(fpid));
+
+  assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' })).status, 200);
+});
+
+// start() replaces a record wholesale with `tunnel: null`, and is reached only
+// once the app's own pid is dead — but the SHARE child can still be alive. The
+// record is the only reference to it, so overwriting without tearing down
+// orphans a public funnel AND leaves the slot naming an app that has no share:
+// neither unshare (no rec.tunnel to act on) nor stop can ever release it.
+test('restarting an app whose process died kills its still-live funnel first', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+  const fpid = await funnelPidOf('app');
+  assert.ok(pidAlive(fpid));
+
+  // The app dies on its own; the user hits Start again before any poll.
+  const appPid = JSON.parse(await fs.readFile(path.join(storeRoot(), 'state.json'), 'utf8')).apps.app.pid;
+  process.kill(-appPid, 'SIGKILL');
+  await waitFor(() => !pidAlive(appPid));
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+
+  await waitFor(() => !pidAlive(fpid)); // the orphan is gone, not stranded on 443
+  // ...and the slot it held is genuinely free, not merely unreferenced.
+  assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' })).status, 200);
+});
+
+// The exclusion that makes a re-share replace normally must not also let two
+// concurrent shares of the SAME app both proceed: the second would orphan the
+// first's proxy and funnel child, and that child's later exit reverts the
+// node's whole serve config, taking the surviving share's URL with it.
+test('two concurrent shares of the SAME app: only one funnel is ever started', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  const argvLog = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-argv-')), 'argv.log');
+  process.env.FAKE_TAILSCALE_ARGV_LOG = argvLog;
+  t.after(async () => {
+    delete process.env.FAKE_TAILSCALE_ARGV_LOG;
+    await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {});
+    server.close(); await rmRoot(root); await fs.rm(path.dirname(argvLog), { recursive: true, force: true });
+  });
+
+  await startApp(base, 'app');
+  const [a, b] = await Promise.all([
+    j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' }),
+    j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' }),
+  ]);
+  assert.deepEqual([a.status, b.status].sort(), [200, 409]);
+  assert.equal(funnelEvents(await tailscaleEvents(argvLog), 'invoke').length, 1,
+    'the losing request never spawned a second funnel');
+});
+
+// A refusal thrown BEFORE teardown leaves the previous share fully intact, so
+// releasing the slot there would let another app raise a competing funnel in
+// front of a share that is still live and still advertised.
+test('a re-share that fails before teardown leaves the old funnel AND its claim intact', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root);
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+  const fpid = await funnelPidOf('app');
+
+  // tailscaled bounces; the user re-shares the app that already holds the slot.
+  process.env.CODEHUB_TAILSCALE_BIN = '/nonexistent/tailscale';
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 501);
+  assert.ok(pidAlive(fpid), 'the refusal did not touch the live funnel');
+
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  const clash = await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' });
+  assert.equal(clash.status, 409, 'the still-live funnel still holds the slot');
+  assert.match(clash.body.error, /'app'/);
+});
+
+// The CLI reverts the node's WHOLE serve config as it exits, so a replacement
+// funnel spawned while the old one is still shutting down gets its URL revoked
+// moments later. Ordering is read from the fake's own event log rather than
+// from wall-clock in the test.
+test('a re-share waits for the previous funnel to finish exiting', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  const argvLog = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-argv-')), 'argv.log');
+  process.env.FAKE_TAILSCALE_ARGV_LOG = argvLog;
+  process.env.FAKE_TAILSCALE_MODE = 'slow-exit'; // ~300ms to exit after SIGTERM
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    delete process.env.FAKE_TAILSCALE_ARGV_LOG; delete process.env.FAKE_TAILSCALE_MODE;
+    await appManager.unshare('app').catch(() => {}); await appManager.stop('app').catch(() => {});
+    server.close(); await rmRoot(root); await fs.rm(path.dirname(argvLog), { recursive: true, force: true });
+  });
+
+  await startApp(base, 'app');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+  const first = await funnelPidOf('app');
+
+  await j(base, 'DELETE', '/api/apps/app/share');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+
+  const events = await tailscaleEvents(argvLog);
+  const starts = funnelEvents(events, 'invoke');
+  const exits = funnelEvents(events, 'exit');
+  assert.equal(starts.length, 2);
+  const firstExit = exits.find((e) => e.pid === first);
+  assert.ok(firstExit, 'the first funnel logged its exit');
+  assert.ok(starts[1].t >= firstExit.t,
+    'the replacement funnel started only after the previous one had finished exiting');
+  assert.equal(pidAlive(first), false);
+});
+
+// A persisted funnel pid can have been recycled while code-hub was down, and
+// the teardown path SIGTERMs then SIGKILLs a whole process GROUP — so an
+// unverified kill would take out an unrelated program on the user's machine.
+test('init does not signal a persisted funnel pid that is not a tailscale funnel', async (t) => {
+  const root = await mkRoot();
+  const bystander = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' }); // the recycled pid
+  t.after(async () => {
+    try { process.kill(-bystander.pid, 'SIGKILL'); } catch { /* gone */ }
+    await rmRoot(root);
+  });
+
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify({ apps: { demo: {
+    id: 'demo', project: 'demo', path: path.join(root, 'demo'), isWorktree: false, branch: null,
+    pid: 99999999, pgid: 99999999, port: 5000, urls: [], startedSha: null, startedAt: '',
+    tunnel: { kind: 'tailscale', url: 'https://node.tailnet.ts.net', pid: bystander.pid, proxyPort: 5001 },
+  } } }));
+
+  await appManager.init();
+
+  const { apps } = await appManager.list();
+  assert.equal(apps.find((a) => a.id === 'demo'), undefined, 'the stale record is still dropped');
+  // Give any (wrong) signal time to land before concluding it was not sent.
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(pidAlive(bystander.pid), 'the unrelated process was left alone');
+});
+
+// A share spends up to the whole readiness backstop in flight, and while the
+// slot is `pending` it carries NO pid — so killShareChild's pid match cannot
+// protect it, and stop()/list()'s prune/start() are all free to drop the record
+// out from under it. Writing on regardless attaches a LIVE public funnel to a
+// record the store no longer holds: unreachable by unshare/stop, never
+// persisted, and — being alive — never reaped, so it 409s every future share on
+// every app until a restart, which then loses it entirely.
+test('stopping an app mid-share leaves no funnel behind and no claim on the slot', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const argvLog = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-argv-')), 'argv.log');
+  process.env.FAKE_TAILSCALE_ARGV_LOG = argvLog;
+  process.env.FAKE_TAILSCALE_MODE = 'slow-start'; // ~400ms before the funnel is up
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    delete process.env.FAKE_TAILSCALE_ARGV_LOG; delete process.env.FAKE_TAILSCALE_MODE;
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root); await fs.rm(path.dirname(argvLog), { recursive: true, force: true });
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+
+  const inFlight = j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  await new Promise((r) => setTimeout(r, 150)); // the funnel is still coming up
+  assert.equal((await j(base, 'POST', '/api/apps/app/stop')).status, 200);
+
+  const res = await inFlight;
+  assert.equal(res.status, 409, 'the share reports that its app went away rather than claiming success');
+
+  // The funnel it had already started is killed, not stranded on 443.
+  const events = await tailscaleEvents(argvLog);
+  const [started] = funnelEvents(events, 'invoke');
+  assert.ok(started, 'a funnel was in fact started before the stop landed');
+  await waitFor(async () => funnelEvents(await tailscaleEvents(argvLog), 'exit').some((e) => e.pid === started.pid));
+
+  // ...and the slot is free, not held by an app that no longer exists.
+  assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' })).status, 200);
+});
+
+// The slot is released when the child it NAMES is killed, never on an id match.
+// share() claims the slot and then tears down that same app's PREVIOUS funnel,
+// so an id-keyed release would drop the claim it just made — reopening the
+// window for another app to raise a competing funnel mid-flight.
+//
+// The stagger is load-bearing and so is its SIZE. Issued simultaneously, the
+// other app can legitimately win the slot and 409 the re-share, which passes
+// under the id-keyed mutation too. It must land after the re-share's teardown
+// (where an id-keyed release would fire) and before it commits — `slow-exit`
+// widens that to the ~300ms the previous funnel takes to go away.
+test('a re-share does not release its own claim while tearing down its old funnel', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd() }, { git: true });
+  await mkProject(root, 'other', { start: fakeAppCmd() }, { git: true });
+  const argvLog = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-argv-')), 'argv.log');
+  process.env.FAKE_TAILSCALE_ARGV_LOG = argvLog;
+  process.env.FAKE_TAILSCALE_MODE = 'slow-exit';
+  const { server, base } = await boot(root);
+  t.after(async () => {
+    delete process.env.FAKE_TAILSCALE_ARGV_LOG; delete process.env.FAKE_TAILSCALE_MODE;
+    for (const id of ['app', 'other']) { await appManager.unshare(id).catch(() => {}); await appManager.stop(id).catch(() => {}); }
+    server.close(); await rmRoot(root); await fs.rm(path.dirname(argvLog), { recursive: true, force: true });
+  });
+
+  await startApp(base, 'app');
+  await startApp(base, 'other');
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' })).status, 200);
+  const before = funnelEvents(await tailscaleEvents(argvLog), 'invoke').length;
+
+  const reshare = j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  await new Promise((r) => setTimeout(r, 150)); // inside the old funnel's exit wait
+  const otherIssuedAt = Date.now();
+  const [a, b] = await Promise.all([reshare, j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale' })]);
+
+  assert.deepEqual([a.status, b.status].sort(), [200, 409], 'the re-share kept the slot it had claimed');
+  const events = await tailscaleEvents(argvLog);
+  const after = funnelEvents(events, 'invoke').length;
+  assert.equal(after - before, 1, 'exactly one new funnel was started — no competing one');
+
+  // Prove the stagger landed where it discriminates, so this test cannot go
+  // quietly vacuous if timings shift: an id-keyed release fires when the old
+  // funnel is signalled, and the claim is re-established when the replacement
+  // is spawned. The second request must arrive strictly between the two.
+  const signalled = funnelEvents(events, 'sigterm')[0];
+  const replacement = funnelEvents(events, 'invoke')[before];
+  assert.ok(signalled && replacement, 'saw both the old funnel being signalled and the new one starting');
+  assert.ok(signalled.t <= otherIssuedAt && otherIssuedAt <= replacement.t,
+    `the competing share must land inside the teardown→respawn window (${signalled.t} <= ${otherIssuedAt} <= ${replacement.t})`);
 });
 
 // --- Fixed port (`port` in the manifest) ---

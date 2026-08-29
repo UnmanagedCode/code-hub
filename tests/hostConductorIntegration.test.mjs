@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { unregisterInMemory } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
 
 async function bootFakeConductor() {
   const srv = http.createServer((req, res) => { res.writeHead(200); res.end('conductor-ui'); });
@@ -17,6 +17,7 @@ async function bootFakeConductor() {
 }
 
 async function bootHub() {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   await appManager.init();
   const server = createServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));

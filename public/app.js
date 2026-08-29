@@ -1,7 +1,7 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
 // renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice } from './shareState.js';
+import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote } from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -19,7 +19,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -41,6 +41,7 @@ async function refresh({ periodic = false } = {}) {
     const data = await api('GET', 'api/apps');
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
+    state.tailscaleAvailable = data.tailscaleAvailable;
     if (!periodic || !Object.keys(state.credEdit).length) render();
     document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
@@ -261,12 +262,17 @@ function sharePanel(app) {
   if (s && s.choosing) {
     return el('div', { class: 'share' },
       el('div', { class: 'share-actions' },
-        el('button', { onclick: () => doShare(app, 'lan') }, 'Share on LAN'),
+        el('button', { onclick: () => doShare(app, 'lan') }, 'LAN'),
         el('button', {
           disabled: !state.cloudflaredAvailable,
           title: state.cloudflaredAvailable ? '' : 'cloudflared not installed',
           onclick: () => doShare(app, 'tunnel'),
-        }, 'Share via Tunnel'),
+        }, 'cloudflared'),
+        el('button', {
+          disabled: !state.tailscaleAvailable,
+          title: state.tailscaleAvailable ? '' : 'tailscale not available',
+          onclick: () => doShare(app, 'tailscale'),
+        }, 'tailscale'),
         el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
       ));
   }
@@ -290,15 +296,11 @@ function sharePanel(app) {
   const openUrl = resolveOpenUrl(s, shared);
   const kind = shared.kind || 'tunnel';
   const authEnabled = shared.auth !== false;
-  const lanTls = kind === 'lan' && String(shared.url).startsWith('https:');
   const panel = el('div', { class: 'share' });
   panel.appendChild(el('div', { class: 'share-url' }, shared.url));
-  panel.appendChild(el('div', { class: 'cred-note' },
-    kind !== 'lan' ? 'via public tunnel'
-    : !authEnabled && lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit), no authentication — anyone on the network can reach this app'
-    : !authEnabled ? 'via LAN, no authentication — anyone on the network can reach this app'
-    : lanTls ? 'via LAN (HTTPS, self-signed — your browser warns on first visit)'
-    : 'via LAN (plain HTTP — credentials are not encrypted in transit)'));
+  // Wording lives in shareState.js so a tailscale share can't silently claim
+  // to be a cloudflared tunnel without a test noticing.
+  panel.appendChild(el('div', { class: 'cred-note' }, resolveCredNote(shared)));
 
   // Wording and warn-vs-note live in shareState.js so the fail-safe rule (an
   // unidentifiable holder still warns) is unit-testable without a DOM.
@@ -312,8 +314,8 @@ function sharePanel(app) {
       ...shared.urls.slice(1).map((u) => el('a', { href: u, target: '_blank', rel: 'noopener' }, u))));
   }
 
-  // Auth is only ever toggleable on a LAN share — a tunnel share is always
-  // gated. The toggle itself now lives inside the Edit form below (credsBlock)
+  // Auth is only ever toggleable on a LAN share — tunnel and tailscale shares
+  // are always gated. The toggle itself now lives inside the Edit form below (credsBlock)
   // rather than a standalone control, so it applies on Save instead of live.
   const editing = !!state.credEdit[app.id];
   if (editing || (authEnabled && shared.username && shared.password)) {
@@ -327,8 +329,8 @@ function sharePanel(app) {
     panel.appendChild(qr);
   }
   // For a LAN share, Edit is reachable regardless of auth state — it's the
-  // only way to turn authentication back on once it's off. A tunnel share is
-  // always gated, so Edit there still only ever edits credentials.
+  // only way to turn authentication back on once it's off. Tunnel and
+  // tailscale shares are always gated, so Edit there only edits credentials.
   const canEdit = kind === 'lan' || (authEnabled && shared.username && shared.password);
   panel.appendChild(el('div', { class: 'share-actions' },
     el('a', { class: 'btn-link', href: openUrl, target: '_blank', rel: 'noopener' }, '▶ Open'),
@@ -473,6 +475,9 @@ function render() {
   const cf = document.getElementById('cf-status');
   cf.textContent = state.cloudflaredAvailable ? 'cloudflared ✓' : 'no cloudflared';
   cf.className = `pill ${state.cloudflaredAvailable ? 'ok' : 'off'}`;
+  const ts = document.getElementById('ts-status');
+  ts.textContent = state.tailscaleAvailable ? 'tailscale ✓' : 'no tailscale';
+  ts.className = `pill ${state.tailscaleAvailable ? 'ok' : 'off'}`;
 
   if (!state.apps.length) { emptyEl.textContent = 'No apps found. Add a .hub.json to a sibling project.'; emptyEl.style.display = ''; root.innerHTML = ''; return; }
   emptyEl.style.display = 'none';

@@ -49,6 +49,28 @@ test('reconcile clears a tunnel whose pid is dead but keeps the app', async (t) 
   assert.equal(s.apps.a.tunnel, null);
 });
 
+// Dropping a record takes the only copy of its share child's pid with it, so
+// reconcile must hand back any child still ALIVE at that moment — nothing else
+// in the system can find it afterwards. A child already dead is not reported:
+// there is nothing to kill.
+test('reconcile reports the tunnels of dropped records whose child is still alive', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const liveFunnel = spawnLived();
+  t.after(() => { try { process.kill(-liveFunnel.pid, 'SIGKILL'); } catch {} });
+
+  const s = { apps: {
+    stranded: { id: 'stranded', pid: 2 ** 30, tunnel: { kind: 'tailscale', pid: liveFunnel.pid, url: 'https://n.ts.net' } },
+    alreadyDead: { id: 'alreadyDead', pid: 2 ** 30, tunnel: { kind: 'tailscale', pid: 2 ** 30, url: 'https://d.ts.net' } },
+    noShare: { id: 'noShare', pid: 2 ** 30, tunnel: null },
+  } };
+  const { strandedTunnels } = await state.reconcile(s);
+
+  assert.deepEqual(Object.keys(s.apps), [], 'all three dead apps are dropped');
+  assert.deepEqual(strandedTunnels.map((x) => x.id), ['stranded']);
+  assert.equal(strandedTunnels[0].tunnel.pid, liveFunnel.pid, 'the pid survives the delete, in the caller\'s hands');
+});
+
 test('corrupt state file is moved aside, not fatal', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
