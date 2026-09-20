@@ -42,40 +42,54 @@ function worktreesRoot() {
 }
 
 // `:` is code-hub's **reserved id qualifier**, and the reservation is what
-// makes the two id namespaces disjoint: a worktree id always contains one, a
-// main checkout's id never does (a root directory whose name contains `:` is
-// refused as an app below). Without that, a root dir literally named `a:b` —
-// legal on Linux — would emit the same id as worktree `a/b`. This is a rule
-// code-hub sets for its own namespace; it assumes nothing about which
-// characters code-conductor allows in a project name or worktree key.
-const ID_QUALIFIER = ':';
+// makes `worktreeId()` injective and the two id namespaces disjoint. Every
+// directory name that feeds an id is refused if it contains one:
+//   - a root directory (`a:b` — legal on Linux — would otherwise emit the
+//     same id as worktree `a/b`), and
+//   - a worktree's `<project>` or `<key>` (`a/b:c` and `a:b/c` would
+//     otherwise both compose `a:b:c`: two checkouts under one id, with
+//     readdir order deciding which one every action reaches).
+// code-hub enforces this over its own id namespace. It does not assume
+// code-conductor keeps `:` out of a project name or worktree key — it
+// refuses to serve a directory that carries one, and says so whenever that
+// refusal cost a servable app (see the warn sites below).
+export const WORKTREE_ID_QUALIFIER = ':';
 
 export function isWorktreeId(id) {
-  return typeof id === 'string' && id.includes(ID_QUALIFIER);
+  return typeof id === 'string' && id.includes(WORKTREE_ID_QUALIFIER);
 }
 
 // THE one place a worktree's app id is composed, so discovery and appDir()
 // can never drift on its shape. `<project>` and `<key>` are directory names
-// verbatim; the id is opaque and never split back apart — appDir() resolves
-// one by enumerating directories and comparing composed ids, so `<key>`'s
-// charset stays conductor's business.
+// verbatim, guaranteed qualifier-free by listWorktreeDirs() below — which is
+// what makes this injective. The id is opaque and never split back apart:
+// appDir() resolves one by enumerating directories and comparing composed
+// ids.
 export function worktreeId(project, key) {
-  return `${project}${ID_QUALIFIER}${key}`;
+  return `${project}${WORKTREE_ID_QUALIFIER}${key}`;
 }
 
-// Every worktree checkout under the local worktrees root, as
-// `{ project, key, dir }`. Dot-prefixed `<project>` dirs are skipped, mirroring
-// the root scan; `<key>` entries are filtered only on being directories.
+// Every worktree checkout under the local worktrees root, split into
+// `{ worktrees, refused }` — both arrays of `{ project, key, dir }`. Skipped
+// outright (in neither array): dot-prefixed `<project>` dirs, mirroring the
+// root scan, and any entry that isn't a real directory (a symlink's Dirent
+// reports isDirectory() === false, so a linked-in tree is not a checkout).
+// `refused` holds entries whose `<project>` or `<key>` carries the reserved
+// qualifier: they can never be served, since their composed id would not
+// identify them uniquely. They are handed back rather than dropped so
+// discoverApps() can say so when the refusal actually cost an app — the same
+// scoping the root pass uses. Every other caller wants `worktrees` alone.
 export async function listWorktreeDirs() {
   const root = worktreesRoot();
   let projects;
   try {
     projects = await fs.readdir(root, { withFileTypes: true });
   } catch (e) {
-    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return [];
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return { worktrees: [], refused: [] };
     throw e;
   }
-  const out = [];
+  const worktrees = [];
+  const refused = [];
   for (const p of projects) {
     if (!p.isDirectory() || p.name.startsWith('.')) continue;
     const projectDir = path.join(root, p.name);
@@ -88,10 +102,11 @@ export async function listWorktreeDirs() {
     }
     for (const k of keys) {
       if (!k.isDirectory()) continue;
-      out.push({ project: p.name, key: k.name, dir: path.join(projectDir, k.name) });
+      const entry = { project: p.name, key: k.name, dir: path.join(projectDir, k.name) };
+      (isWorktreeId(p.name) || isWorktreeId(k.name) ? refused : worktrees).push(entry);
     }
   }
-  return out;
+  return { worktrees, refused };
 }
 
 // Absolute directory an app id names, or null if it names none. The one
@@ -101,14 +116,15 @@ export async function appDir(id) {
   if (typeof id !== 'string' || id.length === 0) return null;
   // A qualified id names a worktree by construction, so it is never resolved
   // against the root — that is what keeps this single-valued when a root dir
-  // happens to share the name (see ID_QUALIFIER).
+  // happens to share the name (see WORKTREE_ID_QUALIFIER).
   if (!isWorktreeId(id) && !id.startsWith('.') && path.basename(id) === id) {
     const dir = path.join(projectsRoot(), id);
     try {
       if ((await fs.stat(dir)).isDirectory()) return dir;
     } catch { /* not a main checkout; fall through to the worktrees */ }
   }
-  const wt = (await listWorktreeDirs()).find((w) => worktreeId(w.project, w.key) === id);
+  const { worktrees } = await listWorktreeDirs();
+  const wt = worktrees.find((w) => worktreeId(w.project, w.key) === id);
   return wt ? wt.dir : null;
 }
 
@@ -332,7 +348,7 @@ export async function discoverApps() {
       // worktree id. Silent for an unservable dir like any other, loud when
       // it cost the user a real app.
       if (res.manifest || res.error) {
-        console.warn(`[code-hub] '${e.name}' is not servable: '${ID_QUALIFIER}' is reserved for worktree ids, so a project directory cannot contain one`);
+        console.warn(`[code-hub] '${e.name}' is not servable: '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids, so a project directory cannot contain one`);
       }
       continue;
     }
@@ -346,7 +362,7 @@ export async function discoverApps() {
     out.push({ id: e.name, project: e.name, path: dir, isWorktree: false, branch: null, manifest: res.manifest, manifestError: null, source: res.source });
   }
 
-  const worktrees = await listWorktreeDirs();
+  const { worktrees, refused } = await listWorktreeDirs();
   for (const { project, key, dir } of worktrees) {
     const id = worktreeId(project, key);
     // The registry lookup key for a worktree IS its app id, so a broken own
@@ -377,6 +393,21 @@ export async function discoverApps() {
     // fixed port too.
     const wtManifest = manifest.port == null ? manifest : { ...manifest, port: null };
     out.push({ id, project, path: dir, isWorktree: true, branch: null, manifest: wtManifest, manifestError: null, source });
+  }
+
+  // Same scoping as the root pass's refusal: a refused checkout that would
+  // have served something gets said out loud, one that was never going to
+  // serve anything is skipped in silence. Named by path, since the whole
+  // point is that its id would be ambiguous.
+  for (const { project, key, dir } of refused) {
+    const own = await resolveManifestSource(worktreeId(project, key), dir, registry);
+    // A refused `<project>` is itself unservable as a root app, so there is
+    // nothing it could have donated — and not resolving it keeps a
+    // qualifier-bearing name off every filesystem path.
+    const parentWouldServe = !isWorktreeId(project) && Boolean((await resolve(project)).manifest);
+    if (own.manifest || own.error || parentWouldServe) {
+      console.warn(`[code-hub] '${path.relative(root, dir)}' is not servable: '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids, so a worktree's project or key cannot contain one`);
+    }
   }
 
   // A registration is legitimate when it names a discovered app, or a project

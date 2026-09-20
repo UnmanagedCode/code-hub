@@ -171,7 +171,7 @@ test('registerApp: a worktree id registers the worktree checkout itself', async 
   assert.ok(!(await discoverApps()).find((a) => a.id === 'tool:ab12cd'));
 });
 
-test('registerApp: rejects a worktree id naming no checkout', async (t) => {
+test('registerApp: rejects a worktree id naming no checkout, naming the reservation', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'tool', null);
@@ -179,6 +179,26 @@ test('registerApp: rejects a worktree id naming no checkout', async (t) => {
 
   await assert.rejects(
     () => appManager.registerApp({ id: 'tool:nope', start: 'npm start' }),
-    /is not an existing directory/,
+    /matches no worktree under the projects root — ':' is reserved for worktree ids/,
   );
+});
+
+test('registerApp: a qualified id is refused even when a root dir of that exact name exists', async (t) => {
+  // The reservation excludes the directory, so the old
+  // "is not an existing directory" would be a false statement of the reason —
+  // and nothing may be written for an id discovery would then refuse.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool:ab12cd', null); // a real dir; no worktree anywhere
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'tool:ab12cd', start: 'npm start' }),
+    (e) => {
+      assert.equal(e.statusCode, 400);
+      assert.doesNotMatch(e.message, /is not an existing directory/);
+      assert.match(e.message, /reserved for worktree ids/);
+      return true;
+    },
+  );
+  await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });

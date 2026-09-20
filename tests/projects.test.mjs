@@ -615,6 +615,85 @@ test('a root dir whose name carries the reserved qualifier cannot collide with a
   assert.match(warnings[0], /'alpha:ab12cd' is not servable/);
 });
 
+test('two worktrees whose components compose the SAME id are both refused', async (t) => {
+  // The injectivity hole: `.worktrees/a/b:c` and `.worktrees/a:b/c` both
+  // compose `a:b:c`. Composing them would put two checkouts under one id —
+  // the UI showing two cards, every action on either reaching whichever
+  // readdir returned first, the other silently unreachable. Both carry their
+  // own manifest, so each would surface if it were composed at all.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'a', 'b:c', { start: 'x', name: 'one' });
+  await mkWorktree(root, 'a:b', 'c', { start: 'x', name: 'two' });
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.equal(apps.filter((app) => app.id === 'a:b:c').length, 0, 'neither may be composed');
+  assert.equal(new Set(apps.map((app) => app.id)).size, apps.length, 'ids are unique');
+  assert.equal(await appDir('a:b:c'), null);
+
+  // Both were servable, so both refusals are said out loud and name their path.
+  assert.equal(warnings.length, 2, warnings.join('\n'));
+  assert.ok(warnings.some((w) => w.includes(path.join('.worktrees', 'a', 'b:c'))), warnings.join('\n'));
+  assert.ok(warnings.some((w) => w.includes(path.join('.worktrees', 'a:b', 'c'))), warnings.join('\n'));
+});
+
+test('a worktree whose key carries the reserved qualifier is refused, and warns when it cost an app', async (t) => {
+  // Singly, too — not only when a second checkout collides with it. The
+  // parent is servable, so this worktree would have surfaced by inheritance.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  await mkWorktree(root, 'alpha', 'ok', null);
+  await mkWorktree(root, 'alpha', 'we:ird', null);
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.ok(apps.find((app) => app.id === 'alpha:ok'), 'test setup sanity: a normal sibling worktree still surfaces');
+  assert.ok(!apps.some((app) => app.id.includes('we:ird')));
+  assert.equal(await appDir('alpha:we:ird'), null);
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.match(warnings[0], /is not servable/);
+});
+
+test('a refused worktree that was never going to serve anything is skipped silently', async (t) => {
+  // Warn scoping, mirroring the root pass: no own manifest source and no
+  // parent to inherit from means nothing was lost, so nothing is logged on
+  // every 2s discovery poll.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'orphan', 'we:ird', null); // no parent, no manifest
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.deepEqual(warnings, []);
+  assert.equal(apps.length, 0);
+});
+
+test('a qualified id never resolves to a root directory of that exact name', async (t) => {
+  // The no-worktree arm of appDir's short-circuit. Pre-reservation this
+  // resolved to the root dir, so registerApp wrote a registry entry under an
+  // id discovery then refuses — a phantom registration plus a permanent
+  // orphan-key warning.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha:ab12cd', null); // exists, but no worktree anywhere
+
+  assert.equal(await appDir('alpha:ab12cd'), null);
+});
+
 test('an unservable root dir carrying the reserved qualifier is skipped silently', async (t) => {
   // The warning exists to explain a vanished app; a dir that was never
   // servable must not log on every 2s discovery poll.

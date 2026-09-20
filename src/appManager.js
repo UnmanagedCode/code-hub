@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
-  discoverApps, projectsRoot, MANIFEST_FILENAME, appDir, listWorktreeDirs,
+  discoverApps, projectsRoot, MANIFEST_FILENAME, appDir, listWorktreeDirs, isWorktreeId,
+  WORKTREE_ID_QUALIFIER,
   validateManifestObject, readRegistry, writeRegistry, registerInMemory,
 } from './projects.js';
 import * as state from './state.js';
@@ -80,7 +81,7 @@ export async function init() {
       // when neither exists would make discoverApps() warn about an orphaned
       // key on every call, and could shadow the injected dir with a same-named
       // but unrelated sibling under the root (wrong path/git info).
-      const hasInRootWorktree = (await listWorktreeDirs()).some((w) => w.project === HOST_CONDUCTOR_ID);
+      const hasInRootWorktree = (await listWorktreeDirs()).worktrees.some((w) => w.project === HOST_CONDUCTOR_ID);
       if (isUnderRoot(projectsRoot(), injectedDir) || hasInRootWorktree) {
         registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
       }
@@ -763,7 +764,15 @@ export async function registerApp({ id, start, name, healthPath, readyWhen, port
   }
   const dir = await appDir(id);
   if (!dir) {
-    const e = new Error(`'${id}' is not an existing directory under the projects root`); e.statusCode = 400; throw e;
+    // A qualified id can only ever name a worktree — `:` is reserved, so it
+    // is never resolved against the projects root even when a directory of
+    // that exact name sits there. Saying "not an existing directory" would be
+    // false in that case, so name the rule instead; deciding it from the id's
+    // shape alone also keeps a `:`-bearing id off every filesystem path.
+    const e = new Error(isWorktreeId(id)
+      ? `'${id}' matches no worktree under the projects root — '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids (<project>:<key>), so an id containing one never names a project directory`
+      : `'${id}' is not an existing directory under the projects root`);
+    e.statusCode = 400; throw e;
   }
   if (await hasManifestFile(dir)) {
     const e = new Error(`'${id}' already has a .hub.json — no registration needed`); e.statusCode = 409; throw e;
