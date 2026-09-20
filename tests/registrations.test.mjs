@@ -204,11 +204,10 @@ test('registerApp: a qualified id is refused even when a root dir of that exact 
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });
 
-test('registerApp: the round trip — an overlay id showing no card registers, and the card appears', async (t) => {
-  // The asymmetry, end to end: a project with a worktree here but no manifest
-  // source shows no card, yet `appDir()` still resolves its id — otherwise it
-  // could never be registered (not listed because not registered, not
-  // registrable because not listed) short of hand-editing the registry.
+test('registerApp: the round trip — a conductor id showing no card registers, and the card appears', async (t) => {
+  // The asymmetry, end to end: `register_app` exists to make a project
+  // servable WITHOUT a `.hub.json`, so its id must resolve while it still has
+  // no manifest source and therefore no card. Registering closes the gap.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
@@ -248,20 +247,20 @@ test('registerApp: with the conductor unreachable an overlay id refuses, and wri
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });
 
-test('registerApp: an overlay id the listing would not show is refused, and writes nothing', async (t) => {
-  // A conductor project with no worktree under the root is not code-hub's to
-  // serve. Accepting it would persist a registry entry naming an app that can
-  // never appear or start, and make discovery warn about the orphaned key on
-  // every poll.
+test('registerApp: a conductor id whose recorded tree is gone is refused, and writes nothing', async (t) => {
+  // The refusal case that survives the worktree rule being dropped: the
+  // snapshot is up to its TTL stale, so a project the conductor still lists
+  // may name a directory that no longer exists. Writing a registry entry for
+  // it would persist a key naming nothing — unusable, and logged as an
+  // orphaned key on every 2s poll.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
-  const solo = await mkProject(outside, 'solo', null);
-  await useConductorOverlay([ccProject('solo', solo)]);
+  await useConductorOverlay([ccProject('vanished', path.join(outside, 'vanished'))]); // never created
 
   await assert.rejects(
-    () => appManager.registerApp({ id: 'solo', start: 'npm start' }),
-    /'solo' is not an existing directory under the projects root/,
+    () => appManager.registerApp({ id: 'vanished', start: 'npm start' }),
+    /'vanished' is not an existing directory under the projects root/,
   );
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 

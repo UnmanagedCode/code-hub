@@ -118,37 +118,31 @@ async function isDirectory(p) {
   }
 }
 
-// THE definition of "this conductor-overlay name is one code-hub may serve,
-// and from where" — the directory, or null. A LOCATION question only. Both
-// the overlay pass in discoverApps() and appDir() below decide through this
-// one function; deciding it twice by convention is how `register_app` came to
-// accept an id for a project with no worktree here, which the listing would
-// never show.
+// THE definition of "where does this conductor-known project live" — the
+// directory, or null. A LOCATION question only: the caller decides what to do
+// with the answer. Both the overlay pass in discoverApps() and appDir() below
+// go through this one function, so they can never place the same project in
+// two different directories.
 //
-// Whether a row is actually EMITTED carries one further condition the overlay
-// pass applies on its own — the project must have a manifest source. So the
-// two callers deliberately differ for exactly one case: a project that has a
-// worktree here but no `.hub.json` and no registration shows no card, while
-// `appDir()` still resolves its id. That is what lets `register_app` give it
-// a manifest source in the first place; the refusal above (no worktree here)
-// is unaffected, so no registration can be written for a project that would
-// still have nothing to consume it.
+// Whether a row is EMITTED carries one further condition the overlay pass
+// applies on its own: the project must have a manifest source there. That is
+// the single deliberate asymmetry between the two callers — a conductor
+// project with no `.hub.json` and no registration shows no card, while
+// `appDir()` still resolves its id. It has to: `register_app`'s whole purpose
+// is making an app servable WITHOUT a `.hub.json`, so the id must resolve
+// before the registration exists. The asymmetry closes itself — registering
+// creates the manifest source, so the card appears and the registry key is
+// never orphaned.
 //
-// The caller supplies the facts it already has: `hasRootDir` (the root scan
-// produced a directory of this name, which always wins), and `wtProjects`
-// (the projects of the non-refused worktrees under the root). The recorded
-// path is stat-verified here — a snapshot up to its TTL old can name a tree
-// that has since moved or gone — and never composed from an id. Nothing here
-// enumerates a directory; `listWorktreeDirs()` remains the only place that
-// does.
-async function overlayAppDir(name, { overlay, hasRootDir, wtProjects }) {
+// `hasRootDir` (the root scan produced a directory of this name) is the
+// caller's fact, and it always wins. The recorded path is stat-verified here
+// — a snapshot up to its TTL old can name a tree that has since moved or gone
+// — and never composed from an id. Nothing here enumerates a directory;
+// `listWorktreeDirs()` remains the only place that does.
+async function overlayAppDir(name, { overlay, hasRootDir }) {
   if (hasRootDir) return null;
   const ccDir = overlay.get(name);
   if (!ccDir) return null;
-  // Scope: the overlay gives an orphaned worktree group its real parent. A
-  // conductor project with no worktree under the root is not code-hub's to
-  // serve, by the listing or by an id.
-  if (!wtProjects.has(name)) return null;
   return await isDirectory(ccDir) ? ccDir : null;
 }
 
@@ -164,22 +158,21 @@ export async function appDir(id) {
     const dir = path.join(projectsRoot(), id);
     if (await isDirectory(dir)) return dir; // a main checkout under the root
   }
-  const { worktrees } = await listWorktreeDirs();
-  // Else the conductor overlay, decided by the same location predicate the
-  // listing decides by (which does NOT include the listing's manifest-source
-  // condition — see overlayAppDir). The names a snapshot can hold are
-  // guarded (single segment, not dot-leading, qualifier-free), so no id shape
-  // reaches a path through here that the root branch above would have
-  // refused — and that branch has already returned if a directory of this
-  // name exists under the root, which is why `hasRootDir` is false here. With
-  // the conductor unreachable the id is in neither the snapshot nor the
-  // listing, and registerApp refusing it is the correct degradation.
-  const overlayDir = await overlayAppDir(id, {
-    overlay: conductorProjects.snapshot(),
-    hasRootDir: false,
-    wtProjects: new Set(worktrees.map((w) => w.project)),
-  });
+  // Else where the conductor records the project — the same location
+  // predicate the listing places it by, off the same snapshot. It resolves
+  // even when no card is shown for the project (see overlayAppDir), which is
+  // what lets `register_app` give a manifest-less project one. The names a
+  // snapshot can hold are guarded (single segment, not dot-leading,
+  // qualifier-free), so no id shape reaches a path through here that the root
+  // branch above would have refused — and that branch has already returned if
+  // a directory of this name exists under the root, which is why `hasRootDir`
+  // is false here. With the conductor unreachable the id is in no snapshot at
+  // all, and registerApp refusing it is the correct degradation.
+  const overlayDir = await overlayAppDir(id, { overlay: conductorProjects.snapshot(), hasRootDir: false });
   if (overlayDir) return overlayDir;
+  // Still needed for a worktree id, which resolves by comparing composed ids
+  // against the enumeration — never by splitting the id apart.
+  const { worktrees } = await listWorktreeDirs();
   const wt = worktrees.find((w) => worktreeId(w.project, w.key) === id);
   return wt ? wt.dir : null;
 }
@@ -349,6 +342,33 @@ async function resolveManifestSource(name, dir, registry) {
   return { manifest: null, source: null, error: null };
 }
 
+// The root scan produced a directory of this name, so it is served and the
+// conductor's record is ignored — correct, and what standalone code-hub would
+// do anyway. Say so when that cost a card: the conductor names a DIFFERENT
+// real directory that code-hub could have served (it has a manifest source
+// there), so either the card on screen describes a checkout the conductor
+// does not mean by this name — wrong path, wrong git info, and any worktrees
+// nesting under it — or there is no card at all where there would have been
+// one. Silent when the conductor's tree has no manifest source, since nothing
+// would have been shown for it either way: the same "loud only when the
+// refusal cost something servable" scoping the `:` refusals use.
+//
+// The counterfactual is resolved against the conductor's directory
+// deliberately, and NOT through discoverApps()'s memoized resolve(), which
+// for a name with a root directory resolves the ROOT one — a different
+// question, and caching its answer under this name would be wrong.
+// `fs.realpath` on the root directory, since the conductor's path is already
+// one, so a symlinked root cannot read as a disagreement.
+async function warnRootScanShadowedConductor(name, ccDir, root, registry) {
+  if (!await isDirectory(ccDir)) return;
+  const inRoot = path.join(root, name);
+  const realInRoot = await fs.realpath(inRoot).catch(() => inRoot);
+  if (realInRoot === ccDir) return;
+  const { manifest, error } = await resolveManifestSource(name, ccDir, registry);
+  if (!manifest && !error) return;
+  console.warn(`[code-hub] '${name}': code-conductor records this project at '${ccDir}', but the projects root has its own '${inRoot}' — serving the root directory, so this card (and any worktrees nesting under it) describes that checkout, not the conductor's`);
+}
+
 // Scan for servable apps in three passes over one shared registry.
 //
 // Root pass: every non-dot directory under the projects root is its own app
@@ -372,14 +392,15 @@ async function resolveManifestSource(name, dir, registry) {
 // it's just skipped, same as having no manifest at all.
 //
 // Conductor overlay pass: a project the ROOT SCAN PRODUCED NO DIRECTORY FOR,
-// which the host conductor records a local tree for, which has at least one
-// non-refused worktree under the root, and which has a manifest source at
-// that tree, gets a main-checkout row there — the real parent of a worktree
-// group that would otherwise render as a header-only "no main checkout" card.
-// The filesystem scan always wins: the overlay only fills gaps, and a project
-// with no `.hub.json` and no registration gets no card, just as it wouldn't
-// in-root. See `src/conductorProjects.js` for where the catalog comes from and
-// how it degrades.
+// which the host conductor records a local tree for, and which has a manifest
+// source at that tree, gets a main-checkout row there — that is how a project
+// whose checkout the scan cannot see (outside the root, or under a dot-dir it
+// skips) becomes servable at all. Its worktrees then nest under that row
+// instead of a header-only "no main checkout" card; they are a consequence of
+// the row, never a condition for it. The filesystem scan always wins, and a
+// project with no `.hub.json` and no registration gets no card, just as it
+// wouldn't in-root. See `src/conductorProjects.js` for where the catalog comes
+// from and how it degrades.
 //
 // Each app carries `source: 'manifest' | 'registry' | 'memory'`.
 export async function discoverApps() {
@@ -487,29 +508,11 @@ export async function discoverApps() {
     }
   }
 
-  const wtProjects = new Set(worktrees.map((w) => w.project));
   for (const [name, ccDir] of overlay) {
     const hasRootDir = rootDirNames.has(name);
-    const dir = await overlayAppDir(name, { overlay, hasRootDir, wtProjects });
+    const dir = await overlayAppDir(name, { overlay, hasRootDir });
     if (!dir) {
-      // Suppressed by the root scan — correct, and behaviour is unchanged.
-      // But the worktrees still nest under the root directory's card while
-      // the conductor says the project lives somewhere else, so that card
-      // shows the wrong checkout's path and git info for them. Say so.
-      //
-      // The condition is the LOCATION predicate with the root directory taken
-      // out of it — deliberately not the manifest-source condition the emit
-      // pass adds, since the mis-nesting happens whether or not the recorded
-      // tree is servable. Compared through realpath on the ROOT directory,
-      // since the conductor's path is already one — a symlinked root must not
-      // read as a disagreement.
-      if (hasRootDir && await overlayAppDir(name, { overlay, hasRootDir: false, wtProjects })) {
-        const inRoot = path.join(root, name);
-        const realInRoot = await fs.realpath(inRoot).catch(() => inRoot);
-        if (realInRoot !== ccDir) {
-          console.warn(`[code-hub] '${name}': code-conductor records this project at '${ccDir}', but the projects root has its own '${inRoot}' — serving the root directory, and nesting the worktrees under its card`);
-        }
-      }
+      if (hasRootDir) await warnRootScanShadowedConductor(name, ccDir, root, registry);
       continue;
     }
     // The SECOND condition, deliberately NOT part of overlayAppDir(): no card
@@ -519,10 +522,10 @@ export async function discoverApps() {
     // — fail loudly, same as in-root.
     //
     // appDir() keeps answering only the location question, so it still
-    // resolves this id. The asymmetry is the bootstrap route: without it a
-    // project could not be registered (it isn't listed because it isn't
-    // registered) except by hand-editing the registry. Registering it gives
-    // it a source, and the card appears on the next poll.
+    // resolves this id. That is the bootstrap route: `register_app` exists to
+    // make a project servable without a `.hub.json`, so the id has to resolve
+    // before any registration exists. Registering creates the source, and the
+    // card appears on the next poll.
     const res = await resolve(name);
     if (!res.source) continue;
     out.push({
@@ -537,6 +540,7 @@ export async function discoverApps() {
   // under `.worktrees/` whose own checkout lives outside the scanned root —
   // that second case is a registration only its worktrees consume.
   const appIds = new Set(out.map((a) => a.id));
+  const wtProjects = new Set(worktrees.map((w) => w.project));
   const regKeys = new Set([...Object.keys(registry), ...inMemoryRegistrations.keys()]);
   for (const key of regKeys) {
     if (!appIds.has(key) && !wtProjects.has(key)) {

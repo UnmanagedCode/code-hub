@@ -4,12 +4,14 @@
 // failure-containment decision for it lives here; `src/projects.js` only ever
 // sees a plain `Map<name, absoluteDir>`.
 //
-// Why an overlay exists at all: cc nests EVERY local-system project's
-// worktrees at `<projectsRoot>/.worktrees/<project>/<key>`, whatever directory
-// the project's own tree lives in. A project the root scan produces no
-// directory for (its tree is elsewhere, or is nested under a dot-dir the scan
-// skips) therefore still has its worktrees discovered, with no parent row to
-// nest them under. The conductor knows where that tree actually is.
+// Why an overlay exists at all: code-hub's root scan sees only directories
+// directly under the projects root, so a project whose tree is elsewhere — or
+// nested under a dot-dir the scan skips, `.plugins/<name>` being the common
+// case — is invisible to it however servable the tree is. The conductor knows
+// where every project's tree actually is. (Such a project's worktrees ARE
+// already discovered, since cc nests every local-system project's at
+// `<projectsRoot>/.worktrees/<project>/<key>` whatever directory its tree
+// lives in; they simply had no parent row to nest under.)
 import path from 'node:path';
 import { isEmbedded, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 import { isWorktreeId } from './projects.js';
