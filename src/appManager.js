@@ -15,6 +15,7 @@ import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
 import { generateSelfSigned } from './selfsigned.js';
 import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
+import * as conductorProjects from './conductorProjects.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -34,6 +35,11 @@ function isUnderRoot(root, dir) {
 }
 
 export async function init() {
+  // The ONE awaited conductor call: it lands the project overlay before the
+  // first listing, off the request path and bounded by the overlay's own
+  // timeout. No-op when standalone; every later refresh is fired lazily by
+  // discovery and never awaited.
+  await conductorProjects.refresh();
   store = await state.load();
   // reconcile drops records whose app pid is dead — which, for an app that
   // died in the same window code-hub did, would delete the only record of a

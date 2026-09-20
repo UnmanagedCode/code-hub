@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import * as appManager from '../src/appManager.js';
 import { discoverApps, registryFile } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, useConductorOverlay, resetConductorOverlay, ccProject } from './helpers.mjs';
 
 test('registerApp: happy path makes a manifest-less dir startable', async (t) => {
   const root = await mkRoot();
@@ -199,6 +200,45 @@ test('registerApp: a qualified id is refused even when a root dir of that exact 
       assert.match(e.message, /reserved for worktree ids/);
       return true;
     },
+  );
+  await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
+});
+
+test('registerApp: an overlay id registers the conductor-recorded tree and makes it startable', async (t) => {
+  // The overlay id is a real target for registration: `appDir()` reads the
+  // same snapshot discovery does, so an id the listing shows as a card is an
+  // id `register_app` can write for.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'wanderer', null); // no .hub.json anywhere
+  await mkWorktree(root, 'wanderer', 'ab12cd', null);
+  await useConductorOverlay([ccProject('wanderer', tree)]);
+
+  const app = await appManager.registerApp({ id: 'wanderer', start: 'npm start', name: 'Wanderer' });
+  assert.equal(app.id, 'wanderer');
+  assert.equal(app.path, tree);
+  assert.equal(app.source, 'registry');
+  assert.equal(app.manifest.start, 'npm start');
+  assert.equal(app.manifestError, null);
+
+  const onDisk = JSON.parse(await fs.readFile(registryFile(), 'utf8'));
+  assert.equal(onDisk.wanderer.start, 'npm start');
+  // ...and its worktree inherits the registration, as it did before the overlay.
+  assert.equal((await discoverApps()).find((a) => a.id === 'wanderer:ab12cd').source, 'registry');
+});
+
+test('registerApp: with the conductor unreachable an overlay id refuses, and writes nothing', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  await mkProject(outside, 'wanderer', null);
+  await mkWorktree(root, 'wanderer', 'ab12cd', null);
+  await useConductorOverlay(null);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'wanderer', start: 'npm start' }),
+    /'wanderer' is not an existing directory under the projects root/,
   );
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });
