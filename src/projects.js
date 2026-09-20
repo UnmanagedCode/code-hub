@@ -17,13 +17,16 @@ export const STORE_DIRNAME = '.code-hub';
 export const REGISTRY_FILENAME = 'registrations.json';
 
 // code-conductor nests every worktree under one root as
-// `<worktrees root>/<project>/<key>`; locally that root is
+// `<worktrees root>/<project>/<key>`. For a project on its LOCAL system —
+// the only kind code-hub scans — that root is always
 // `<projectsRoot>/.worktrees`, whatever directory the project's own tree
 // lives in (`LOCAL_WORKTREES_DIRNAME` in code-conductor's src/projects.ts is
-// the owning definition). The intermediate directory name therefore IS the
-// parent project by construction — nothing about `<key>` is inspected, and
-// no sibling `<projectsRoot>/<project>` is required, which is what keeps an
-// adopted / out-of-root project's worktrees discoverable.
+// the owning definition; a project on a registered remote system gets a
+// different root, which never lands under the scanned root). The
+// intermediate directory name therefore IS the parent project by
+// construction — nothing about `<key>` is inspected, and no sibling
+// `<projectsRoot>/<project>` is required, which is what keeps an adopted /
+// out-of-root project's worktrees discoverable.
 export const WORKTREES_DIRNAME = '.worktrees';
 
 export function projectsRoot() {
@@ -38,14 +41,26 @@ function worktreesRoot() {
   return path.join(projectsRoot(), WORKTREES_DIRNAME);
 }
 
+// `:` is code-hub's **reserved id qualifier**, and the reservation is what
+// makes the two id namespaces disjoint: a worktree id always contains one, a
+// main checkout's id never does (a root directory whose name contains `:` is
+// refused as an app below). Without that, a root dir literally named `a:b` —
+// legal on Linux — would emit the same id as worktree `a/b`. This is a rule
+// code-hub sets for its own namespace; it assumes nothing about which
+// characters code-conductor allows in a project name or worktree key.
+const ID_QUALIFIER = ':';
+
+export function isWorktreeId(id) {
+  return typeof id === 'string' && id.includes(ID_QUALIFIER);
+}
+
 // THE one place a worktree's app id is composed, so discovery and appDir()
-// can never drift on its shape. `:` keeps the id a plain basename (it passes
-// registerApp's separator guard) and a single legal path segment, so it
-// survives `/api/apps/:id/*` unchanged. The id is opaque: nothing ever splits
-// it back apart — appDir() resolves one by enumerating directories and
-// comparing composed ids, so `<key>`'s charset stays conductor's business.
+// can never drift on its shape. `<project>` and `<key>` are directory names
+// verbatim; the id is opaque and never split back apart — appDir() resolves
+// one by enumerating directories and comparing composed ids, so `<key>`'s
+// charset stays conductor's business.
 export function worktreeId(project, key) {
-  return `${project}:${key}`;
+  return `${project}${ID_QUALIFIER}${key}`;
 }
 
 // Every worktree checkout under the local worktrees root, as
@@ -84,7 +99,10 @@ export async function listWorktreeDirs() {
 // targets a dir that isn't servable yet, so discovery never returns it).
 export async function appDir(id) {
   if (typeof id !== 'string' || id.length === 0) return null;
-  if (!id.startsWith('.') && path.basename(id) === id) {
+  // A qualified id names a worktree by construction, so it is never resolved
+  // against the root — that is what keeps this single-valued when a root dir
+  // happens to share the name (see ID_QUALIFIER).
+  if (!isWorktreeId(id) && !id.startsWith('.') && path.basename(id) === id) {
     const dir = path.join(projectsRoot(), id);
     try {
       if ((await fs.stat(dir)).isDirectory()) return dir;
@@ -309,6 +327,15 @@ export async function discoverApps() {
     const dir = path.join(root, e.name);
 
     const res = await resolve(e.name);
+    if (isWorktreeId(e.name)) {
+      // Reserved qualifier: this dir's basename would collide with a
+      // worktree id. Silent for an unservable dir like any other, loud when
+      // it cost the user a real app.
+      if (res.manifest || res.error) {
+        console.warn(`[code-hub] '${e.name}' is not servable: '${ID_QUALIFIER}' is reserved for worktree ids, so a project directory cannot contain one`);
+      }
+      continue;
+    }
     if (res.error) {
       // Surface the broken manifest/registration as a non-startable app
       // rather than hiding the whole project — fail loudly, not silently.

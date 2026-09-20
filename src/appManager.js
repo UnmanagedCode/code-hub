@@ -72,10 +72,11 @@ export async function init() {
       // record even though discoverApps() never returns it.
       appPath = injectedDir;
       // Register in-memory only when the id actually resolves to something
-      // under the root: the checkout itself, or — since code-conductor puts
-      // every worktree under `<root>/.worktrees/<project>/` regardless of
-      // where the project's own tree lives — at least one worktree of it,
-      // which needs the registration to inherit a manifest at all. Registering
+      // under the root: the checkout itself, or — since a worktree need not
+      // be a sibling of its checkout, cc rooting a local-system project's
+      // worktrees at `<root>/.worktrees/<project>/` wherever its tree lives —
+      // at least one worktree of it, which needs the registration to inherit
+      // a manifest at all. Registering
       // when neither exists would make discoverApps() warn about an orphaned
       // key on every call, and could shadow the injected dir with a same-named
       // but unrelated sibling under the root (wrong path/git info).

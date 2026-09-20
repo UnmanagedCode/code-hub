@@ -285,12 +285,12 @@ test('embedded, worktree with no .hub.json of its own inherits the host conducto
 });
 
 test('embedded, conductor checkout OUTSIDE the root: its in-root worktree still inherits the in-memory manifest', async (t) => {
-  // The live code-hub case, and what the widened `init()` guard exists for:
-  // code-conductor puts every worktree under `<root>/.worktrees/<project>/`
-  // whatever directory the project's own tree lives in, so an out-of-root
-  // checkout DOES get in-root worktrees. Skipping registerInMemory for it
-  // (the old "a worktree is always a sibling of its checkout" premise) leaves
-  // that worktree with nothing to inherit and it vanishes from the listing.
+  // A worktree is not necessarily a sibling of its checkout: for a project on
+  // cc's local system, worktrees are rooted at `<root>/.worktrees/<project>/`
+  // wherever the project's own tree lives, so an out-of-root checkout DOES get
+  // in-root worktrees. This is the case the second arm of `init()`'s
+  // registration condition exists for — without it the worktree has nothing to
+  // inherit and vanishes from the listing.
   const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
   process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
   process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
