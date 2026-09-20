@@ -942,7 +942,10 @@ test('an overlay project\'s own .hub.json makes it startable and donates to its 
   assert.equal(wt.manifest.port, null, 'a worktree still never inherits a fixed port');
 });
 
-test('an overlay project with no manifest source is a non-startable row, not a Start that 400s', async (t) => {
+test('an overlay project with no manifest source is NOT emitted — no card without a .hub.json or a registration', async (t) => {
+  // The overlay shows a card on exactly the terms the root pass does: a
+  // manifest source or nothing. A project with neither is not servable, so it
+  // gets no row, and its worktrees keep the "no main checkout" card.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
@@ -951,12 +954,31 @@ test('an overlay project with no manifest source is a non-startable row, not a S
   await useConductorOverlay([ccProject('bare', tree)]);
 
   const apps = await discoverApps();
-  const main = apps.find((a) => a.id === 'bare');
-  assert.ok(main);
+  assert.equal(apps.find((a) => a.id === 'bare'), undefined);
+  assert.ok(apps.find((a) => a.id === 'bare:ab12cd'), 'the worktree is servable on its own and stays listed');
+  // ...but the id still RESOLVES, which is the only route to registering it.
+  assert.equal(await appDir('bare'), tree);
+});
+
+test('an overlay project servable by a registrations.json entry alone is emitted', async (t) => {
+  // The bootstrap path the appDir/listing asymmetry exists for: no `.hub.json`
+  // anywhere, a registration keyed by the project name, and the card appears.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'registered', null);
+  await mkWorktree(root, 'registered', 'ab12cd', null);
+  await writeRegistrations(root, { registered: { start: 'npm start', name: 'Registered' } });
+  await useConductorOverlay([ccProject('registered', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'registered');
+  assert.ok(main, 'a registration alone makes an overlay project servable');
   assert.equal(main.path, tree);
-  assert.equal(main.manifest, null);
-  assert.equal(main.source, null);
-  assert.match(main.manifestError, /no \.hub\.json and no registrations\.json entry — not startable/);
+  assert.equal(main.source, 'registry');
+  assert.equal(main.manifest.start, 'npm start');
+  assert.equal(main.manifestError, null);
+  assert.equal(apps.find((a) => a.id === 'registered:ab12cd').source, 'registry');
 });
 
 test('a conductor project with no worktrees under the root adds no card', async (t) => {

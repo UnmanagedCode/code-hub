@@ -446,7 +446,7 @@ test('embedded: a conductor-known project outside the root becomes a real parent
   assert.equal((await j(base, 'POST', '/api/apps/wanderer%3Aab12cd/stop')).status, 200);
 });
 
-test('embedded: an overlay row with no manifest source refuses Start with the widened reason', async (t) => {
+test('embedded: a conductor project with no manifest source gets no card at all', async (t) => {
   const root = await mkRoot();
   const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   const treeDir = await mkProject(outsideParent, 'bare', null, { git: true }); // no .hub.json, no registration
@@ -471,14 +471,13 @@ test('embedded: an overlay row with no manifest source refuses Start with the wi
   });
 
   const res = await j(base, 'GET', '/api/apps');
-  const main = res.body.apps.find((a) => a.id === 'bare');
-  assert.ok(main);
-  assert.equal(main.path, treeDir);
-  assert.match(main.manifestError, /not startable/);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.apps.find((a) => a.id === 'bare'), undefined, 'no .hub.json and no registration ⇒ no card');
 
+  // Not shown ⇒ not startable through the API either.
   const start = await j(base, 'POST', '/api/apps/bare/start');
-  assert.equal(start.status, 400);
-  assert.match(start.body.error, /no \.hub\.json and no registrations\.json entry — not startable/);
+  assert.equal(start.status, 404);
+  assert.match(start.body.error, /unknown app 'bare'/);
 });
 
 test('embedded: CONDUCTOR_PROJECT_DIR still wins over the conductor\'s record of its OWN project', async (t) => {

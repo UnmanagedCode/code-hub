@@ -204,16 +204,19 @@ test('registerApp: a qualified id is refused even when a root dir of that exact 
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });
 
-test('registerApp: an overlay id registers the conductor-recorded tree and makes it startable', async (t) => {
-  // The overlay id is a real target for registration: `appDir()` reads the
-  // same snapshot discovery does, so an id the listing shows as a card is an
-  // id `register_app` can write for.
+test('registerApp: the round trip — an overlay id showing no card registers, and the card appears', async (t) => {
+  // The asymmetry, end to end: a project with a worktree here but no manifest
+  // source shows no card, yet `appDir()` still resolves its id — otherwise it
+  // could never be registered (not listed because not registered, not
+  // registrable because not listed) short of hand-editing the registry.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
   const tree = await mkProject(outside, 'wanderer', null); // no .hub.json anywhere
   await mkWorktree(root, 'wanderer', 'ab12cd', null);
   await useConductorOverlay([ccProject('wanderer', tree)]);
+
+  assert.equal((await discoverApps()).find((a) => a.id === 'wanderer'), undefined, 'no card before registering');
 
   const app = await appManager.registerApp({ id: 'wanderer', start: 'npm start', name: 'Wanderer' });
   assert.equal(app.id, 'wanderer');
@@ -224,8 +227,10 @@ test('registerApp: an overlay id registers the conductor-recorded tree and makes
 
   const onDisk = JSON.parse(await fs.readFile(registryFile(), 'utf8'));
   assert.equal(onDisk.wanderer.start, 'npm start');
+  const after = await discoverApps();
+  assert.ok(after.find((a) => a.id === 'wanderer'), 'the card appears once the registration gives it a source');
   // ...and its worktree inherits the registration, as it did before the overlay.
-  assert.equal((await discoverApps()).find((a) => a.id === 'wanderer:ab12cd').source, 'registry');
+  assert.equal(after.find((a) => a.id === 'wanderer:ab12cd').source, 'registry');
 });
 
 test('registerApp: with the conductor unreachable an overlay id refuses, and writes nothing', async (t) => {
@@ -259,4 +264,12 @@ test('registerApp: an overlay id the listing would not show is refused, and writ
     /'solo' is not an existing directory under the projects root/,
   );
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
+
+  // And the refusal leaves nothing behind that discovery then complains
+  // about: the orphan-key warning would otherwise fire on every 2s poll.
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try { await discoverApps(); await discoverApps(); } finally { console.warn = orig; }
+  assert.deepEqual(warnings, []);
 });
