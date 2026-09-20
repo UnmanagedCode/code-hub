@@ -49,7 +49,7 @@ test('hostConductorPort: null for a malformed URL', withEnv({ CONDUCTOR_PLUGIN_I
 
 test('isHostConductorId: only matches "code-conductor" while embedded', withEnv({ CONDUCTOR_PLUGIN_ID: 'code-hub', CONDUCTOR_URL: 'http://127.0.0.1:5000' }, () => {
   assert.equal(isHostConductorId('code-conductor'), true);
-  assert.equal(isHostConductorId('code-conductor_worktree_ab12cd'), false);
+  assert.equal(isHostConductorId('code-conductor:ab12cd'), false);
   assert.equal(isHostConductorId('some-other-app'), false);
 }));
 

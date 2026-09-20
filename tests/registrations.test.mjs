@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import * as appManager from '../src/appManager.js';
 import { discoverApps, registryFile } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree } from './helpers.mjs';
 
 test('registerApp: happy path makes a manifest-less dir startable', async (t) => {
   const root = await mkRoot();
@@ -134,10 +135,50 @@ test('a registry entry\'s fixed port is stripped from that project\'s worktrees'
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'tool', null);
-  await mkProject(root, 'tool_worktree_ab12cd', null);
+  await mkWorktree(root, 'tool', 'ab12cd', null);
   await appManager.registerApp({ id: 'tool', start: 'npm start', port: 3100 });
 
   const apps = await discoverApps();
   assert.equal(apps.find((a) => a.id === 'tool').manifest.port, 3100);
-  assert.equal(apps.find((a) => a.id === 'tool_worktree_ab12cd').manifest.port, null);
+  assert.equal(apps.find((a) => a.id === 'tool:ab12cd').manifest.port, null);
+});
+
+test('registerApp: a worktree id registers the worktree checkout itself', async (t) => {
+  // registerApp is the one site that must map an id to a directory without
+  // discovery; for a worktree that means resolving `<project>:<key>` to
+  // `<root>/.worktrees/<project>/<key>` and writing the registry under that
+  // same id — with the fixed port still stripped on the way out.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+  await mkWorktree(root, 'tool', 'ab12cd', null);
+
+  const app = await appManager.registerApp({ id: 'tool:ab12cd', start: 'npm start', name: 'WT', port: 3100 });
+  assert.equal(app.id, 'tool:ab12cd');
+  assert.equal(app.isWorktree, true);
+  assert.equal(app.project, 'tool');
+  assert.equal(app.source, 'registry');
+  assert.equal(app.manifest.start, 'npm start');
+  assert.equal(app.manifest.port, null, 'a worktree never keeps a fixed port, even its own registration\'s');
+  assert.equal(app.path, path.join(root, '.worktrees', 'tool', 'ab12cd'));
+
+  const onDisk = JSON.parse(await fs.readFile(registryFile(), 'utf8'));
+  assert.equal(onDisk['tool:ab12cd'].start, 'npm start');
+  assert.equal(onDisk['tool:ab12cd'].port, 3100); // stripped at discovery, not at write
+
+  const result = await appManager.unregisterApp('tool:ab12cd');
+  assert.deepEqual(result, { id: 'tool:ab12cd', registered: false });
+  assert.ok(!(await discoverApps()).find((a) => a.id === 'tool:ab12cd'));
+});
+
+test('registerApp: rejects a worktree id naming no checkout', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+  await mkWorktree(root, 'tool', 'ab12cd', null);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'tool:nope', start: 'npm start' }),
+    /is not an existing directory/,
+  );
 });

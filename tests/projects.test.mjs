@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { discoverApps, registerInMemory, unregisterInMemory, registryFile } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, writeRegistrations } from './helpers.mjs';
+import { discoverApps, registerInMemory, unregisterInMemory, registryFile, appDir, worktreeId } from '../src/projects.js';
+import { mkRoot, rmRoot, mkProject, mkWorktree, writeRegistrations } from './helpers.mjs';
 
 test('discovers only dirs with a .hub.json, honouring PROJECTS_ROOT', async (t) => {
   const root = await mkRoot();
@@ -19,14 +19,14 @@ test('discovers only dirs with a .hub.json, honouring PROJECTS_ROOT', async (t) 
   assert.equal(apps.every((a) => !a.isWorktree), true);
 });
 
-test('classifies <project>_worktree_<hash> dirs as worktrees of their parent', async (t) => {
+test('classifies .worktrees/<project>/<key> dirs as worktrees of their parent', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'alpha', { start: 'x' });
-  await mkProject(root, 'alpha_worktree_ab12cd', { start: 'x' });
+  await mkWorktree(root, 'alpha', 'ab12cd', { start: 'x' });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'alpha_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'alpha:ab12cd');
   assert.ok(wt);
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'alpha');
@@ -219,10 +219,10 @@ test('a worktree with no manifest of its own inherits its parent\'s .hub.json', 
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'alpha', { start: 'from-parent-manifest' });
-  await mkProject(root, 'alpha_worktree_ab12cd', null);
+  await mkWorktree(root, 'alpha', 'ab12cd', null);
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'alpha_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'alpha:ab12cd');
   assert.ok(wt);
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'alpha');
@@ -235,11 +235,11 @@ test('a worktree with no manifest of its own inherits its parent\'s in-memory re
   const root = await mkRoot();
   t.after(() => { unregisterInMemory('conductor'); return rmRoot(root); });
   await mkProject(root, 'conductor', null);
-  await mkProject(root, 'conductor_worktree_ab12cd', null);
+  await mkWorktree(root, 'conductor', 'ab12cd', null);
   registerInMemory('conductor', { start: 'npm start', name: 'Conductor' });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'conductor_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'conductor:ab12cd');
   assert.ok(wt);
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'conductor');
@@ -251,11 +251,11 @@ test('a worktree with no manifest of its own inherits its parent\'s disk registr
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'beta', null);
-  await mkProject(root, 'beta_worktree_ab12cd', null);
+  await mkWorktree(root, 'beta', 'ab12cd', null);
   await writeRegistrations(root, { beta: { start: 'from-registry' } });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'beta_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'beta:ab12cd');
   assert.ok(wt);
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'beta');
@@ -268,24 +268,26 @@ test('a worktree\'s own .hub.json still wins over inheriting the parent\'s manif
   t.after(() => { unregisterInMemory('gamma'); return rmRoot(root); });
   await mkProject(root, 'gamma', null);
   registerInMemory('gamma', { start: 'from-parent-memory' });
-  await mkProject(root, 'gamma_worktree_ab12cd', { start: 'own-worktree-manifest' });
+  await mkWorktree(root, 'gamma', 'ab12cd', { start: 'own-worktree-manifest' });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'gamma_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'gamma:ab12cd');
   assert.ok(wt);
   assert.equal(wt.source, 'manifest');
   assert.equal(wt.manifest.start, 'own-worktree-manifest');
 });
 
 test('a worktree\'s own disk registration still wins over the parent\'s manifest', async (t) => {
+  // The registry lookup key for a worktree IS its app id, so the entry is
+  // written under `<project>:<key>`, not the bare key.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'delta', { start: 'parent-manifest' });
-  await mkProject(root, 'delta_worktree_ab12cd', null);
-  await writeRegistrations(root, { 'delta_worktree_ab12cd': { start: 'own-worktree-registry' } });
+  await mkWorktree(root, 'delta', 'ab12cd', null);
+  await writeRegistrations(root, { 'delta:ab12cd': { start: 'own-worktree-registry' } });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'delta_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'delta:ab12cd');
   assert.ok(wt);
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'delta');
@@ -297,10 +299,10 @@ test('neither the worktree nor its parent has any manifest source: the worktree 
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'epsilon', null);
-  await mkProject(root, 'epsilon_worktree_ab12cd', null);
+  await mkWorktree(root, 'epsilon', 'ab12cd', null);
 
   const apps = await discoverApps();
-  assert.ok(!apps.find((a) => a.id === 'epsilon_worktree_ab12cd'));
+  assert.ok(!apps.find((a) => a.id === 'epsilon:ab12cd'));
 });
 
 test('a broken parent .hub.json is not inherited; the worktree is skipped, not crashed', async (t) => {
@@ -309,13 +311,13 @@ test('a broken parent .hub.json is not inherited; the worktree is skipped, not c
   const dir = path.join(root, 'zeta');
   await fs.mkdir(dir);
   await fs.writeFile(path.join(dir, '.hub.json'), '{ not json');
-  await mkProject(root, 'zeta_worktree_ab12cd', null);
+  await mkWorktree(root, 'zeta', 'ab12cd', null);
 
   const apps = await discoverApps();
   const parent = apps.find((a) => a.id === 'zeta');
   assert.ok(parent);
   assert.match(parent.manifestError, /invalid JSON/);
-  assert.ok(!apps.find((a) => a.id === 'zeta_worktree_ab12cd'));
+  assert.ok(!apps.find((a) => a.id === 'zeta:ab12cd'));
 });
 
 test('a broken parent disk registration is not inherited either', async (t) => {
@@ -323,81 +325,216 @@ test('a broken parent disk registration is not inherited either', async (t) => {
   t.after(() => rmRoot(root));
   await mkProject(root, 'eta', null);
   await writeRegistrations(root, { eta: { name: 'missing start' } });
-  await mkProject(root, 'eta_worktree_ab12cd', null);
+  await mkWorktree(root, 'eta', 'ab12cd', null);
 
   const apps = await discoverApps();
   const parent = apps.find((a) => a.id === 'eta');
   assert.ok(parent);
   assert.match(parent.manifestError, /"start" is required/);
-  assert.ok(!apps.find((a) => a.id === 'eta_worktree_ab12cd'));
+  assert.ok(!apps.find((a) => a.id === 'eta:ab12cd'));
 });
 
-test('a <x>_worktree_<hash>-shaped dir with no sibling <x> dir is not eligible for fallback, just skipped', async (t) => {
+test('a worktree of a project with NO main checkout under the root still surfaces', async (t) => {
+  // The nested layout names the parent project structurally, so parenthood is
+  // read off the intermediate dir and a sibling `<root>/<project>` is NOT
+  // required. This is the live adopted/out-of-root project case (code-hub's
+  // own checkout lives in `.plugins/`, its worktrees under the scanned root):
+  // requiring the sibling would make those worktrees invisible.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await mkProject(root, 'orphan_worktree_ab12cd', null);
+  await mkWorktree(root, 'ghost', 'ab12cd', { start: 'own-manifest' });
 
   const apps = await discoverApps();
-  assert.ok(!apps.find((a) => a.id === 'orphan_worktree_ab12cd'));
+  const wt = apps.find((a) => a.id === 'ghost:ab12cd');
+  assert.ok(wt, 'a worktree with its own manifest must surface without a parent dir under the root');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'ghost');
+  assert.equal(wt.source, 'manifest');
+  assert.ok(!apps.find((a) => a.id === 'ghost'));
 });
 
-test('classifies a named (non-hex) worktree slug as a worktree of its parent', async (t) => {
-  // Reproduces the live bug: code-conductor now composes worktree dirs with
-  // free-form slug ids (letters + hyphens), not just 6-char hex. A regex
-  // charset-matching the id shape misses this entirely and the dir vanishes
-  // from discovery. Matching on the `_worktree_` delimiter and the sibling
-  // check must classify this correctly regardless of id charset.
+test('a parentless worktree with nothing to inherit is still skipped', async (t) => {
+  // The other half of the rule above: surfacing is decided by having a
+  // manifest source, never by the parenthood check.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'ghost', 'ab12cd', null);
+
+  const apps = await discoverApps();
+  assert.ok(!apps.find((a) => a.id === 'ghost:ab12cd'));
+});
+
+test('nothing about a worktree key is inspected: differently-shaped keys both classify', async (t) => {
+  // code-conductor's key charset is its own to define and has already changed
+  // once (hex shortId -> free-form slug). The nested layout means the key is
+  // never matched against anything, so both shapes must classify identically.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'code-conductor', { start: 'x' });
-  await mkProject(root, 'code-conductor_worktree_hub-probe', { start: 'x' });
+  await mkWorktree(root, 'code-conductor', 'ab12cd', { start: 'x' });
+  await mkWorktree(root, 'code-conductor', 'hub-probe', { start: 'x' });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'code-conductor_worktree_hub-probe');
-  assert.ok(wt);
-  assert.equal(wt.isWorktree, true);
-  assert.equal(wt.project, 'code-conductor');
+  for (const key of ['ab12cd', 'hub-probe']) {
+    const wt = apps.find((a) => a.id === `code-conductor:${key}`);
+    assert.ok(wt, `worktree key ${key} should classify`);
+    assert.equal(wt.isWorktree, true);
+    assert.equal(wt.project, 'code-conductor');
+  }
 });
 
-test('a _worktree_-delimited dir with its own manifest but no matching sibling is treated as an ordinary project, not a worktree', async (t) => {
-  // Deliberately gives the dir its OWN .hub.json so it appears in the
-  // output either way. Without that, "correctly not a worktree" and
-  // "dropped for lack of a manifest" (see the orphan test above, which uses
-  // a manifest-less dir) look identical and prove nothing about the sibling
-  // check itself. Do not simplify this manifest away — that would silently
-  // gut the discriminating power of this test.
+test('two projects sharing a worktree key get distinct ids', async (t) => {
+  // The collision the `<project>:<key>` id exists to prevent: conductor scopes
+  // worktree keys per project precisely so two projects may share one.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await mkProject(root, 'solo_worktree_my-slug', { start: 'x' });
+  await mkProject(root, 'alpha', { start: 'a' });
+  await mkProject(root, 'beta', { start: 'b' });
+  await mkWorktree(root, 'alpha', 'shared', null);
+  await mkWorktree(root, 'beta', 'shared', null);
 
   const apps = await discoverApps();
-  const app = apps.find((a) => a.id === 'solo_worktree_my-slug');
+  const a = apps.find((x) => x.id === 'alpha:shared');
+  const b = apps.find((x) => x.id === 'beta:shared');
+  assert.ok(a && b);
+  assert.equal(a.manifest.start, 'a');
+  assert.equal(b.manifest.start, 'b');
+  assert.equal(a.project, 'alpha');
+  assert.equal(b.project, 'beta');
+});
+
+test('a worktree key equal to another project\'s name does not collide with it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'a' });
+  await mkProject(root, 'beta', { start: 'b' });
+  await mkWorktree(root, 'alpha', 'beta', null);
+
+  const apps = await discoverApps();
+  const project = apps.find((x) => x.id === 'beta');
+  const wt = apps.find((x) => x.id === 'alpha:beta');
+  assert.ok(project && wt);
+  assert.equal(project.isWorktree, false);
+  assert.equal(project.manifest.start, 'b');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'alpha');
+  assert.equal(wt.manifest.start, 'a'); // inherited from alpha, not beta
+});
+
+test('a worktree with its OWN broken .hub.json is an error row that still nests under its parent', async (t) => {
+  // Parenthood is known before resolution now, so a broken worktree manifest
+  // surfaces as a worktree of its project instead of a bogus top-level card.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  const wtDir = await mkWorktree(root, 'alpha', 'ab12cd', null);
+  await fs.writeFile(path.join(wtDir, '.hub.json'), '{ not json');
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'alpha:ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'alpha');
+  assert.equal(wt.manifest, null);
+  assert.equal(wt.source, 'manifest');
+  assert.match(wt.manifestError, /invalid JSON/);
+  assert.match(wt.manifestError, /ab12cd/); // names the WORKTREE's own file
+});
+
+test('a worktree\'s own broken registry entry is labelled with the worktree id', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  await mkWorktree(root, 'alpha', 'ab12cd', null);
+  await writeRegistrations(root, { 'alpha:ab12cd': { name: 'missing start' } });
+
+  const apps = await discoverApps();
+  const wt = apps.find((a) => a.id === 'alpha:ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'alpha');
+  assert.equal(wt.source, 'registry');
+  assert.match(wt.manifestError, /registrations\.json#alpha:ab12cd/);
+});
+
+test('a registry key naming only a .worktrees/<project> dir is not warned as orphaned', async (t) => {
+  // The out-of-root parent case: a project whose checkout isn't under the root
+  // holds a registration consumed only by its worktrees. Warning on it would
+  // fire on every discovery call.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'adopted', 'ab12cd', null);
+  await writeRegistrations(root, { adopted: { start: 'from-registry' } });
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.deepEqual(warnings, []);
+  const wt = apps.find((a) => a.id === 'adopted:ab12cd');
+  assert.ok(wt, 'the worktree inherits the out-of-root parent\'s registration');
+  assert.equal(wt.source, 'registry');
+  assert.equal(wt.manifest.start, 'from-registry');
+});
+
+test('a registry key naming neither a root dir nor a .worktrees project still warns', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'adopted', 'ab12cd', null);
+  await writeRegistrations(root, { nowhere: { start: 'x' } });
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try { await discoverApps(); } finally { console.warn = orig; }
+
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.match(warnings[0], /'nowhere' has no matching directory/);
+});
+
+test('appDir resolves a main checkout, a worktree id, and nothing else', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  const wtDir = await mkWorktree(root, 'alpha', 'ab12cd', null);
+
+  assert.equal(await appDir('alpha'), path.join(root, 'alpha'));
+  assert.equal(await appDir('alpha:ab12cd'), wtDir);
+  assert.equal(await appDir('alpha:nope'), null);
+  assert.equal(await appDir('nope'), null);
+});
+
+test('worktreeId composes the id discovery uses', async (t) => {
+  // discoverApps() and appDir() must never drift from each other on id shape.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  await mkWorktree(root, 'alpha', 'ab12cd', null);
+
+  const apps = await discoverApps();
+  assert.ok(apps.find((a) => a.id === worktreeId('alpha', 'ab12cd')));
+});
+
+test('a top-level dir literally named <x>_worktree_<key> is an ordinary project', async (t) => {
+  // The old flat layout is gone, not half-recognised: nothing splits on
+  // `_worktree_` any more. Gives the dir its own .hub.json so it appears in
+  // the output either way — otherwise "not a worktree" and "dropped for lack
+  // of a manifest" would look identical.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'alpha', { start: 'x' });
+  await mkProject(root, 'alpha_worktree_ab12cd', { start: 'x' });
+
+  const apps = await discoverApps();
+  const app = apps.find((a) => a.id === 'alpha_worktree_ab12cd');
   assert.ok(app);
   assert.equal(app.isWorktree, false);
-  assert.equal(app.project, 'solo_worktree_my-slug');
+  assert.equal(app.project, 'alpha_worktree_ab12cd');
 });
 
-test('a dir name containing the delimiter twice resolves to the rightmost sibling match', async (t) => {
-  const root = await mkRoot();
-  t.after(() => rmRoot(root));
-  // The sibling `a` dir is what makes this discriminate: without it, a
-  // leftmost-first implementation would also miss `a` and fall through to
-  // `a_worktree_b` by the same "no match, keep going" path — passing for
-  // the wrong reason. With both `a` and `a_worktree_b` present, leftmost
-  // wrongly stops at `a` while rightmost correctly reaches `a_worktree_b`.
-  // Looks removable; isn't.
-  await mkProject(root, 'a', { start: 'x' });
-  await mkProject(root, 'a_worktree_b', { start: 'x' });
-  await mkProject(root, 'a_worktree_b_worktree_c', null);
-
-  const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'a_worktree_b_worktree_c');
-  assert.ok(wt);
-  assert.equal(wt.isWorktree, true);
-  assert.equal(wt.project, 'a_worktree_b');
-});
-
-// A fixed port is per-checkout. These three cases cover every route by which a
+// A fixed port is per-checkout. These cases cover every route by which a
 // worktree could otherwise acquire one: inheriting the parent's manifest, its
 // own git-carried copy of that `.hub.json`, and — the discriminating one — the
 // memoized parent object being mutated rather than copied.
@@ -405,11 +542,11 @@ test('a worktree inheriting its parent\'s manifest never inherits the fixed port
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'pinned', { start: 'x', port: 3000 });
-  await mkProject(root, 'pinned_worktree_ab12cd', null); // no manifest of its own → inherits
+  await mkWorktree(root, 'pinned', 'ab12cd', null); // no manifest of its own → inherits
 
   const apps = await discoverApps();
   assert.equal(apps.find((a) => a.id === 'pinned').manifest.port, 3000);
-  const wt = apps.find((a) => a.id === 'pinned_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'pinned:ab12cd');
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.manifest.port, null);
   assert.equal(wt.manifest.start, 'x'); // everything else still inherited
@@ -422,39 +559,39 @@ test('a worktree with its OWN .hub.json carrying a port still reports null', asy
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'pinned', { start: 'x', port: 3000 });
-  await mkProject(root, 'pinned_worktree_ab12cd', { start: 'x', port: 3000 });
+  await mkWorktree(root, 'pinned', 'ab12cd', { start: 'x', port: 3000 });
 
   const apps = await discoverApps();
-  const wt = apps.find((a) => a.id === 'pinned_worktree_ab12cd');
+  const wt = apps.find((a) => a.id === 'pinned:ab12cd');
   assert.equal(wt.manifest.port, null);
   assert.equal(wt.manifest.start, 'x');
 });
 
 test('stripping a worktree\'s port copies the manifest — the parent keeps its own', async (t) => {
-  // `resolve()` memoizes one object per dir name and hands the SAME object to
-  // both the parent's row and its worktrees'. Mutating it in place to strip the
-  // worktree's port would also strip the parent's. Discovery order puts the
-  // worktree AFTER the parent (readdir + sort), so a mutating implementation
-  // corrupts the parent entry that was already pushed — this asserts on the
-  // parent read back out of the final result, which is where that shows up.
+  // `resolve()` memoizes one object per project name and hands the SAME object
+  // to both the parent's row and its worktrees'. Mutating it in place to strip
+  // the worktree's port would also strip the parent's. The worktree pass runs
+  // AFTER the root pass, so a mutating implementation corrupts the parent entry
+  // that was already pushed — this asserts on the parent read back out of the
+  // final result, which is where that shows up.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'pinned', { start: 'x', port: 3000 });
-  await mkProject(root, 'pinned_worktree_aa', null);
-  await mkProject(root, 'pinned_worktree_bb', null);
+  await mkWorktree(root, 'pinned', 'aa', null);
+  await mkWorktree(root, 'pinned', 'bb', null);
 
   const apps = await discoverApps();
   assert.equal(apps.find((a) => a.id === 'pinned').manifest.port, 3000);
-  assert.equal(apps.find((a) => a.id === 'pinned_worktree_aa').manifest.port, null);
-  assert.equal(apps.find((a) => a.id === 'pinned_worktree_bb').manifest.port, null);
+  assert.equal(apps.find((a) => a.id === 'pinned:aa').manifest.port, null);
+  assert.equal(apps.find((a) => a.id === 'pinned:bb').manifest.port, null);
 });
 
 test('a worktree of an unpinned parent is unaffected (no spurious copy)', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'plain', { start: 'x' });
-  await mkProject(root, 'plain_worktree_ab12cd', null);
+  await mkWorktree(root, 'plain', 'ab12cd', null);
 
   const apps = await discoverApps();
-  assert.equal(apps.find((a) => a.id === 'plain_worktree_ab12cd').manifest.port, null);
+  assert.equal(apps.find((a) => a.id === 'plain:ab12cd').manifest.port, null);
 });

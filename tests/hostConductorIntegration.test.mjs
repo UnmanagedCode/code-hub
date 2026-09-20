@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { unregisterInMemory } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
 
 async function bootFakeConductor() {
   const srv = http.createServer((req, res) => { res.writeHead(200); res.end('conductor-ui'); });
@@ -38,14 +38,14 @@ test('embedded: host code-conductor is always-on (share works, start/stop blocke
 
   const root = await mkRoot();
   await mkProject(root, 'code-conductor', { start: fakeAppCmd() });
-  await mkProject(root, 'code-conductor_worktree_ab12cd', { start: fakeAppCmd() });
+  await mkWorktree(root, 'code-conductor', 'ab12cd', { start: fakeAppCmd() });
   const { server, base } = await bootHub();
 
   t.after(async () => {
     delete process.env.CONDUCTOR_PLUGIN_ID;
     delete process.env.CONDUCTOR_URL;
     unregisterInMemory('code-conductor');
-    await appManager.stop('code-conductor_worktree_ab12cd').catch(() => {});
+    await appManager.stop('code-conductor:ab12cd').catch(() => {});
     server.close();
     conductorSrv.close();
     await rmRoot(root);
@@ -61,7 +61,7 @@ test('embedded: host code-conductor is always-on (share works, start/stop blocke
   assert.equal(main.port, conductorPort);
   assert.equal(main.isWorktree, false);
 
-  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor:ab12cd');
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.alwaysOn, false);
   assert.equal(wt.status, 'stopped');
@@ -82,13 +82,13 @@ test('embedded: host code-conductor is always-on (share works, start/stop blocke
   assert.equal(res.body.tunnel, null);
 
   // The worktree remains fully independent: normal start/stop lifecycle.
-  res = await j(base, 'POST', '/api/apps/code-conductor_worktree_ab12cd/start');
+  res = await j(base, 'POST', '/api/apps/code-conductor%3Aab12cd/start');
   assert.equal(res.status, 200);
   await waitFor(async () => {
     const { body } = await j(base, 'GET', '/api/apps');
-    return ['ready', 'running'].includes(body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd').status);
+    return ['ready', 'running'].includes(body.apps.find((a) => a.id === 'code-conductor:ab12cd').status);
   });
-  res = await j(base, 'POST', '/api/apps/code-conductor_worktree_ab12cd/stop');
+  res = await j(base, 'POST', '/api/apps/code-conductor%3Aab12cd/stop');
   assert.equal(res.status, 200);
 });
 
@@ -260,7 +260,7 @@ test('embedded, worktree with no .hub.json of its own inherits the host conducto
 
   const root = await mkRoot();
   await mkProject(root, 'code-conductor', null); // no .hub.json — init() registers it in-memory
-  await mkProject(root, 'code-conductor_worktree_ab12cd', null); // no .hub.json, no own registration
+  await mkWorktree(root, 'code-conductor', 'ab12cd', null); // no .hub.json, no own registration
   const { server, base } = await bootHub();
 
   t.after(async () => {
@@ -274,8 +274,57 @@ test('embedded, worktree with no .hub.json of its own inherits the host conducto
 
   const res = await j(base, 'GET', '/api/apps');
   assert.equal(res.status, 200);
-  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor:ab12cd');
   assert.ok(wt, 'worktree should be surfaced via parent in-memory-manifest inheritance');
+  assert.equal(wt.isWorktree, true);
+  assert.equal(wt.project, 'code-conductor');
+  assert.equal(wt.source, 'memory');
+  assert.equal(wt.alwaysOn, false);
+  assert.equal(wt.status, 'stopped');
+  assert.equal(wt.error, null);
+});
+
+test('embedded, conductor checkout OUTSIDE the root: its in-root worktree still inherits the in-memory manifest', async (t) => {
+  // The live code-hub case, and what the widened `init()` guard exists for:
+  // code-conductor puts every worktree under `<root>/.worktrees/<project>/`
+  // whatever directory the project's own tree lives in, so an out-of-root
+  // checkout DOES get in-root worktrees. Skipping registerInMemory for it
+  // (the old "a worktree is always a sibling of its checkout" premise) leaves
+  // that worktree with nothing to inherit and it vanishes from the listing.
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+
+  const root = await mkRoot();
+  // No `<root>/code-conductor` at all — the checkout lives elsewhere.
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-conductor-'));
+  const conductorDir = await mkProject(outsideParent, 'code-conductor', null, { git: true });
+  process.env.CONDUCTOR_PROJECT_DIR = conductorDir;
+  await mkWorktree(root, 'code-conductor', 'ab12cd', null, { git: true }); // no manifest of its own
+
+  const { server, base } = await bootHub();
+
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.path, conductorDir);
+  assert.equal(main.alwaysOn, true);
+
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor:ab12cd');
+  assert.ok(wt, 'an in-root worktree of an out-of-root conductor must still surface');
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'code-conductor');
   assert.equal(wt.source, 'memory');
@@ -288,7 +337,7 @@ test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree sti
   // Regression coverage: a prior version only called registerInMemory() in
   // the discovery-fallback branch (no CONDUCTOR_PROJECT_DIR), so this
   // injected-dir path never registered code-conductor's manifest in memory
-  // and any code-conductor_worktree_* dir silently vanished from the listing
+  // and any `code-conductor:<key>` worktree silently vanished from the listing
   // — even though its checkout was right there on disk.
   const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
   process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
@@ -297,7 +346,7 @@ test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree sti
   const root = await mkRoot();
   const conductorDir = await mkProject(root, 'code-conductor', null); // no .hub.json, lives in-root
   process.env.CONDUCTOR_PROJECT_DIR = conductorDir; // modern conductor injects its own dir
-  await mkProject(root, 'code-conductor_worktree_ab12cd', null, { git: true }); // no .hub.json, no own registration
+  await mkWorktree(root, 'code-conductor', 'ab12cd', null, { git: true }); // no .hub.json, no own registration
 
   const { server, base } = await bootHub();
 
@@ -321,7 +370,7 @@ test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree sti
   assert.equal(main.isWorktree, false);
   assert.equal(main.path, conductorDir); // still resolved from the injected dir
 
-  const wt = res.body.apps.find((a) => a.id === 'code-conductor_worktree_ab12cd');
+  const wt = res.body.apps.find((a) => a.id === 'code-conductor:ab12cd');
   assert.ok(wt, 'worktree of an in-root, injected-dir host conductor should still be surfaced via manifest inheritance');
   assert.equal(wt.isWorktree, true);
   assert.equal(wt.project, 'code-conductor');

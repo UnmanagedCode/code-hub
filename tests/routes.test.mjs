@@ -12,7 +12,7 @@ import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
 import net from 'node:net';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, spawnFakeFunnel, tailscaleEvents, funnelEvents, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, spawnFakeFunnel, tailscaleEvents, funnelEvents, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
@@ -1262,18 +1262,21 @@ test('a worktree of a fixed-port project starts on a FREE port, not the pinned o
   await mkProject(root, 'app', { start: fakeAppCmd(), port }, { git: true });
   // Git carries the parent's .hub.json into the worktree checkout — same file,
   // fixed port and all. Discovery must strip it so both can run at once.
-  await mkProject(root, 'app_worktree_ab12cd', { start: fakeAppCmd(), port }, { git: true });
+  await mkWorktree(root, 'app', 'ab12cd', { start: fakeAppCmd(), port }, { git: true });
   const { server, base } = await boot(root);
   t.after(async () => {
     await appManager.stop('app').catch(() => {});
-    await appManager.stop('app_worktree_ab12cd').catch(() => {});
+    await appManager.stop('app:ab12cd').catch(() => {});
     server.close(); await rmRoot(root);
   });
 
   const parent = await j(base, 'POST', '/api/apps/app/start');
   assert.equal(parent.body.port, port);
 
-  const wt = await j(base, 'POST', '/api/apps/app_worktree_ab12cd/start');
+  // Encoded exactly as the client sends it (`encodeURIComponent(app.id)`):
+  // this is also the end-to-end proof that a `:`-bearing id survives the REST
+  // surface and matches `/api/apps/:id/start` unchanged.
+  const wt = await j(base, 'POST', '/api/apps/app%3Aab12cd/start');
   assert.equal(wt.status, 200, JSON.stringify(wt.body));
   assert.equal(wt.body.fixedPort, null);
   assert.notEqual(wt.body.port, port); // it did not try to take the parent's port

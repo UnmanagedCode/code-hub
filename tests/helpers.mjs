@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { WORKTREES_DIRNAME } from '../src/projects.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -83,6 +84,11 @@ export async function mkProject(root, name, manifest, { git = false } = {}) {
   }
   return dir;
 }
+
+// Create a worktree checkout at the layout code-conductor produces:
+// <root>/.worktrees/<project>/<key>. Same manifest/git options as mkProject.
+export const mkWorktree = (root, project, key, manifest, opts) =>
+  mkProject(root, path.join(WORKTREES_DIRNAME, project, key), manifest, opts);
 
 // Write <root>/.code-hub/registrations.json directly, bypassing appManager,
 // so tests can set up registry state (including deliberately malformed raw
