@@ -47,7 +47,7 @@
       },
       {
         "name": "register_app",
-        "description": "Register a sibling project directory that has no .hub.json as a startable app (machine-local, written to registrations.json). Rejected if the directory already has a .hub.json. An optional fixed `port` (1024-65535) pins the app to that port on its default checkout instead of an allocated free one; worktrees ignore it and always get a free port. Multi-route apps (a routes array) can't be expressed in this schema — register those by hand-editing registrations.json directly.",
+        "description": "Register a project directory or worktree checkout that has no .hub.json as a startable app (machine-local, written to registrations.json). `id` is the app id: a project's directory basename, or `<project>:<key>` for a worktree. `:` is reserved for that qualifier, so an id containing one is only ever resolved as a worktree — a project directory whose name contains `:` cannot be registered (or served) at all. Rejected if the directory already has a .hub.json. An optional fixed `port` (1024-65535) pins the app to that port on its default checkout instead of an allocated free one; worktrees ignore it and always get a free port. Multi-route apps (a routes array) can't be expressed in this schema — register those by hand-editing registrations.json directly.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -63,7 +63,7 @@
       },
       {
         "name": "unregister_app",
-        "description": "Remove a machine-local registration for a sibling project (from registrations.json). Has no effect on a project with its own .hub.json.",
+        "description": "Remove a machine-local registration for a project or worktree (from registrations.json), by app id. Has no effect on one with its own .hub.json.",
         "inputSchema": {
           "type": "object",
           "properties": {

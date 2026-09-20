@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
-  discoverApps, projectsRoot, MANIFEST_FILENAME,
+  discoverApps, projectsRoot, MANIFEST_FILENAME, appDir, listWorktreeDirs, isWorktreeId,
+  WORKTREE_ID_QUALIFIER,
   validateManifestObject, readRegistry, writeRegistry, registerInMemory,
 } from './projects.js';
 import * as state from './state.js';
@@ -26,8 +27,7 @@ const proxies = new Map();
 
 // True when `dir` is `root` itself or a descendant of it. Used to decide
 // whether the injected host-conductor dir is reachable by discoverApps()'s
-// root scan at all — an out-of-root checkout (and therefore any worktree of
-// it, which is always a sibling of the checkout) never is.
+// root scan at all.
 function isUnderRoot(root, dir) {
   const rel = path.relative(root, dir);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
@@ -72,15 +72,17 @@ export async function init() {
       // discovery needed. list()'s second loop surfaces this store.apps
       // record even though discoverApps() never returns it.
       appPath = injectedDir;
-      // Only register in-memory when that dir is actually reachable by
-      // discoverApps()'s root scan. Worktrees are always created as siblings
-      // of the checkout they branch from, so an out-of-root checkout can
-      // never have an in-root worktree either — registering here would do
-      // nothing useful, and would either shadow the injected dir with a
-      // same-named but unrelated sibling under root (wrong path/git info) or,
-      // with no such sibling, make discoverApps() warn about an orphaned key
-      // on every call.
-      if (isUnderRoot(projectsRoot(), injectedDir)) {
+      // Register in-memory only when the id actually resolves to something
+      // under the root: the checkout itself, or — since a worktree need not
+      // be a sibling of its checkout, cc rooting a local-system project's
+      // worktrees at `<root>/.worktrees/<project>/` wherever its tree lives —
+      // at least one worktree of it, which needs the registration to inherit
+      // a manifest at all. Registering
+      // when neither exists would make discoverApps() warn about an orphaned
+      // key on every call, and could shadow the injected dir with a same-named
+      // but unrelated sibling under the root (wrong path/git info).
+      const hasInRootWorktree = (await listWorktreeDirs()).worktrees.some((w) => w.project === HOST_CONDUCTOR_ID);
+      if (isUnderRoot(projectsRoot(), injectedDir) || hasInRootWorktree) {
         registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
       }
     } else {
@@ -88,8 +90,8 @@ export async function init() {
       // `code-conductor/` dir under the root. The conductor carries no
       // `.hub.json` of its own, so register it in-memory (never persisted)
       // before discovering — this is what makes discoverApps() find it at
-      // all, and lets a code-conductor_worktree_* dir with no manifest of its
-      // own inherit one via projects.js's worktree-parent-fallback.
+      // all, and lets a `code-conductor:<key>` worktree with no manifest of
+      // its own inherit one via projects.js's worktree-parent-fallback.
       registerInMemory(HOST_CONDUCTOR_ID, { start: 'npm start', name: 'code-conductor', healthPath: '/' });
       const discovered = await discoverApps();
       const app = discovered.find((a) => a.id === HOST_CONDUCTOR_ID && !a.isWorktree);
@@ -751,23 +753,26 @@ async function hasManifestFile(dir) {
   }
 }
 
-// Register a sibling dir that has no `.hub.json` of its own as a startable
-// app, by writing an entry into registrations.json (see projects.js). A dir
-// that already has a `.hub.json` — even a broken one — needs no registration
-// and is rejected outright; it always wins over any registry entry.
+// Register a project dir or worktree checkout that has no `.hub.json` of its
+// own as a startable app, by writing an entry into registrations.json (see
+// projects.js). A dir that already has a `.hub.json` — even a broken one —
+// needs no registration and is rejected outright; it always wins over any
+// registry entry.
 export async function registerApp({ id, start, name, healthPath, readyWhen, port, routes } = {}) {
   if (typeof id !== 'string' || id.length === 0 || id.startsWith('.') || path.basename(id) !== id) {
     const e = new Error('id is required and must be a plain, non-dot-prefixed directory basename (no path separators)'); e.statusCode = 400; throw e;
   }
-  const dir = path.join(projectsRoot(), id);
-  let stat;
-  try {
-    stat = await fs.stat(dir);
-  } catch {
-    stat = null;
-  }
-  if (!stat || !stat.isDirectory()) {
-    const e = new Error(`'${id}' is not an existing directory under the projects root`); e.statusCode = 400; throw e;
+  const dir = await appDir(id);
+  if (!dir) {
+    // A qualified id can only ever name a worktree — `:` is reserved, so it
+    // is never resolved against the projects root even when a directory of
+    // that exact name sits there. Saying "not an existing directory" would be
+    // false in that case, so name the rule instead; deciding it from the id's
+    // shape alone also keeps a `:`-bearing id off every filesystem path.
+    const e = new Error(isWorktreeId(id)
+      ? `'${id}' matches no worktree under the projects root — '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids (<project>:<key>), so an id containing one never names a project directory`
+      : `'${id}' is not an existing directory under the projects root`);
+    e.statusCode = 400; throw e;
   }
   if (await hasManifestFile(dir)) {
     const e = new Error(`'${id}' already has a .hub.json — no registration needed`); e.statusCode = 409; throw e;

@@ -32,8 +32,8 @@ export function hostConductorDir() {
 }
 
 // True only for the main code-conductor checkout while embedded — never for
-// a worktree (those have a distinct `_worktree_<hash>`-suffixed id, so this
-// can never misfire on one).
+// a worktree (a worktree id always carries a `:<key>` suffix, so this can
+// never misfire on one).
 export function isHostConductorId(id) {
   return isEmbedded() && id === HOST_CONDUCTOR_ID;
 }
