@@ -682,6 +682,73 @@ test('a refused worktree that was never going to serve anything is skipped silen
   assert.equal(apps.length, 0);
 });
 
+test('a refused worktree whose parent donates via registrations.json still warns', async (t) => {
+  // resolve() looks the parent up BY NAME against the registries, which is
+  // independent of any root directory — so a registration keyed `a:b` is a
+  // real app this refusal costs, even though `<root>/a:b` doesn't exist and
+  // would itself be refused if it did. Skipping the parent arm for a refused
+  // `<project>` loses this silently: the only log would be the generic
+  // orphan-key warning, which says nothing about the checkout.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'a:b', 'c', null); // no manifest of its own → would inherit
+  await writeRegistrations(root, { 'a:b': { start: 'from-registry' } });
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.equal(apps.length, 0);
+  assert.ok(
+    warnings.some((w) => w.includes('is not servable') && w.includes(path.join('.worktrees', 'a:b', 'c'))),
+    warnings.join('\n'),
+  );
+});
+
+test('a refused worktree carrying a BROKEN manifest of its own warns', async (t) => {
+  // The own.error arm, isolated: no parent anywhere, so neither own.manifest
+  // nor the parent arm can carry this — only the broken manifest can. A
+  // servable app was not lost, but a loud failure was, and swallowing it
+  // would leave the checkout silently invisible with a broken file on disk.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const wtDir = await mkWorktree(root, 'orphan', 'we:ird', null);
+  await fs.writeFile(path.join(wtDir, '.hub.json'), '{ not json');
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.equal(apps.length, 0);
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.match(warnings[0], /is not servable/);
+  assert.ok(warnings[0].includes(path.join('.worktrees', 'orphan', 'we:ird')), warnings[0]);
+});
+
+test('a registry key whose only in-root worktrees are REFUSED still warns as orphaned', async (t) => {
+  // The orphan-key exemption reads the composable `worktrees` array, never
+  // `refused`: a refused checkout consumes nothing, so the key really does
+  // name nothing servable. Folding `refused` into the exemption would
+  // suppress this warning and leave a dead registration unreported forever.
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkWorktree(root, 'ghost', 'we:ird', null); // clean project name, refused key
+  await writeRegistrations(root, { ghost: { start: 'x' } });
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.equal(apps.length, 0);
+  assert.ok(warnings.some((w) => /'ghost' has no matching directory/.test(w)), warnings.join('\n'));
+});
+
 test('a qualified id never resolves to a root directory of that exact name', async (t) => {
   // The no-worktree arm of appDir's short-circuit. Pre-reservation this
   // resolved to the root dir, so registerApp wrote a registry entry under an

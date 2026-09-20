@@ -401,11 +401,12 @@ export async function discoverApps() {
   // point is that its id would be ambiguous.
   for (const { project, key, dir } of refused) {
     const own = await resolveManifestSource(worktreeId(project, key), dir, registry);
-    // A refused `<project>` is itself unservable as a root app, so there is
-    // nothing it could have donated — and not resolving it keeps a
-    // qualifier-bearing name off every filesystem path.
-    const parentWouldServe = !isWorktreeId(project) && Boolean((await resolve(project)).manifest);
-    if (own.manifest || own.error || parentWouldServe) {
+    // The parent arm applies to a refused `<project>` too: resolve() looks it
+    // up BY NAME against the registries, which is independent of whether a
+    // root directory of that name exists or is itself servable — the same
+    // by-name route that lets an out-of-root parent donate a manifest. So a
+    // registration keyed `a:b` really is an app this refusal costs.
+    if (own.manifest || own.error || (await resolve(project)).manifest) {
       console.warn(`[code-hub] '${path.relative(root, dir)}' is not servable: '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids, so a worktree's project or key cannot contain one`);
     }
   }
