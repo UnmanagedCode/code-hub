@@ -1072,3 +1072,21 @@ test('an overlay project whose recorded tree has a BROKEN .hub.json surfaces the
   assert.equal(main.source, 'manifest');
   assert.match(main.manifestError, /invalid JSON/);
 });
+
+test('appDir() refuses an overlay id with no worktree — the same condition the listing emits on', async (t) => {
+  // The listing and id resolution decide through one predicate. When they
+  // drifted, `register_app` accepted an id no card would ever show: a
+  // permanent unusable registry entry, plus an orphan-key warning on every
+  // 2s poll.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const solo = await mkProject(outside, 'solo', null);       // conductor knows it, no worktree here
+  const paired = await mkProject(outside, 'paired', null);   // conductor knows it, worktree here
+  await mkWorktree(root, 'paired', 'ab12cd', null);
+  await useConductorOverlay([ccProject('solo', solo), ccProject('paired', paired)]);
+
+  assert.equal(await appDir('solo'), null, 'no worktree ⇒ no servable app ⇒ no directory');
+  assert.equal(await appDir('paired'), paired, 'the same predicate says yes for the group that has one');
+  assert.equal((await discoverApps()).find((a) => a.id === 'solo'), undefined);
+});

@@ -35,20 +35,24 @@ For a project on code-conductor's **local system** — the only kind code-hub sc
 
 **Trigger:** `CONDUCTOR_PLUGIN_ID` + `CONDUCTOR_URL` both set (the same "embedded" test `src/hostConductor.js` owns). Standalone code-hub never makes this call and behaves exactly as it would without the feature.
 
-**Call:** `GET ${CONDUCTOR_URL}/api/projects`, the conductor's own listing — a bare JSON array of `{ name, path, system, ... }`. Fired at `appManager.init()` (awaited once, off the request path) and lazily by discovery when the cached answer is older than 5s; never awaited on a request. 2s timeout per call.
+**Call:** `GET ${CONDUCTOR_URL}/api/projects`, the conductor's own listing — a bare JSON array of `{ name, path, system, ... }`. Fired at `appManager.init()` (awaited once, off the request path) and lazily by discovery once 5s have passed since the last **attempt** — success or failure alike, which is what holds a down conductor to one call per 5s rather than one per 2s poll; never awaited on a request. 2s timeout per call.
 
 **What it contributes:** a `name -> absolute tree directory` map (`src/conductorProjects.js`). `discoverApps()` uses it for exactly two things, both additive:
 
 1. A **third pass** emitting a main-checkout row (`isWorktree: false`, `path` = the recorded tree) for a project that (a) the root scan produced **no directory of that name** for, (b) has ≥1 non-refused worktree under `<projectsRoot>/.worktrees/`, and (c) whose recorded path still stats as a directory. Without this the project's worktrees render under a header-only "no main checkout" card.
 2. The directory a project **name** resolves to for manifest resolution, so an overlay project's own `.hub.json` is read at its real tree — both for its own row and for its worktrees' inheritance (see above).
 
-**Precedence:** the filesystem scan wins. A name the root scan produced a directory for is served from that directory, in discovery and in `appDir()` alike; the overlay row is dropped, with a `console.warn` naming both paths when the conductor recorded a different directory *and* the project has worktrees (behaviour is unchanged in that case — the warning exists because the disagreement is otherwise silent).
+**Precedence:** the filesystem scan wins. A name the root scan produced a directory for is served from that directory, in discovery and in `appDir()` alike; the overlay row is dropped, with a `console.warn` naming both paths when the row would otherwise have been served — the project has worktrees under the root and the recorded path still stats as a directory — and that directory is not the root one. A recorded path that has vanished produces no warning, since nothing was lost. Behaviour is unchanged in every case; the warning exists because the disagreement is otherwise silent.
 
-**Rows dropped** (silently, since the same rules already make such a project's worktrees invisible): anything whose `system` isn't `local` (a project on a registered remote system — its tree *and* its worktrees are on another machine, so code-hub can serve neither), a non-absolute or empty `path` (which is what a conductor row degraded to an unparseable record carries), and a `name` that is empty, dot-leading, not a single path segment, or carries the reserved `:`.
+**Rows dropped**, all silently:
 
-**Degradation:** every failure — not embedded, connection refused, conductor restarted on another port, timeout, non-2xx, non-JSON, not an array — is silent and **keeps the last good answer**; the snapshot is never cleared, so the conductor can never empty the listing. With no successful fetch the overlay is empty and discovery is exactly the filesystem answer.
+- `system` isn't `local` — a project on a registered remote system: its tree *and* its worktrees are on another machine, so neither is under the scanned root and code-hub can serve neither.
+- `name` empty, dot-leading, not a single path segment, or carrying the reserved `:` — code-hub's own scan already refuses such a name (a dot-prefixed or `:`-bearing `<project>` under `.worktrees/` is skipped or refused), so the drop costs nothing that was ever visible.
+- `path` empty or not absolute — what the conductor emits for a row whose project record it could not parse. It is telling code-hub it does not know where that tree is, so there is no directory to serve and nothing to say; the project's worktrees stay listed under the "no main checkout" card, which is the honest rendering of exactly that.
 
-**`register_app` on an overlay id** works: `appDir()` reads the *same* snapshot discovery does, so an id the listing shows is an id a registration can target, and the entry is keyed by that id like any other. With the conductor unreachable the id is in neither, and `register_app` refuses it with the ordinary `'<id>' is not an existing directory under the projects root` — correct degradation, not a bug: code-hub cannot confirm where that tree is.
+**Degradation:** every failure — not embedded, connection refused, conductor restarted on another port, timeout, non-2xx, non-JSON, not an array — is silent and **keeps the last good answer**, so no failure can empty the listing. A *successful* answer always replaces it, including an empty array or one whose every row is refused: that is the conductor saying it knows of no project here, which is an answer. With no successful fetch the overlay is empty and discovery is exactly the filesystem answer.
+
+**`register_app` on an overlay id** works for exactly the ids the listing shows: `appDir()` and the overlay pass decide through one shared predicate (`overlayAppDir()` in `src/projects.js`) over the same snapshot, so a conductor project with no worktree under the root — one no card will ever show — is refused rather than persisted as an entry naming an app that can never start. For an id that does qualify, the entry is keyed by that id like any other. With the conductor unreachable the id is in neither, and `register_app` refuses it with the ordinary `'<id>' is not an existing directory under the projects root` — correct degradation, not a bug: code-hub cannot confirm where that tree is.
 
 ## HTTP API (`/api`, JSON)
 
@@ -110,7 +114,7 @@ Response fields: `kind` (`"tunnel"`, `"lan"` or `"tailscale"`), `url` (primary s
   "error": null,                // crash tail for a crashed app, else whatever `manifestError` says for a stopped non-startable one; display-only, not the Start-disable signal
   "manifestError": null,        // "this app cannot start, here is why" — a manifest/registration that failed to parse or validate, or no manifest source at all (a conductor-overlay row). The Start-disable signal; null when the app can start
   "alwaysOn": false,            // true only for the host code-conductor when code-hub runs embedded as its plugin
-  "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), or "memory" (in-memory registration) — for a worktree with none of its own, reflects where its PARENT's manifest came from (see "Worktree manifest inheritance" above)
+  "source": "manifest"          // "manifest" (has a .hub.json), "registry" (registrations.json), "memory" (in-memory registration), or null when there is no manifest source at all (a conductor-overlay row, which `manifestError` then explains) — for a worktree with none of its own, reflects where its PARENT's manifest came from (see "Worktree manifest inheritance" above)
 }
 ```
 

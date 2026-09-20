@@ -80,8 +80,22 @@ test('a body that is not JSON keeps the last good snapshot', async (t) => {
 
 test('a JSON body that is not an array keeps the last good snapshot', async (t) => {
   t.after(cleanup);
-  await goodThen(async () => ok({ projects: [row('beta', '/trees/beta')] }));
+  // A STRING body, deliberately: it is iterable, so without the Array.isArray
+  // guard it walks character by character, every char is refused as a row,
+  // and the snapshot is replaced by an empty Map — a silent emptying of the
+  // listing rather than a retained answer. A non-iterable body (an object)
+  // would only throw into the same silent catch and prove nothing.
+  await goodThen(async () => ok('["alpha"]'));
   assert.deepEqual([...conductorProjects.snapshot()], [['alpha', '/trees/alpha']]);
+});
+
+test('a successful EMPTY array replaces the snapshot — retention is for failures only', async (t) => {
+  t.after(cleanup);
+  // The conductor answering "no projects" is an answer, not a failure: the
+  // last known project may genuinely be gone, and holding it would keep a
+  // card for a tree nothing owns.
+  await goodThen(async () => ok([]));
+  assert.equal(conductorProjects.snapshot().size, 0);
 });
 
 test('a refused connection keeps the last good snapshot', async (t) => {
@@ -94,11 +108,25 @@ test('a timeout keeps the last good snapshot, and refresh() still resolves', asy
   t.after(cleanup);
   // What AbortSignal.timeout() produces when the budget runs out, raised
   // without waiting out a real 2s.
-  await goodThen(async (_url, opts) => {
-    assert.ok(opts.signal instanceof AbortSignal, 'the fetch must carry the timeout signal');
+  await goodThen(async () => {
     throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
   });
   assert.equal(conductorProjects.snapshot().get('alpha'), '/trees/alpha');
+});
+
+test('the fetch carries an abort signal, so the call is bounded', async (t) => {
+  t.after(cleanup);
+  embed();
+  // Captured and asserted AFTER refresh() returns: anything thrown inside the
+  // fetch impl is swallowed by the module's own failure containment, so an
+  // assertion made in there can never fail a test.
+  let seen = null;
+  conductorProjects._setFetchImpl(async (url, opts) => { seen = { url, opts }; return ok([]); });
+
+  await conductorProjects.refresh();
+  assert.equal(seen.url, 'http://127.0.0.1:1/api/projects');
+  assert.ok(seen.opts?.signal instanceof AbortSignal, 'no abort signal ⇒ the 2s budget is not enforced');
+  assert.equal(seen.opts.signal.aborted, false);
 });
 
 test('unusable rows are dropped one by one; the usable ones in the same body survive', async (t) => {

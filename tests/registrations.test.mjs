@@ -242,3 +242,21 @@ test('registerApp: with the conductor unreachable an overlay id refuses, and wri
   );
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 });
+
+test('registerApp: an overlay id the listing would not show is refused, and writes nothing', async (t) => {
+  // A conductor project with no worktree under the root is not code-hub's to
+  // serve. Accepting it would persist a registry entry naming an app that can
+  // never appear or start, and make discovery warn about the orphaned key on
+  // every poll.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const solo = await mkProject(outside, 'solo', null);
+  await useConductorOverlay([ccProject('solo', solo)]);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'solo', start: 'npm start' }),
+    /'solo' is not an existing directory under the projects root/,
+  );
+  await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
+});

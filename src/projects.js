@@ -118,6 +118,31 @@ async function isDirectory(p) {
   }
 }
 
+// THE definition of "this conductor-overlay name is a servable app, served
+// from here" — the directory to serve it from, or null. Both the overlay pass
+// in discoverApps() and appDir() below decide through this one function, so
+// the listing and id resolution cannot disagree about whether an overlay id
+// exists; agreeing by convention is exactly how `register_app` came to accept
+// an id the listing would never show.
+//
+// The caller supplies the facts it already has: `hasRootDir` (the root scan
+// produced a directory of this name, which always wins), and `wtProjects`
+// (the projects of the non-refused worktrees under the root). The recorded
+// path is stat-verified here — a snapshot up to its TTL old can name a tree
+// that has since moved or gone — and never composed from an id. Nothing here
+// enumerates a directory; `listWorktreeDirs()` remains the only place that
+// does.
+async function overlayAppDir(name, { overlay, hasRootDir, wtProjects }) {
+  if (hasRootDir) return null;
+  const ccDir = overlay.get(name);
+  if (!ccDir) return null;
+  // Scope: the overlay gives an orphaned worktree group its real parent. A
+  // conductor project with no worktree under the root is not code-hub's to
+  // serve, by the listing or by an id.
+  if (!wtProjects.has(name)) return null;
+  return await isDirectory(ccDir) ? ccDir : null;
+}
+
 // Absolute directory an app id names, or null if it names none. The one
 // id -> dir resolution that can't go through discoverApps() (registerApp
 // targets a dir that isn't servable yet, so discovery never returns it).
@@ -130,16 +155,21 @@ export async function appDir(id) {
     const dir = path.join(projectsRoot(), id);
     if (await isDirectory(dir)) return dir; // a main checkout under the root
   }
-  // Else the conductor overlay, read from the SAME snapshot discoverApps()
-  // reads, so the two can never disagree about whether an overlay id exists.
-  // The names it can hold are already guarded (single segment, not
-  // dot-leading, qualifier-free), so no id shape can reach a path through
-  // here that the root branch above would have refused. With the conductor
-  // unreachable the id is in neither, and registerApp refusing it is the
-  // correct degradation.
-  const overlayDir = conductorProjects.snapshot().get(id);
-  if (overlayDir && await isDirectory(overlayDir)) return overlayDir;
   const { worktrees } = await listWorktreeDirs();
+  // Else the conductor overlay, decided by the SAME predicate the listing
+  // decides by, off the same snapshot. The names a snapshot can hold are
+  // guarded (single segment, not dot-leading, qualifier-free), so no id shape
+  // reaches a path through here that the root branch above would have
+  // refused — and that branch has already returned if a directory of this
+  // name exists under the root, which is why `hasRootDir` is false here. With
+  // the conductor unreachable the id is in neither the snapshot nor the
+  // listing, and registerApp refusing it is the correct degradation.
+  const overlayDir = await overlayAppDir(id, {
+    overlay: conductorProjects.snapshot(),
+    hasRootDir: false,
+    wtProjects: new Set(worktrees.map((w) => w.project)),
+  });
+  if (overlayDir) return overlayDir;
   const wt = worktrees.find((w) => worktreeId(w.project, w.key) === id);
   return wt ? wt.dir : null;
 }
@@ -455,31 +485,29 @@ export async function discoverApps() {
 
   const wtProjects = new Set(worktrees.map((w) => w.project));
   for (const [name, ccDir] of overlay) {
-    // An orphaned worktree group is the whole scope: a conductor project with
-    // no worktree under the root is not on screen today, and the overlay does
-    // not put it there.
-    if (!wtProjects.has(name)) continue;
-    if (rootDirNames.has(name)) {
+    const hasRootDir = rootDirNames.has(name);
+    const dir = await overlayAppDir(name, { overlay, hasRootDir, wtProjects });
+    if (!dir) {
       // Suppressed by the root scan — correct, and behaviour is unchanged.
       // But when that suppression cost a row it is silently wrong (the card
-      // says one checkout, the conductor means another), so say so. Compared
-      // through realpath on the ROOT directory, since the conductor's path is
-      // already one — a symlinked root must not read as a disagreement.
-      const inRoot = path.join(root, name);
-      const realInRoot = await fs.realpath(inRoot).catch(() => inRoot);
-      if (realInRoot !== ccDir && await isDirectory(ccDir)) {
-        console.warn(`[code-hub] '${name}': code-conductor records this project at '${ccDir}', but the projects root has its own '${inRoot}' — serving the root directory, and nesting the worktrees under its card`);
+      // says one checkout, the conductor means another), so say so. "Cost a
+      // row" is the same predicate with the root directory taken out of it,
+      // so the warning can never disagree with the emit decision about what a
+      // servable overlay row is. Compared through realpath on the ROOT
+      // directory, since the conductor's path is already one — a symlinked
+      // root must not read as a disagreement.
+      if (hasRootDir && await overlayAppDir(name, { overlay, hasRootDir: false, wtProjects })) {
+        const inRoot = path.join(root, name);
+        const realInRoot = await fs.realpath(inRoot).catch(() => inRoot);
+        if (realInRoot !== ccDir) {
+          console.warn(`[code-hub] '${name}': code-conductor records this project at '${ccDir}', but the projects root has its own '${inRoot}' — serving the root directory, and nesting the worktrees under its card`);
+        }
       }
       continue;
     }
-    // Stat-verified, never composed from an id: the path comes off the
-    // conductor's record, and a snapshot up to its TTL old can name a tree
-    // that has since moved or gone. listWorktreeDirs() stays the single
-    // directory enumerator — this pass enumerates nothing.
-    if (!await isDirectory(ccDir)) continue;
     const res = await resolve(name);
     out.push({
-      id: name, project: name, path: ccDir, isWorktree: false, branch: null,
+      id: name, project: name, path: dir, isWorktree: false, branch: null,
       manifest: res.manifest,
       manifestError: res.error ? res.error.message : (res.manifest ? null : NO_MANIFEST_SOURCE),
       source: res.source,

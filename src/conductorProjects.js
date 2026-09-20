@@ -29,13 +29,15 @@ const LOCAL_SYSTEM = 'local';
 const FETCH_TIMEOUT_MS = 2000;
 
 // At most one conductor call per 5s however many UI clients poll at 2s. The
-// window is counted from the END of the previous attempt, success or not, so a
-// down conductor is retried at this cadence rather than on every request.
+// window is counted from the end of the previous ATTEMPT, success or not (see
+// `lastAttemptAt`), which is what holds a down conductor to this cadence — a
+// window counted from the last SUCCESS would retry on every request.
 const OVERLAY_TTL_MS = 5000;
 
 // Last good answer. Replaced atomically on success and RETAINED on every
-// failure — never cleared, so the conductor can never empty code-hub's
-// listing.
+// failure, so no failure can empty code-hub's listing. A successful answer
+// always wins, empty included: "the conductor knows of no project here" is an
+// answer, and holding a departed project's tree would keep a card for it.
 let cache = new Map();
 let lastAttemptAt = 0;
 let inFlight = null;
@@ -58,11 +60,11 @@ export function _reset() {
 }
 
 // The overlay, as a `Map<projectName, absoluteDir>`. Synchronous, never
-// throws, never blocks: it hands back the last good answer and — when that
-// answer is older than the TTL — fires a refresh it does NOT await, so no
-// request path ever waits on the conductor. Empty until the first successful
-// fetch lands, which is what makes standalone code-hub behave exactly as it
-// did before this module existed.
+// throws, never blocks: it hands back the last good answer and — once the TTL
+// has passed since the last ATTEMPT finished — fires a refresh it does NOT
+// await, so no request path ever waits on the conductor. Empty until the
+// first successful fetch lands; standalone it stays empty for the process's
+// life, so the listing there is exactly the filesystem scan's answer.
 export function snapshot() {
   if (isEmbedded() && !inFlight && now() - lastAttemptAt >= OVERLAY_TTL_MS) void refresh();
   return cache;
@@ -98,11 +100,11 @@ export async function refresh() {
 }
 
 // One `ProjectInfo` row is usable only if it names a local directory code-hub
-// could serve under an id it is allowed to mint. A refused name is dropped
-// SILENTLY: the same rules already make its worktrees invisible
-// (`listWorktreeDirs()` skips a dot-prefixed `<project>` and routes a
-// `:`-bearing one into `refused`), so nothing is lost and there is nothing to
-// say.
+// could serve under an id it is allowed to mint. Every drop is silent. For a
+// refused NAME that is because the same rules already make its worktrees
+// invisible (`listWorktreeDirs()` skips a dot-prefixed `<project>` and routes
+// a `:`-bearing one into `refused`), so nothing is lost; the other two guards
+// carry their own reasons below.
 function buildSnapshot(rows) {
   // The conductor's record of its OWN project names its main checkout, while
   // the conductor process code-hub is embedded in may be running from a
@@ -116,8 +118,13 @@ function buildSnapshot(rows) {
     if (!row || typeof row !== 'object') continue;
     const { name, path: dir, system } = row;
     if (system !== LOCAL_SYSTEM) continue;
-    // Also what drops a degraded row: the conductor emits those with `path: ''`
-    // so the project stays visible (and deletable) in its own UI.
+    // Also what drops a degraded row — the conductor emits `path: ''` for a
+    // project whose record it could not parse, to keep it visible (and
+    // deletable) in its own UI. Its reason differs from the name guards
+    // above: such a project's worktrees ARE enumerated and DO render. The
+    // conductor is saying it does not know where the tree is, so there is no
+    // directory to serve, and the worktrees keep the "no main checkout" card
+    // — the honest rendering of exactly that.
     if (typeof dir !== 'string' || dir === '' || !path.isAbsolute(dir)) continue;
     if (typeof name !== 'string' || name === '' || name.startsWith('.') || path.basename(name) !== name) continue;
     if (isWorktreeId(name)) continue;
