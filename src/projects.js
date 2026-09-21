@@ -121,8 +121,17 @@ async function isDirectory(p) {
 // THE definition of "where does this conductor-known project live" — the
 // directory, or null. A LOCATION question only: the caller decides what to do
 // with the answer. Both the overlay pass in discoverApps() and appDir() below
-// go through this one function, so they can never place the same project in
-// two different directories.
+// go through this one function, so wherever the root scan's verdict is the
+// same for both, they place the project in the same directory.
+//
+// One case escapes that, upstream of here and not fixable here: a root entry
+// that is a SYMLINK to a directory. The root scan reads `Dirent.isDirectory()`,
+// false for a symlink, so the listing treats the name as root-scan-absent and
+// emits the overlay row at the conductor's tree — while appDir()'s root branch
+// stats the path, which follows the link, and returns `<root>/<name>` without
+// consulting this function at all. The two then name different directories for
+// one project. Serving a symlinked root entry is a standing question older than
+// this overlay, which only makes both answers visible at once.
 //
 // Whether a row is EMITTED carries one further condition the overlay pass
 // applies on its own: the project must have a manifest source there. That is
@@ -130,9 +139,11 @@ async function isDirectory(p) {
 // project with no `.hub.json` and no registration shows no card, while
 // `appDir()` still resolves its id. It has to: `register_app`'s whole purpose
 // is making an app servable WITHOUT a `.hub.json`, so the id must resolve
-// before the registration exists. The asymmetry closes itself — registering
-// creates the manifest source, so the card appears and the registry key is
-// never orphaned.
+// before the registration exists. The asymmetry closes itself for as long as
+// the overlay knows the project — registering creates the manifest source, so
+// the card appears. If the conductor later stops listing the project and it
+// has no worktrees under the root, the entry is left naming nothing and the
+// orphaned-key warning at the end of discoverApps() says so.
 //
 // `hasRootDir` (the root scan produced a directory of this name) is the
 // caller's fact, and it always wins. The recorded path is stat-verified here

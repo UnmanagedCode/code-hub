@@ -8,10 +8,11 @@
 // directly under the projects root, so a project whose tree is elsewhere — or
 // nested under a dot-dir the scan skips, `.plugins/<name>` being the common
 // case — is invisible to it however servable the tree is. The conductor knows
-// where every project's tree actually is. (Such a project's worktrees ARE
-// already discovered, since cc nests every local-system project's at
+// where every project's tree actually is. (Such a project's worktrees are
+// discovered either way, since cc nests every local-system project's at
 // `<projectsRoot>/.worktrees/<project>/<key>` whatever directory its tree
-// lives in; they simply had no parent row to nest under.)
+// lives in. With no row for the project they nest under a header-only
+// "no main checkout" card instead.)
 import path from 'node:path';
 import { isEmbedded, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 import { isWorktreeId } from './projects.js';

@@ -1057,6 +1057,26 @@ test('a conductor path that no longer exists yields no row', async (t) => {
   assert.ok(apps.find((a) => a.id === 'ghost:ab12cd'), 'its worktree stays listed, orphaned as before');
 });
 
+test('a conductor path that no longer exists yields no row even when a REGISTRATION would resolve', async (t) => {
+  // The discriminating case for the stat guard on the emit path. A registry
+  // entry is keyed by NAME, not by directory, so it resolves perfectly well
+  // against a directory that does not exist — meaning the manifest-source
+  // condition cannot stand in for the stat. Drop the stat verification from
+  // the listing and this fixture emits a card whose `path` names a deleted
+  // tree: exactly what a snapshot gone stale inside its TTL produces.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  await mkWorktree(root, 'ghost', 'ab12cd', null); // keeps the orphan-key warning quiet
+  await writeRegistrations(root, { ghost: { start: 'npm start', name: 'Ghost' } });
+  await useConductorOverlay([ccProject('ghost', path.join(root, '..', 'codehub-deleted-tree-does-not-exist'))]);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'ghost'), undefined, 'a registration must not resurrect a vanished tree');
+  // The worktree still consumes that registration, as it does for any
+  // out-of-root parent — which is why the registration is not itself orphaned.
+  assert.equal(apps.find((a) => a.id === 'ghost:ab12cd').source, 'registry');
+});
+
 test('appDir() resolves an overlay id to the conductor-recorded tree, and nothing when the conductor is down', async (t) => {
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
