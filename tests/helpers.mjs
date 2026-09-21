@@ -5,6 +5,7 @@ import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WORKTREES_DIRNAME } from '../src/projects.js';
+import * as conductorProjects from '../src/conductorProjects.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -99,6 +100,33 @@ export async function writeRegistrations(root, contents) {
   const raw = typeof contents === 'string' ? contents : JSON.stringify(contents, null, 2);
   await fs.writeFile(path.join(dir, 'registrations.json'), raw);
 }
+
+// Put code-hub in the embedded state and land one canned `/api/projects`
+// answer in the conductor overlay, without a socket: `rows` is the array the
+// conductor would serve, or null for an unreachable conductor. Pair with
+// resetConductorOverlay() in `t.after` — the overlay's cache and the env vars
+// are module/process state that outlives a single test.
+export async function useConductorOverlay(rows) {
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = 'http://127.0.0.1:1';
+  conductorProjects._setFetchImpl(async () => {
+    if (rows === null) throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { code: 'ECONNREFUSED' });
+    return { ok: true, status: 200, json: async () => rows };
+  });
+  await conductorProjects.refresh();
+}
+
+export function resetConductorOverlay() {
+  conductorProjects._reset();
+  delete process.env.CONDUCTOR_PLUGIN_ID;
+  delete process.env.CONDUCTOR_URL;
+}
+
+// A `ProjectInfo` row as the conductor serves it, with the fields the overlay
+// reads. Extra fields it carries (workspace, sessions, git facts) are ignored.
+export const ccProject = (name, dir, extra = {}) => ({
+  name, path: dir, workspace: null, system: 'local', remoteId: null, ...extra,
+});
 
 export function gitCommit(dir, msg = 'change') {
   const g = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });

@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { discoverApps, registerInMemory, unregisterInMemory, registryFile, appDir, worktreeId } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, writeRegistrations } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, writeRegistrations, useConductorOverlay, resetConductorOverlay, ccProject } from './helpers.mjs';
 
 test('discovers only dirs with a .hub.json, honouring PROJECTS_ROOT', async (t) => {
   const root = await mkRoot();
@@ -852,4 +853,313 @@ test('an unpinned parent\'s manifest object is SHARED with its worktrees, not co
   assert.equal(aa.manifest, parent.manifest);
   assert.equal(bb.manifest, parent.manifest);
   assert.equal(parent.manifest.port, null);
+});
+
+// ---------------------------------------------------------------------------
+// The conductor project overlay: a project the ROOT SCAN produced no directory
+// for, whose worktrees nevertheless live under the root, gets its real parent
+// row from the conductor's record of where its tree is.
+// ---------------------------------------------------------------------------
+
+test('embedded with an unreachable conductor returns exactly the standalone answer', async (t) => {
+  // Requirement in one assertion: the overlay is strictly additive, and a
+  // conductor that cannot be reached degrades to the filesystem answer rather
+  // than to a degraded one. Anything the overlay changed unconditionally —
+  // ordering, a field default, dirFor() — would show up as a diff here.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  await mkProject(root, 'alpha', { start: 'x' });
+  await mkProject(root, 'no-manifest', null);
+  await mkWorktree(root, 'alpha', 'ab12cd', { start: 'x' });
+  await mkWorktree(root, 'orphan', 'ab12cd', { start: 'y' });
+
+  const standalone = await discoverApps();
+  await useConductorOverlay(null); // embedded, conductor refuses the connection
+  const embedded = await discoverApps();
+
+  assert.deepStrictEqual(embedded, standalone);
+  assert.ok(standalone.find((a) => a.id === 'orphan:ab12cd'), 'setup: the orphaned worktree is present either way');
+});
+
+test('an out-of-root project the conductor knows becomes the parent row for its worktrees', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'wanderer', { start: 'x' });
+  await mkWorktree(root, 'wanderer', 'ab12cd', { start: 'x' });
+  await useConductorOverlay([ccProject('wanderer', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'wanderer');
+  assert.ok(main, 'the conductor-known tree must surface as a main checkout');
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.path, tree);
+  assert.equal(main.project, 'wanderer');
+  // The nesting contract render() consumes: the worktree's `project` names a
+  // row that is now in the payload, so it stops being an orphan card.
+  assert.equal(apps.find((a) => a.id === 'wanderer:ab12cd').project, 'wanderer');
+});
+
+test('a tree nested under a DOT-dir of the projects root is an overlay case too', async (t) => {
+  // The real-world shape: `.plugins/<name>` is lexically under the root, so
+  // "outside the root" would miss it — the root scan skips it for the leading
+  // dot, and "the root scan produced no directory of that name" is what the
+  // overlay keys on.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  const tree = path.join(root, '.plugins', 'nested');
+  await fs.mkdir(tree, { recursive: true });
+  await fs.writeFile(path.join(tree, '.hub.json'), JSON.stringify({ start: 'x' }));
+  await mkWorktree(root, 'nested', 'ab12cd', null);
+  await useConductorOverlay([ccProject('nested', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'nested');
+  assert.ok(main);
+  assert.equal(main.path, tree);
+  assert.equal(main.manifest.start, 'x');
+});
+
+test('an overlay project\'s own .hub.json makes it startable and donates to its worktrees', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'wanderer', { start: 'from-its-own-tree', port: 3100 });
+  await mkWorktree(root, 'wanderer', 'ab12cd', null); // no manifest of its own → inherits
+  await useConductorOverlay([ccProject('wanderer', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'wanderer');
+  assert.equal(main.source, 'manifest');
+  assert.equal(main.manifest.start, 'from-its-own-tree');
+  assert.equal(main.manifestError, null);
+  assert.equal(main.manifest.port, 3100);
+
+  const wt = apps.find((a) => a.id === 'wanderer:ab12cd');
+  assert.ok(wt, 'the worktree inherits the manifest read at the conductor-recorded tree');
+  assert.equal(wt.source, 'manifest');
+  assert.equal(wt.manifest.start, 'from-its-own-tree');
+  assert.equal(wt.manifest.port, null, 'a worktree still never inherits a fixed port');
+});
+
+test('an overlay project with no manifest source is NOT emitted — no card without a .hub.json or a registration', async (t) => {
+  // The overlay shows a card on exactly the terms the root pass does: a
+  // manifest source or nothing. A project with neither is not servable, so it
+  // gets no row, and its worktrees keep the "no main checkout" card.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'bare', null);
+  await mkWorktree(root, 'bare', 'ab12cd', { start: 'x' });
+  await useConductorOverlay([ccProject('bare', tree)]);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'bare'), undefined);
+  assert.ok(apps.find((a) => a.id === 'bare:ab12cd'), 'the worktree is servable on its own and stays listed');
+  // ...but the id still RESOLVES, which is the only route to registering it.
+  assert.equal(await appDir('bare'), tree);
+  // And with nothing to nest under, the worktree keeps its orphan grouping.
+  assert.equal(apps.find((a) => a.id === 'bare:ab12cd').project, 'bare');
+});
+
+test('an overlay project servable by a registrations.json entry alone is emitted', async (t) => {
+  // The bootstrap path the appDir/listing asymmetry exists for: no `.hub.json`
+  // anywhere, a registration keyed by the project name, and the card appears.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'registered', null);
+  await mkWorktree(root, 'registered', 'ab12cd', null);
+  await writeRegistrations(root, { registered: { start: 'npm start', name: 'Registered' } });
+  await useConductorOverlay([ccProject('registered', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'registered');
+  assert.ok(main, 'a registration alone makes an overlay project servable');
+  assert.equal(main.path, tree);
+  assert.equal(main.source, 'registry');
+  assert.equal(main.manifest.start, 'npm start');
+  assert.equal(main.manifestError, null);
+  assert.equal(apps.find((a) => a.id === 'registered:ab12cd').source, 'registry');
+});
+
+test('a conductor project with NO worktrees is emitted like any other — worktrees are irrelevant to the card', async (t) => {
+  // The overlay surfaces conductor-known projects the root scan cannot see.
+  // Worktrees nest under such a card when they exist; they are never a
+  // precondition for it.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'solo', { start: 'x' });
+  await useConductorOverlay([ccProject('solo', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'solo');
+  assert.ok(main, 'no worktree anywhere, and it still gets a card');
+  assert.equal(main.path, tree);
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.manifest.start, 'x');
+  assert.equal(await appDir('solo'), tree);
+});
+
+test('a root directory of the same name wins, and the suppressed overlay row warns', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const inRoot = await mkProject(root, 'foo', { start: 'in-root' });
+  const elsewhere = await mkProject(outside, 'foo', { start: 'elsewhere' });
+  await mkWorktree(root, 'foo', 'ab12cd', null);
+  await useConductorOverlay([ccProject('foo', elsewhere)]);
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.deepEqual(apps.filter((a) => a.id === 'foo').length, 1, 'exactly one row for the name');
+  const main = apps.find((a) => a.id === 'foo');
+  assert.equal(main.path, inRoot);
+  assert.equal(main.manifest.start, 'in-root', 'the root directory\'s own manifest, not the conductor tree\'s');
+  assert.equal(apps.find((a) => a.id === 'foo:ab12cd').manifest.start, 'in-root');
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.ok(warnings[0].includes(inRoot) && warnings[0].includes(elsewhere), warnings[0]);
+});
+
+test('a conductor path that agrees with the root directory does not warn', async (t) => {
+  // Scoping, same as the `:` refusals: loud only when the suppression cost
+  // something. Agreement costs nothing, and a warning on every 2s poll would
+  // be noise.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  const inRoot = await mkProject(root, 'foo', { start: 'in-root' });
+  await mkWorktree(root, 'foo', 'ab12cd', null);
+  await useConductorOverlay([ccProject('foo', await fs.realpath(inRoot))]);
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try { await discoverApps(); } finally { console.warn = orig; }
+
+  assert.deepEqual(warnings, []);
+});
+
+test('a conductor path that no longer exists yields no row', async (t) => {
+  // The snapshot can be up to its TTL stale, so every overlay path is
+  // stat-verified before it becomes a card's `path`.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  await mkWorktree(root, 'ghost', 'ab12cd', { start: 'x' });
+  await useConductorOverlay([ccProject('ghost', path.join(root, '..', 'codehub-deleted-tree-does-not-exist'))]);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'ghost'), undefined);
+  assert.ok(apps.find((a) => a.id === 'ghost:ab12cd'), 'its worktree stays listed, orphaned as before');
+});
+
+test('a conductor path that no longer exists yields no row even when a REGISTRATION would resolve', async (t) => {
+  // The discriminating case for the stat guard on the emit path. A registry
+  // entry is keyed by NAME, not by directory, so it resolves perfectly well
+  // against a directory that does not exist — meaning the manifest-source
+  // condition cannot stand in for the stat. Drop the stat verification from
+  // the listing and this fixture emits a card whose `path` names a deleted
+  // tree: exactly what a snapshot gone stale inside its TTL produces.
+  const root = await mkRoot();
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
+  await mkWorktree(root, 'ghost', 'ab12cd', null); // keeps the orphan-key warning quiet
+  await writeRegistrations(root, { ghost: { start: 'npm start', name: 'Ghost' } });
+  await useConductorOverlay([ccProject('ghost', path.join(root, '..', 'codehub-deleted-tree-does-not-exist'))]);
+
+  const apps = await discoverApps();
+  assert.equal(apps.find((a) => a.id === 'ghost'), undefined, 'a registration must not resurrect a vanished tree');
+  // The worktree still consumes that registration, as it does for any
+  // out-of-root parent — which is why the registration is not itself orphaned.
+  assert.equal(apps.find((a) => a.id === 'ghost:ab12cd').source, 'registry');
+});
+
+test('appDir() resolves an overlay id to the conductor-recorded tree, and nothing when the conductor is down', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'wanderer', null);
+  await mkWorktree(root, 'wanderer', 'ab12cd', null);
+
+  await useConductorOverlay([ccProject('wanderer', tree)]);
+  assert.equal(await appDir('wanderer'), tree);
+
+  resetConductorOverlay();
+  await useConductorOverlay(null);
+  assert.equal(await appDir('wanderer'), null, 'with no overlay the id names nothing — correct degradation');
+});
+
+test('a root directory still wins over the overlay in appDir()', async (t) => {
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const inRoot = await mkProject(root, 'foo', null);
+  const elsewhere = await mkProject(outside, 'foo', null);
+  await useConductorOverlay([ccProject('foo', elsewhere)]);
+
+  assert.equal(await appDir('foo'), inRoot);
+});
+
+test('an overlay project whose recorded tree has a BROKEN .hub.json surfaces the error, not the generic reason', async (t) => {
+  // Fail loudly: the same treatment an in-root project gets. Reporting "no
+  // manifest source" here would hide a file that is right there and wrong.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const tree = await mkProject(outside, 'wanderer', null);
+  await fs.writeFile(path.join(tree, '.hub.json'), '{ not json');
+  await mkWorktree(root, 'wanderer', 'ab12cd', null);
+  await useConductorOverlay([ccProject('wanderer', tree)]);
+
+  const apps = await discoverApps();
+  const main = apps.find((a) => a.id === 'wanderer');
+  assert.ok(main);
+  assert.equal(main.manifest, null);
+  assert.equal(main.source, 'manifest');
+  assert.match(main.manifestError, /invalid JSON/);
+});
+
+test('appDir() places a conductor project by its record alone; the card needs a manifest source', async (t) => {
+  // The one deliberate asymmetry: id resolution answers "where does this
+  // project live", the listing additionally requires something to start. Both
+  // read the same snapshot, so they can never place a project in two
+  // different directories.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const bare = await mkProject(outside, 'bare', null);              // no manifest source
+  const servable = await mkProject(outside, 'servable', { start: 'x' });
+  await useConductorOverlay([ccProject('bare', bare), ccProject('servable', servable)]);
+
+  assert.equal(await appDir('bare'), bare, 'resolvable, which is what makes register_app possible');
+  assert.equal(await appDir('servable'), servable);
+
+  const ids = (await discoverApps()).map((a) => a.id);
+  assert.ok(!ids.includes('bare'), 'no manifest source ⇒ no card');
+  assert.ok(ids.includes('servable'));
+});
+
+test('a shadowed conductor path with no manifest source does NOT warn', async (t) => {
+  // The suppression is announced only when it cost a card. If the conductor's
+  // tree has no `.hub.json` and no registration, no row would have been
+  // emitted for it even with the root directory out of the way, so there is
+  // nothing to report — and a warning here would fire on every 2s poll.
+  const root = await mkRoot();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
+  const inRoot = await mkProject(root, 'foo', { start: 'in-root' });
+  const elsewhere = await mkProject(outside, 'foo', null); // real dir, nothing servable in it
+  await useConductorOverlay([ccProject('foo', elsewhere)]);
+
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let apps;
+  try { apps = await discoverApps(); } finally { console.warn = orig; }
+
+  assert.deepEqual(warnings, []);
+  assert.equal(apps.find((a) => a.id === 'foo').path, inRoot);
 });

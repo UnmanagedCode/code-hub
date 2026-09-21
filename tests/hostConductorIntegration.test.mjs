@@ -8,10 +8,21 @@ import { execFileSync } from 'node:child_process';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { unregisterInMemory } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import * as conductorProjects from '../src/conductorProjects.js';
+import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ccProject } from './helpers.mjs';
 
-async function bootFakeConductor() {
-  const srv = http.createServer((req, res) => { res.writeHead(200); res.end('conductor-ui'); });
+// `projects` are served at `/api/projects` exactly as the conductor serves
+// them (a bare array of ProjectInfo), so the overlay exercises its real
+// transport here rather than the fetch seam.
+async function bootFakeConductor(projects = []) {
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/api/projects') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(projects));
+      return;
+    }
+    res.writeHead(200); res.end('conductor-ui');
+  });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   return { srv, port: srv.address().port };
 }
@@ -379,4 +390,145 @@ test('embedded with CONDUCTOR_PROJECT_DIR pointing in-root: its own worktree sti
   assert.equal(wt.status, 'stopped');
   assert.equal(wt.error, null);
   assert.ok(wt.branch); // some default branch name, resolved via git.js
+});
+
+test('embedded: a conductor-known project outside the root becomes a real parent card, worktree and all', async (t) => {
+  // The end-to-end shape of the overlay: the conductor's own /api/projects
+  // answer (over HTTP, its real transport) turns a header-only "no main
+  // checkout" grouping into a main card with the tree's path and git facts,
+  // while the worktree stays independently startable.
+  const root = await mkRoot();
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  const treeDir = await mkProject(outsideParent, 'wanderer', { start: fakeAppCmd() }, { git: true });
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor([ccProject('wanderer', treeDir)]);
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+  await mkWorktree(root, 'wanderer', 'ab12cd', { start: fakeAppCmd() }, { git: true });
+
+  const { server, base } = await bootHub();
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    conductorProjects._reset();
+    // This env shape (embedded, no CONDUCTOR_PROJECT_DIR) is the older-conductor
+    // fallback, which registers the conductor in-memory; drop it so it can't
+    // leak into the next test in this file.
+    unregisterInMemory('code-conductor');
+    await appManager.stop('wanderer:ab12cd').catch(() => {});
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  const main = res.body.apps.find((a) => a.id === 'wanderer');
+  assert.ok(main, 'the conductor-known tree must surface as a main checkout');
+  assert.equal(main.isWorktree, false);
+  assert.equal(main.path, treeDir);
+  assert.equal(main.sourceMissing, false);
+  assert.equal(main.alwaysOn, false);
+  // Git facts are read from the overlay path, which proves the row carries a
+  // real directory and not just a name.
+  assert.equal(main.currentSha, execFileSync('git', ['-C', treeDir, 'rev-parse', 'HEAD']).toString().trim());
+  assert.ok(main.lastCommitAt);
+
+  const wt = res.body.apps.find((a) => a.id === 'wanderer:ab12cd');
+  assert.ok(wt);
+  assert.equal(wt.project, 'wanderer', 'the worktree nests under the new parent row');
+
+  assert.equal((await j(base, 'POST', '/api/apps/wanderer%3Aab12cd/start')).status, 200);
+  await waitFor(async () => {
+    const { body } = await j(base, 'GET', '/api/apps');
+    return ['ready', 'running'].includes(body.apps.find((a) => a.id === 'wanderer:ab12cd').status);
+  });
+  assert.equal((await j(base, 'POST', '/api/apps/wanderer%3Aab12cd/stop')).status, 200);
+});
+
+test('embedded: a conductor project with no manifest source gets no card at all', async (t) => {
+  const root = await mkRoot();
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
+  const treeDir = await mkProject(outsideParent, 'bare', null, { git: true }); // no .hub.json, no registration
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor([ccProject('bare', treeDir)]);
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+  await mkWorktree(root, 'bare', 'ab12cd', null);
+
+  const { server, base } = await bootHub();
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    conductorProjects._reset();
+    // This env shape (embedded, no CONDUCTOR_PROJECT_DIR) is the older-conductor
+    // fallback, which registers the conductor in-memory; drop it so it can't
+    // leak into the next test in this file.
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.apps.find((a) => a.id === 'bare'), undefined, 'no .hub.json and no registration ⇒ no card');
+
+  // Not shown ⇒ not startable through the API either.
+  const start = await j(base, 'POST', '/api/apps/bare/start');
+  assert.equal(start.status, 404);
+  assert.match(start.body.error, /unknown app 'bare'/);
+});
+
+test('embedded: CONDUCTOR_PROJECT_DIR still wins over the conductor\'s record of its OWN project', async (t) => {
+  // `CONDUCTOR_PROJECT_DIR` is the checkout the conductor is RUNNING from,
+  // which may be a worktree of itself; its project record names the main
+  // checkout instead. The injected dir is the authority for this one id, so
+  // the overlay must never move the always-on card onto the recorded tree.
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  const root = await mkRoot();
+  const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-conductor-'));
+  const runningDir = await mkProject(outsideParent, 'running-checkout', null, { git: true });
+  const recordedDir = await mkProject(outsideParent, 'recorded-checkout', null, { git: true });
+  gitCommit(recordedDir, 'a commit only the recorded checkout has');
+  process.env.CONDUCTOR_PROJECT_DIR = runningDir;
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+  await mkWorktree(root, 'code-conductor', 'ab12cd', null, { git: true });
+
+  // Re-serve /api/projects with the conductor naming its own project at a
+  // DIFFERENT directory than the one it injected.
+  conductorSrv.removeAllListeners('request');
+  conductorSrv.on('request', (req, res) => {
+    if (req.url === '/api/projects') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify([ccProject('code-conductor', recordedDir)]));
+      return;
+    }
+    res.writeHead(200); res.end('conductor-ui');
+  });
+
+  const { server, base } = await bootHub();
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    delete process.env.CONDUCTOR_PROJECT_DIR;
+    unregisterInMemory('code-conductor');
+    conductorProjects._reset();
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+    await rmRoot(outsideParent);
+  });
+
+  const res = await j(base, 'GET', '/api/apps');
+  const main = res.body.apps.find((a) => a.id === 'code-conductor');
+  assert.ok(main);
+  assert.equal(main.path, runningDir, 'the injected running checkout, not the conductor\'s project record');
+  assert.equal(main.alwaysOn, true);
+  const runningSha = execFileSync('git', ['-C', runningDir, 'rev-parse', 'HEAD']).toString().trim();
+  const recordedSha = execFileSync('git', ['-C', recordedDir, 'rev-parse', 'HEAD']).toString().trim();
+  assert.notEqual(runningSha, recordedSha, 'test setup sanity: the two checkouts must have distinct history');
+  assert.equal(main.currentSha, runningSha);
+  assert.equal(res.body.apps.find((a) => a.id === 'code-conductor:ab12cd').project, 'code-conductor');
 });
