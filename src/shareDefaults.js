@@ -20,13 +20,15 @@ export function shareDefaultsFile() {
 
 // Read on every call (no cache), like readRegistry. Corrupt JSON is moved
 // aside so it can't wedge every later write; a non-object is ignored.
+// Returns a null-prototype object: ids are directory names, so `__proto__` or
+// `constructor` must read and write as ordinary own keys.
 export async function readAll() {
   const file = shareDefaultsFile();
   let raw;
   try {
     raw = await fs.readFile(file, 'utf8');
   } catch (e) {
-    if (e.code === 'ENOENT') return {};
+    if (e.code === 'ENOENT') return Object.create(null);
     throw e;
   }
   let obj;
@@ -34,15 +36,17 @@ export async function readAll() {
     obj = JSON.parse(raw);
   } catch (e) {
     if (!(e instanceof SyntaxError)) throw e;
-    await fs.rename(file, file + '.corrupt').catch(() => {});
-    console.warn(`[code-hub] ${file}: invalid JSON, moved aside to ${file}.corrupt — no default share logins (${e.message})`);
-    return {};
+    // The moved-aside copy may still hold passwords, so it gets the same 0600.
+    // The parse error isn't logged: its message can quote the input.
+    await fs.rename(file, file + '.corrupt').then(() => fs.chmod(file + '.corrupt', 0o600)).catch(() => {});
+    console.warn(`[code-hub] ${file}: invalid JSON, moved aside to ${file}.corrupt — no default share logins`);
+    return Object.create(null);
   }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
     console.warn(`[code-hub] ${file}: must be a JSON object, ignoring default share logins`);
-    return {};
+    return Object.create(null);
   }
-  return obj;
+  return Object.assign(Object.create(null), obj);
 }
 
 async function write(obj) {
@@ -111,7 +115,7 @@ export function update(id, body) {
 export function clear(id) {
   return serialised(async () => {
     const all = await readAll();
-    if (!(id in all)) return;
+    if (!Object.hasOwn(all, id)) return;
     delete all[id];
     await write(all);
   });

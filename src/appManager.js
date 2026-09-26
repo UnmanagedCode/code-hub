@@ -503,7 +503,8 @@ export async function restart(id) {
 // For a gated share, a fresh token is generated per share; the username and
 // password are the app's stored default share login where set (see
 // shareDefaults.js — each field falls back independently to 'hub' / a random
-// password), all kept in memory only for the share (see the `proxies` map). The QR/authUrl carries the token
+// password), all kept in memory only for the share (see the `proxies` map).
+// The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
 // — no credentials ever appear in the URL); username/password remain
 // available as a Basic-Auth fallback for curl/API clients, and persist
@@ -789,7 +790,7 @@ export async function unshare(id) {
 // id code-hub doesn't know; clear never does, so an entry orphaned by a
 // removed app can still be deleted.
 async function assertKnownApp(id) {
-  if (store.apps[id] || isHostConductorId(id)) return;
+  if (Object.hasOwn(store.apps, id) || isHostConductorId(id)) return;
   if ((await discoverApps()).some((a) => a.id === id)) return;
   const e = new Error(`unknown app '${id}'`); e.statusCode = 404; throw e;
 }

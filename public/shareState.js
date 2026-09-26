@@ -111,10 +111,22 @@ export function resolveCredNote(shared) {
 // plaintext. The mask is a fixed width so it doesn't reveal the length. The
 // real value stays in `shared.password` for Copy, but is never put into an
 // <input> — the edit drafts below start blank instead, and blank means keep.
+// Masking guards against shoulder-surfing only: list() still serves the real
+// password to the browser while the share is live.
 export const PASSWORD_MASK = '••••••••';
 
-export function resolvePasswordDisplay(shared) {
-  return shared.passwordIsDefault ? PASSWORD_MASK : shared.password;
+// The share panel's `pass` row: what it shows, and what its Copy writes.
+export function credRowValues(shared) {
+  return { display: shared.passwordIsDefault ? PASSWORD_MASK : shared.password, copy: shared.password };
+}
+
+// Drop edit drafts (state.credEdit / state.defaultsEdit) whose app is no
+// longer in the listing — e.g. a removed worktree. An orphaned draft would
+// otherwise hold off the periodic render forever, since its form can never
+// be saved or cancelled.
+export function pruneDrafts(drafts, apps) {
+  const ids = new Set(apps.map((a) => a.id));
+  for (const id of Object.keys(drafts)) if (!ids.has(id)) delete drafts[id];
 }
 
 // The Edit form's initial draft for a live share. `kind` 'lan' also carries the
@@ -175,8 +187,10 @@ export function buildDefaultsPatch(draft, defaults) {
 
 // The Edit form's note when a LAN share's TLS toggle is about to change: that
 // re-shares, and a re-share starts from the app's default login if it has one.
-export function resolveTlsReshareNote(auth, hasDefaultLogin) {
+// `defaults` is app.shareDefaults; keyed on a stored default PASSWORD, since
+// with only a default username the password still resets to a random one.
+export function resolveTlsReshareNote(auth, defaults) {
   if (!auth) return 'Changing TLS re-shares the app — new link & QR.';
-  if (hasDefaultLogin) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
+  if (defaults?.hasPassword) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
   return 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).';
 }

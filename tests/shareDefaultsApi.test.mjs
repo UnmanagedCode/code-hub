@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import https from 'node:https';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
+import * as shareDefaults from '../src/shareDefaults.js';
 import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
 
 const basicAuth = (user, pass) => 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
@@ -237,4 +238,52 @@ test('LAN auth:false share of an app with a default gates with the default once 
   assert.equal(app.tunnel.passwordIsDefault, true);
   assert.equal(await status(app.tunnel.proxyPort), 401);
   assert.equal(await status(app.tunnel.proxyPort, 'alice', 'pw-default'), 200);
+});
+
+test('a 404 PUT for an unknown id writes nothing', async (t) => {
+  const { base } = await setup(t, { running: false });
+  await j(base, 'PUT', '/api/apps/app/share/defaults', { username: 'alice' });
+  const before = await shareDefaults.readAll();
+  assert.equal((await j(base, 'PUT', '/api/apps/nope/share/defaults', { password: 'pw' })).status, 404);
+  assert.deepEqual(await shareDefaults.readAll(), before);
+});
+
+test('DELETE removes an orphaned entry for an id that is no known app', async (t) => {
+  const { base } = await setup(t, { running: false });
+  await shareDefaults.update('orphan', { password: 'pw' });
+  await shareDefaults.update('app', { username: 'alice' });
+  const res = await j(base, 'DELETE', '/api/apps/orphan/share/defaults');
+  assert.equal(res.status, 200);
+  assert.deepEqual({ ...(await shareDefaults.readAll()) }, { app: { username: 'alice' } });
+});
+
+test('unsharing clears passwordIsDefault: a re-share without a default password is not masked', async (t) => {
+  const { base } = await setup(t);
+  await j(base, 'PUT', '/api/apps/app/share/defaults', { username: 'alice', password: 'pw-default' });
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false })).body.passwordIsDefault, true);
+  await j(base, 'DELETE', '/api/apps/app/share');
+  await j(base, 'PUT', '/api/apps/app/share/defaults', { password: null });
+  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  assert.equal(res.body.username, 'alice');
+  assert.equal(res.body.passwordIsDefault, false);
+  assert.equal((await getApp(base)).tunnel.passwordIsDefault, false);
+});
+
+test('prototype-named app ids: unknown ones 404, real ones store and list their own entry only', async (t) => {
+  const { root, base } = await setup(t, { running: false });
+  // Not projects (yet): Object.prototype must not make them "known".
+  assert.equal((await j(base, 'GET', '/api/apps/constructor/share/defaults')).status, 404);
+  assert.equal((await j(base, 'GET', '/api/apps/__proto__/share/defaults')).status, 404);
+  assert.equal((await j(base, 'PUT', '/api/apps/__proto__/share/defaults', { password: 'pw' })).status, 404);
+
+  await mkProject(root, 'constructor', { start: fakeAppCmd() });
+  await mkProject(root, '__proto__', { start: fakeAppCmd() });
+  assert.equal((await getApp(base, 'constructor')).shareDefaults, null);
+  assert.equal((await getApp(base, '__proto__')).shareDefaults, null);
+
+  const put = await j(base, 'PUT', '/api/apps/__proto__/share/defaults', { password: 'pw' });
+  assert.deepEqual(put.body, { id: '__proto__', username: null, hasPassword: true });
+  assert.deepEqual((await j(base, 'GET', '/api/apps/__proto__/share/defaults')).body, { id: '__proto__', username: null, hasPassword: true });
+  assert.deepEqual((await getApp(base, '__proto__')).shareDefaults, { username: null, hasPassword: true });
+  assert.equal((await getApp(base, 'constructor')).shareDefaults, null);
 });

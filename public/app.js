@@ -3,7 +3,7 @@
 
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
-  resolvePasswordDisplay, credDraftFor, credPasswordPlaceholder, credPatchBody,
+  credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
   defaultsDraftFor, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
 } from './shareState.js';
 
@@ -47,6 +47,8 @@ async function refresh({ periodic = false } = {}) {
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
     state.tailscaleAvailable = data.tailscaleAvailable;
+    pruneDrafts(state.credEdit, state.apps);
+    pruneDrafts(state.defaultsEdit, state.apps);
     if (!periodic || (!Object.keys(state.credEdit).length && !Object.keys(state.defaultsEdit).length)) render();
     document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
@@ -127,8 +129,8 @@ function routesBlock(app) {
   return wrap;
 }
 
-// `display` is what's shown (a masked default password); Copy always writes
-// the real `value`.
+// `display` is what's shown (a masked default password — see credRowValues);
+// Copy always writes the real `value`.
 function credRow(label, value, display = value) {
   return el('div', { class: 'cred' },
     el('span', { class: 'cred-label' }, label),
@@ -164,7 +166,7 @@ function credsBlock(app, shared, kind) {
       // TLS can't flip in place — Save re-shares to swap the scheme, so the link,
       // QR, and password all regenerate. Warn only when it's actually changing.
       isLan && editing.tls !== (shared.tls !== false)
-        ? el('div', { class: 'cred-note' }, resolveTlsReshareNote(editing.auth, !!app.shareDefaults))
+        ? el('div', { class: 'cred-note' }, resolveTlsReshareNote(editing.auth, app.shareDefaults))
         : null,
       showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'user'),
@@ -258,9 +260,10 @@ function credsBlock(app, shared, kind) {
       ),
     );
   }
+  const pass = credRowValues(shared);
   return el('div', { class: 'creds' },
     credRow('user', shared.username),
-    credRow('pass', shared.password, resolvePasswordDisplay(shared)),
+    credRow('pass', pass.copy, pass.display),
   );
 }
 
