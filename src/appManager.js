@@ -27,9 +27,10 @@ let store = { apps: {} };
 // the proxy server never survive a code-hub restart (see init teardown).
 const proxies = new Map();
 
-// Ids whose live proxy was seeded with the app's stored default password and
-// still holds it (a share-time password edit removes the id). Drives the
-// `passwordIsDefault` flag the UI masks on. Cleared in teardownShare.
+// Ids whose live proxy holds the app's stored default password: added when
+// share() seeds from it or a `saveAsDefault` credentials edit writes it;
+// removed by an unflagged password edit or teardownShare. Drives the
+// `passwordIsDefault` flag the UI masks on.
 const defaultPasswordShares = new Set();
 
 // startAuthProxy options for an app's stored default login: only the fields
@@ -717,30 +718,60 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
 // Edit the active share's Basic-Auth credentials in place — mutates the live
 // proxy (see authproxy.js's setCredentials), so the share URL/token/proxy
 // port never change. Custom creds are per-share-instance only and never touch
-// the app's stored default (share-defaults.json): share() always tears down
-// and recreates the proxy, so the next share starts again from the app's
-// default login if one is set, else 'hub' + an auto-generated password. A
-// password edit ends `passwordIsDefault` for this share.
-export async function updateShareCredentials(id, { username, password } = {}) {
+// the app's stored default (share-defaults.json) unless `saveAsDefault` is
+// true: share() always tears down and recreates the proxy, so the next share
+// starts again from the app's default login if one is set, else 'hub' + an
+// auto-generated password. An unflagged password edit ends
+// `passwordIsDefault` for this share.
+//
+// `saveAsDefault: true` also writes the share's resulting login (each blank
+// field = the live value, so an untouched generated password is included) as
+// the app's default, then applies that whole login to the proxy and marks the
+// share `passwordIsDefault` — the live password equals the stored one by
+// construction. The file write happens
+// before the proxy is touched, so a failed write (500) leaves the live login
+// as it was. If the share is replaced during the write, the default stays
+// written (it's what was asked for) but the new/absent share is left alone (409).
+export async function updateShareCredentials(id, { username, password, saveAsDefault } = {}) {
   const proxy = proxies.get(id);
   if (!proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
   if (!proxy.auth) {
     const e = new Error(`share for '${id}' has authentication disabled — nothing to edit`); e.statusCode = 400; throw e;
   }
+  if (saveAsDefault !== undefined && typeof saveAsDefault !== 'boolean') {
+    const e = new Error("'saveAsDefault' must be a boolean"); e.statusCode = 400; throw e;
+  }
   const hasUsername = username !== undefined;
   const hasPassword = password !== undefined;
-  if (!hasUsername && !hasPassword) { const e = new Error('provide username and/or password to update'); e.statusCode = 400; throw e; }
+  if (!hasUsername && !hasPassword && saveAsDefault !== true) {
+    const e = new Error('provide username and/or password to update, or saveAsDefault: true'); e.statusCode = 400; throw e;
+  }
   if (hasUsername && (typeof username !== 'string' || !username.trim())) {
     const e = new Error('username must be a non-empty string'); e.statusCode = 400; throw e;
   }
   if (hasPassword && (typeof password !== 'string' || !password.trim())) {
     const e = new Error('password must be a non-empty string'); e.statusCode = 400; throw e;
   }
-  proxy.setCredentials({
-    username: hasUsername ? username.trim() : undefined,
-    password: hasPassword ? password.trim() : undefined,
-  });
-  if (hasPassword) defaultPasswordShares.delete(id);
+  // Resolved once, before any await: a ticked save writes exactly this and
+  // then applies all of it, so an edit landing during the write is overwritten
+  // (last writer wins) rather than left live under a `passwordIsDefault` flag.
+  const next = {
+    username: hasUsername ? username.trim() : (saveAsDefault ? proxy.username : undefined),
+    password: hasPassword ? password.trim() : (saveAsDefault ? proxy.password : undefined),
+  };
+  if (saveAsDefault) {
+    try {
+      await shareDefaults.update(id, next);
+    } catch (err) {
+      const e = new Error(`saving '${id}'s default share login failed: ${err.message}`); e.statusCode = 500; throw e;
+    }
+    if (proxies.get(id) !== proxy) {
+      const e = new Error(`'${id}'s share ended while its login was being saved as the default`); e.statusCode = 409; throw e;
+    }
+  }
+  proxy.setCredentials(next);
+  if (saveAsDefault) defaultPasswordShares.add(id);
+  else if (hasPassword) defaultPasswordShares.delete(id);
   // The QR encodes the token URL, which is stable across a creds edit (the
   // token/proxy/URL are untouched), so this is a cache hit — but the field is
   // still returned so the caller can fold it back into its share state on the

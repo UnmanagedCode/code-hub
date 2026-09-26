@@ -3,7 +3,7 @@
 
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
-  credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
+  credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody, credFieldsShown,
   defaultsDraftFor, shareLoginLabel, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
 } from './shareState.js';
 
@@ -23,7 +23,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing a live share; defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password,saveAsDefault} draft while editing a live share (plus {auth,tls} for LAN — see credDraftFor); defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -144,16 +144,19 @@ function credRow(label, value, display = value) {
 // action row) — an edit form + Save/Cancel. For a LAN share this form is also
 // the single place to flip authentication on/off (see the Authentication
 // checkbox below); for a tunnel share (always gated) it only ever edits
-// credentials. Save applies the auth toggle first, then the credentials PATCH
-// (only if actually changed) — see the Save handler below for why the
-// ordering and "only if changed" conditions matter. action()'s own refresh()
+// credentials. "Also save as this app's default login" (unticked by default)
+// makes the credentials PATCH carry `saveAsDefault`, so the share's resulting
+// login also becomes the app's stored default. Save applies the auth toggle
+// first, then the credentials PATCH (only if actually changed, or the box is
+// ticked) — see the Save handler below for why the ordering and "only if
+// changed" conditions matter. action()'s own refresh()
 // re-reads everything back from list() (see appManager.js), so no local merge
 // is needed.
 function credsBlock(app, shared, kind) {
   const editing = state.credEdit[app.id];
   if (editing) {
     const isLan = kind === 'lan';
-    const showCreds = !isLan || editing.auth;
+    const showCreds = credFieldsShown(editing, kind);
     return el('div', { class: 'creds' },
       isLan ? el('label', { class: 'auth-toggle' },
         el('input', { type: 'checkbox', checked: editing.auth, onchange: (e) => { editing.auth = e.target.checked; render(); } }),
@@ -182,6 +185,10 @@ function credsBlock(app, shared, kind) {
           placeholder: credPasswordPlaceholder(editing, shared),
           oninput: (e) => { editing.password = e.target.value; } }),
       ) : null,
+      showCreds ? el('label', { class: 'auth-toggle' },
+        el('input', { type: 'checkbox', checked: editing.saveAsDefault, onchange: (e) => { editing.saveAsDefault = e.target.checked; } }),
+        " Also save as this app's default login",
+      ) : null,
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => action(app.id, async () => {
           // A credentials PATCH (fresh QR + new user/pass) or an auth-gate PATCH
@@ -198,6 +205,10 @@ function credsBlock(app, shared, kind) {
           // share state is on screen; a from-the-start auth:false share has no
           // s.authUrl to clear.
           const mergeShareCreds = (patched) => mergeSharePatch(state.share[app.id], patched);
+          // A ticked save-as-default rides on each credentials PATCH below
+          // (credPatchBody adds the flag). Both LAN paths skip that PATCH when
+          // auth is being turned off, which is what keeps a ticked-then-hidden
+          // checkbox from writing the default.
           if (isLan && editing.tls !== (shared.tls !== false)) {
             // TLS changed — it can't flip in place (scheme/URL/cert are fixed at
             // proxy creation), so re-share to swap it. This spins up a fresh proxy
@@ -210,7 +221,8 @@ function credsBlock(app, shared, kind) {
             });
             state.share[app.id] = res;
             // Apply any creds the user typed in this same edit (blank = keep the
-            // fresh proxy's).
+            // fresh proxy's); when ticked, the new share's login is then saved
+            // as the default.
             if (editing.auth) {
               const body = credPatchBody(editing, shared, { onlyChanged: false });
               if (body) {
