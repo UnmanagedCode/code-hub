@@ -121,7 +121,7 @@ export function credRowValues(shared) {
   return { display: shared.passwordIsDefault ? PASSWORD_MASK : shared.password, copy: shared.password };
 }
 
-// Drop edit drafts (state.credEdit / state.defaultsEdit) whose app is no
+// Drop edit drafts (state.credEdit) whose app is no
 // longer in the listing — e.g. a removed worktree. An orphaned draft would
 // otherwise hold off the periodic render forever, since its form can never
 // be saved or cancelled.
@@ -167,35 +167,6 @@ export function credPatchBody(editing, shared, { onlyChanged }) {
     body[key] = v;
   }
   if (editing.saveAsDefault) body.saveAsDefault = true;
-  return Object.keys(body).length ? body : null;
-}
-
-// The Share chooser's "Share login" form: an app's stored default login for new
-// shares. `defaults` is app.shareDefaults ({ username, hasPassword } | null) —
-// the server never sends the stored password, so the draft never holds it.
-export function defaultsDraftFor(app) {
-  return { username: app.shareDefaults?.username ?? '', password: '', clearPassword: false };
-}
-
-// The Share chooser's entry into the default-login form; ✓ once a default is set.
-export function shareLoginLabel(defaults) { return defaults ? 'Share login ✓' : 'Share login'; }
-
-export function defaultsPasswordPlaceholder(draft, defaults) {
-  if (draft.clearPassword) return 'will be removed — random per share';
-  if (defaults?.hasPassword) return `${PASSWORD_MASK} (set — type to replace)`;
-  return 'none — random per share';
-}
-
-// The PUT /share/defaults body for a draft, or null when nothing changed.
-// username: set when changed, null when emptied; password: set when typed,
-// null when "Forget password" was pressed, else omitted (keep).
-export function buildDefaultsPatch(draft, defaults) {
-  const body = {};
-  const username = draft.username.trim();
-  if (username && username !== defaults?.username) body.username = username;
-  else if (!username && defaults?.username) body.username = null;
-  if (draft.password) body.password = draft.password;
-  else if (draft.clearPassword) body.password = null;
   return Object.keys(body).length ? body : null;
 }
 

@@ -23,7 +23,7 @@ Robustness, mirroring `.hub.json`/`state.json` conventions: whole-file JSON that
 
 ## Default share logins: `share-defaults.json` (`<projectsRoot>/.code-hub/share-defaults.json`)
 
-Per-app default username/password that a **new** share of the app starts with, in every mode (`src/shareDefaults.js`). Managed via `PUT`/`DELETE /api/apps/:id/share/defaults` (below), `PATCH /api/apps/:id/share/credentials` with `saveAsDefault: true` (below), or the UI's **Share login** form and live-share **Edit** checkbox.
+Per-app default username/password that a **new** share of the app starts with, in every mode (`src/shareDefaults.js`). Managed via `PUT`/`DELETE /api/apps/:id/share/defaults` (below), `PATCH /api/apps/:id/share/credentials` with `saveAsDefault: true` (below), or the UI's live-share **Edit** checkbox (which sends that flag).
 
 - **Shape:** `{ "<id>": { "username"?: string, "password"?: string } }`, keyed by **exact app id**. A worktree (`<project>:<key>`) does **not** inherit its parent project's entry.
 - **Per field, independently:** username unset → `hub`; password unset → a CSPRNG password per share. An entry with neither field is deleted, never kept.
