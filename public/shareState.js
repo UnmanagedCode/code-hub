@@ -159,12 +159,15 @@ export function credPatchBody(editing, shared, { onlyChanged }) {
   return Object.keys(body).length ? body : null;
 }
 
-// The card-level "Share login" form: an app's stored default login for new
+// The Share chooser's "Share login" form: an app's stored default login for new
 // shares. `defaults` is app.shareDefaults ({ username, hasPassword } | null) —
 // the server never sends the stored password, so the draft never holds it.
 export function defaultsDraftFor(app) {
   return { username: app.shareDefaults?.username ?? '', password: '', clearPassword: false };
 }
+
+// The Share chooser's entry into the default-login form; ✓ once a default is set.
+export function shareLoginLabel(defaults) { return defaults ? 'Share login ✓' : 'Share login'; }
 
 export function defaultsPasswordPlaceholder(draft, defaults) {
   if (draft.clearPassword) return 'will be removed — random per share';

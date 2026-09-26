@@ -4,7 +4,7 @@
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
   credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
-  defaultsDraftFor, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
+  defaultsDraftFor, shareLoginLabel, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
 } from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
@@ -270,6 +270,7 @@ function credsBlock(app, shared, kind) {
 function sharePanel(app) {
   const s = state.share[app.id];
   if (s && s.choosing) {
+    if (state.defaultsEdit[app.id]) return el('div', { class: 'share' }, defaultsBlock(app));
     return el('div', { class: 'share' },
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => doShare(app, 'lan') }, 'LAN'),
@@ -283,6 +284,8 @@ function sharePanel(app) {
           title: state.tailscaleAvailable ? '' : 'tailscale not available',
           onclick: () => doShare(app, 'tailscale'),
         }, 'tailscale'),
+        el('button', { onclick: () => { state.defaultsEdit[app.id] = defaultsDraftFor(app); render(); } },
+          shareLoginLabel(app.shareDefaults)),
         el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
       ));
   }
@@ -379,16 +382,18 @@ function controls(app) {
     if (!app.alwaysOn) {
       // Stop/restart tear down any active share server-side (teardownShare)
       // — clear the local share/credEdit state too, or the panel would keep
-      // showing the now-defunct URL/creds until a re-share overwrites it.
+      // showing the now-defunct URL/creds until a re-share overwrites it. The
+      // chooser closes with it, so drop its Share login draft as well: left
+      // behind with no form, it would suppress the periodic render.
       row.appendChild(el('button', { class: 'danger', disabled: isBusy,
         onclick: () => action(app.id, async () => {
           await api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`);
-          delete state.share[app.id]; delete state.credEdit[app.id];
+          delete state.share[app.id]; delete state.credEdit[app.id]; delete state.defaultsEdit[app.id];
         }) }, 'Stop'));
       row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
         onclick: () => action(app.id, async () => {
           await api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`);
-          delete state.share[app.id]; delete state.credEdit[app.id];
+          delete state.share[app.id]; delete state.credEdit[app.id]; delete state.defaultsEdit[app.id];
         }) }, 'Restart'));
     }
     row.appendChild(el('button', {
@@ -396,27 +401,20 @@ function controls(app) {
       onclick: () => { state.share[app.id] = { choosing: true }; render(); },
     }, app.tunnel ? 'Shared' : 'Share'));
   }
-  // The app's default login for new shares — settable whether or not it runs.
-  row.appendChild(el('button', { disabled: isBusy,
-    onclick: () => {
-      if (state.defaultsEdit[app.id]) delete state.defaultsEdit[app.id];
-      else state.defaultsEdit[app.id] = defaultsDraftFor(app);
-      render();
-    } }, app.shareDefaults ? 'Share login ✓' : 'Share login'));
   return row;
 }
 
-// The inline "Share login" form (see controls()): edits the app's stored
-// default username/password for NEW shares. The stored password never reaches
-// the client, so its field starts blank and blank on Save keeps it; "Forget
-// password" is the explicit way to drop it.
+// The "Share login" form inside the Share chooser (see sharePanel()), shown in
+// place of the mode buttons: edits the app's stored default username/password
+// for NEW shares. The stored password never reaches the client, so its field
+// starts blank and blank on Save keeps it; "Forget password" is the explicit
+// way to drop it.
 function defaultsBlock(app) {
   const draft = state.defaultsEdit[app.id];
-  if (!draft) return null;
   const defaults = app.shareDefaults;
   const url = `api/apps/${encodeURIComponent(app.id)}/share/defaults`;
   return el('div', { class: 'creds' },
-    el('div', { class: 'cred-note' }, `Default login for new shares of this app.${app.tunnel ? ' Applies from the next share.' : ''}`),
+    el('div', { class: 'cred-note' }, 'Default login for new shares of this app.'),
     el('div', { class: 'cred' },
       el('span', { class: 'cred-label' }, 'user'),
       el('input', { class: 'cred-input', value: draft.username, placeholder: 'hub',
@@ -445,7 +443,10 @@ function defaultsBlock(app) {
             delete state.defaultsEdit[app.id];
           }) }, 'Clear')
         : null,
-      el('button', { onclick: () => { delete state.defaultsEdit[app.id]; render(); } }, 'Cancel'),
+      el('button', { onclick: () => { delete state.defaultsEdit[app.id]; render(); } }, 'Back'),
+      el('button', { onclick: () => {
+        delete state.defaultsEdit[app.id]; delete state.share[app.id]; render();
+      } }, 'Cancel'),
     ),
   );
 }
@@ -490,8 +491,6 @@ function card(app, { subcard = false, worktrees = [] } = {}) {
 
   if (app.error) c.appendChild(el('div', { class: 'err' }, app.error));
   c.appendChild(controls(app));
-  const db = defaultsBlock(app);
-  if (db) c.appendChild(db);
   const routes = routesBlock(app);
   if (routes) c.appendChild(routes);
   const sp = sharePanel(app);

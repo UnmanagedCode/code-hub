@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
   PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
-  defaultsDraftFor, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
+  defaultsDraftFor, shareLoginLabel, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
 } from '../public/shareState.js';
 
 // These cover the client behaviors the server tests can't: how sharePanel
@@ -238,4 +238,11 @@ test('mergeSharePatch carries passwordIsDefault', () => {
   const cur2 = { passwordIsDefault: true };
   mergeSharePatch(cur2, { qrSvg: '<svg/>' }); // absent → untouched
   assert.equal(cur2.passwordIsDefault, true);
+});
+
+test('shareLoginLabel: ✓ once any default is set, plain otherwise', () => {
+  assert.equal(shareLoginLabel(null), 'Share login');
+  assert.equal(shareLoginLabel(undefined), 'Share login');
+  assert.equal(shareLoginLabel({ username: 'u', hasPassword: false }), 'Share login ✓');
+  assert.equal(shareLoginLabel({ username: null, hasPassword: true }), 'Share login ✓');
 });
