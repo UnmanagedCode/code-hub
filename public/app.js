@@ -1,7 +1,11 @@
 // code-hub frontend: vanilla ES module, no build step. Polls /api/apps and
 // renders a mobile-first, sortable list of servable apps as accent-barred cards.
 
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote } from './shareState.js';
+import {
+  resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
+  resolvePasswordDisplay, credDraftFor, credPasswordPlaceholder, credPatchBody,
+  defaultsDraftFor, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
+} from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -19,7 +23,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing a live share; defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -30,7 +34,8 @@ async function api(method, path, opts = {}) {
 }
 
 // `periodic: true` marks the background poll (see the setInterval below) —
-// while a credential edit is in progress (state.credEdit non-empty), it
+// while a credential edit is in progress (state.credEdit or
+// state.defaultsEdit non-empty), it
 // skips render() so the poll can't tear down/refocus the edit's <input>s,
 // same "suppress re-render churn while something's in flight" idea as the
 // `busy` set above. Manual triggers (the refresh button, and action()'s own
@@ -42,7 +47,7 @@ async function refresh({ periodic = false } = {}) {
     state.apps = data.apps;
     state.cloudflaredAvailable = data.cloudflaredAvailable;
     state.tailscaleAvailable = data.tailscaleAvailable;
-    if (!periodic || !Object.keys(state.credEdit).length) render();
+    if (!periodic || (!Object.keys(state.credEdit).length && !Object.keys(state.defaultsEdit).length)) render();
     document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
     document.getElementById('empty').textContent = `Failed to load: ${e.message}`;
@@ -122,10 +127,12 @@ function routesBlock(app) {
   return wrap;
 }
 
-function credRow(label, value) {
+// `display` is what's shown (a masked default password); Copy always writes
+// the real `value`.
+function credRow(label, value, display = value) {
   return el('div', { class: 'cred' },
     el('span', { class: 'cred-label' }, label),
-    el('span', { class: 'cred-val' }, value),
+    el('span', { class: 'cred-val' }, display),
     el('button', { class: 'cred-copy', title: `Copy ${label}`, onclick: () => navigator.clipboard?.writeText(value) }, 'Copy'),
   );
 }
@@ -157,9 +164,7 @@ function credsBlock(app, shared, kind) {
       // TLS can't flip in place — Save re-shares to swap the scheme, so the link,
       // QR, and password all regenerate. Warn only when it's actually changing.
       isLan && editing.tls !== (shared.tls !== false)
-        ? el('div', { class: 'cred-note' }, editing.auth
-            ? 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).'
-            : 'Changing TLS re-shares the app — new link & QR.')
+        ? el('div', { class: 'cred-note' }, resolveTlsReshareNote(editing.auth, !!app.shareDefaults))
         : null,
       showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'user'),
@@ -169,8 +174,10 @@ function credsBlock(app, shared, kind) {
       ) : null,
       showCreds ? el('div', { class: 'cred' },
         el('span', { class: 'cred-label' }, 'pass'),
-        el('input', { class: 'cred-input', value: editing.password,
-          placeholder: editing.password ? '' : 'leave blank to keep current',
+        // A default password is masked: the draft starts blank (the real value
+        // never enters the DOM) and blank on Save keeps it.
+        el('input', { class: 'cred-input', value: editing.password, autocomplete: 'off',
+          placeholder: credPasswordPlaceholder(editing, shared),
           oninput: (e) => { editing.password = e.target.value; } }),
       ) : null,
       el('div', { class: 'share-actions' },
@@ -192,20 +199,19 @@ function credsBlock(app, shared, kind) {
           if (isLan && editing.tls !== (shared.tls !== false)) {
             // TLS changed — it can't flip in place (scheme/URL/cert are fixed at
             // proxy creation), so re-share to swap it. This spins up a fresh proxy
-            // (new URL/QR/token, auto-generated password); share() applies the auth
-            // choice itself, so no separate auth PATCH here.
+            // (new URL/QR/token, and the app's default login or else an
+            // auto-generated password); share() applies the auth choice itself,
+            // so no separate auth PATCH here.
             const res = await api('POST', `api/apps/${encodeURIComponent(app.id)}/share`, {
               body: JSON.stringify({ mode: 'lan', auth: editing.auth, tls: editing.tls }),
               headers: { 'content-type': 'application/json' },
             });
             state.share[app.id] = res;
-            // The fresh proxy started with an auto-generated password; apply any
-            // creds the user typed in this same edit (blank = keep the fresh one).
+            // Apply any creds the user typed in this same edit (blank = keep the
+            // fresh proxy's).
             if (editing.auth) {
-              const body = {};
-              if (editing.username) body.username = editing.username;
-              if (editing.password) body.password = editing.password;
-              if (Object.keys(body).length) {
+              const body = credPatchBody(editing, shared, { onlyChanged: false });
+              if (body) {
                 const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
                   body: JSON.stringify(body),
                   headers: { 'content-type': 'application/json' },
@@ -224,13 +230,11 @@ function credsBlock(app, shared, kind) {
               mergeShareCreds(toggled); // QR now tracks the gate (credentialed on / plain off)
             }
             if (editing.auth) {
-              const body = {};
-              if (editing.username && editing.username !== (shared.username ?? '')) body.username = editing.username;
-              if (editing.password && editing.password !== (shared.password ?? '')) body.password = editing.password;
               // Blank/unchanged fields mean "keep what's there" — the proxy's
               // credentials are stable across an auth toggle, so skipping the
               // PATCH here is what lets re-enabling restore them untouched.
-              if (Object.keys(body).length) {
+              const body = credPatchBody(editing, shared, { onlyChanged: true });
+              if (body) {
                 const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
                   body: JSON.stringify(body),
                   headers: { 'content-type': 'application/json' },
@@ -239,11 +243,14 @@ function credsBlock(app, shared, kind) {
               }
             }
           } else {
-            const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
-              body: JSON.stringify({ username: editing.username, password: editing.password }),
-              headers: { 'content-type': 'application/json' },
-            });
-            mergeShareCreds(patched);
+            const body = credPatchBody(editing, shared, { onlyChanged: true });
+            if (body) {
+              const patched = await api('PATCH', `api/apps/${encodeURIComponent(app.id)}/share/credentials`, {
+                body: JSON.stringify(body),
+                headers: { 'content-type': 'application/json' },
+              });
+              mergeShareCreds(patched);
+            }
           }
           delete state.credEdit[app.id];
         }) }, 'Save'),
@@ -253,7 +260,7 @@ function credsBlock(app, shared, kind) {
   }
   return el('div', { class: 'creds' },
     credRow('user', shared.username),
-    credRow('pass', shared.password),
+    credRow('pass', shared.password, resolvePasswordDisplay(shared)),
   );
 }
 
@@ -337,9 +344,7 @@ function sharePanel(app) {
     el('button', { onclick: () => { navigator.clipboard?.writeText(openUrl); } }, 'Copy'),
     canEdit && !editing
       ? el('button', { onclick: () => {
-          state.credEdit[app.id] = kind === 'lan'
-            ? { auth: authEnabled, tls: shared.tls !== false, username: shared.username ?? '', password: shared.password ?? '' }
-            : { username: shared.username, password: shared.password };
+          state.credEdit[app.id] = credDraftFor(shared, kind);
           render();
         } }, 'Edit')
       : null,
@@ -388,7 +393,58 @@ function controls(app) {
       onclick: () => { state.share[app.id] = { choosing: true }; render(); },
     }, app.tunnel ? 'Shared' : 'Share'));
   }
+  // The app's default login for new shares — settable whether or not it runs.
+  row.appendChild(el('button', { disabled: isBusy,
+    onclick: () => {
+      if (state.defaultsEdit[app.id]) delete state.defaultsEdit[app.id];
+      else state.defaultsEdit[app.id] = defaultsDraftFor(app);
+      render();
+    } }, app.shareDefaults ? 'Share login ✓' : 'Share login'));
   return row;
+}
+
+// The inline "Share login" form (see controls()): edits the app's stored
+// default username/password for NEW shares. The stored password never reaches
+// the client, so its field starts blank and blank on Save keeps it; "Forget
+// password" is the explicit way to drop it.
+function defaultsBlock(app) {
+  const draft = state.defaultsEdit[app.id];
+  if (!draft) return null;
+  const defaults = app.shareDefaults;
+  const url = `api/apps/${encodeURIComponent(app.id)}/share/defaults`;
+  return el('div', { class: 'creds' },
+    el('div', { class: 'cred-note' }, `Default login for new shares of this app.${app.tunnel ? ' Applies from the next share.' : ''}`),
+    el('div', { class: 'cred' },
+      el('span', { class: 'cred-label' }, 'user'),
+      el('input', { class: 'cred-input', value: draft.username, placeholder: 'hub',
+        oninput: (e) => { draft.username = e.target.value; } }),
+    ),
+    el('div', { class: 'cred' },
+      el('span', { class: 'cred-label' }, 'pass'),
+      el('input', { class: 'cred-input', type: 'text', autocomplete: 'off', value: draft.password,
+        placeholder: defaultsPasswordPlaceholder(draft, defaults),
+        oninput: (e) => { draft.password = e.target.value; } }),
+      defaults?.hasPassword && !draft.clearPassword
+        ? el('button', { class: 'cred-copy', onclick: () => { draft.clearPassword = true; render(); } }, 'Forget password')
+        : null,
+    ),
+    el('div', { class: 'share-actions' },
+      el('button', { onclick: () => action(app.id, async () => {
+        const body = buildDefaultsPatch(draft, defaults);
+        if (body) {
+          await api('PUT', url, { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+        }
+        delete state.defaultsEdit[app.id];
+      }) }, 'Save'),
+      defaults
+        ? el('button', { class: 'danger', onclick: () => action(app.id, async () => {
+            await api('DELETE', url);
+            delete state.defaultsEdit[app.id];
+          }) }, 'Clear')
+        : null,
+      el('button', { onclick: () => { delete state.defaultsEdit[app.id]; render(); } }, 'Cancel'),
+    ),
+  );
 }
 
 async function doShare(app, mode) {
@@ -431,6 +487,8 @@ function card(app, { subcard = false, worktrees = [] } = {}) {
 
   if (app.error) c.appendChild(el('div', { class: 'err' }, app.error));
   c.appendChild(controls(app));
+  const db = defaultsBlock(app);
+  if (db) c.appendChild(db);
   const routes = routesBlock(app);
   if (routes) c.appendChild(routes);
   const sp = sharePanel(app);

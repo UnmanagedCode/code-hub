@@ -40,6 +40,7 @@ export function mergeSharePatch(cur, patched) {
   if ('qrSvg' in patched) cur.qrSvg = patched.qrSvg;
   if ('username' in patched) cur.username = patched.username;
   if ('password' in patched) cur.password = patched.password;
+  if ('passwordIsDefault' in patched) cur.passwordIsDefault = patched.passwordIsDefault;
   if (patched.auth === false) delete cur.authUrl;
 }
 
@@ -102,4 +103,80 @@ export function resolveCredNote(shared) {
   if (!authEnabled) return 'via LAN, no authentication — anyone on the network can reach this app';
   if (lanTls) return 'via LAN (HTTPS, self-signed — your browser warns on first visit)';
   return 'via LAN (plain HTTP — credentials are not encrypted in transit)';
+}
+
+// Masking an app's DEFAULT share password. `passwordIsDefault` (from the server)
+// marks a live share still holding the password it was seeded with from the
+// app's stored default; generated and share-time-edited passwords stay
+// plaintext. The mask is a fixed width so it doesn't reveal the length. The
+// real value stays in `shared.password` for Copy, but is never put into an
+// <input> — the edit drafts below start blank instead, and blank means keep.
+export const PASSWORD_MASK = '••••••••';
+
+export function resolvePasswordDisplay(shared) {
+  return shared.passwordIsDefault ? PASSWORD_MASK : shared.password;
+}
+
+// The Edit form's initial draft for a live share. `kind` 'lan' also carries the
+// auth/TLS toggles, which only a LAN share has.
+export function credDraftFor(shared, kind) {
+  const creds = {
+    username: shared.username ?? '',
+    password: shared.passwordIsDefault ? '' : (shared.password ?? ''),
+  };
+  return kind === 'lan' ? { auth: shared.auth !== false, tls: shared.tls !== false, ...creds } : creds;
+}
+
+export function credPasswordPlaceholder(editing, shared) {
+  if (shared.passwordIsDefault && !editing.password) return `${PASSWORD_MASK} (default — type to replace)`;
+  return editing.password ? '' : 'leave blank to keep current';
+}
+
+// A credentials PATCH body from an Edit draft, or null when there's nothing to
+// send. Blank fields mean "keep"; `onlyChanged` also drops a field equal to
+// the live value (an in-place edit), whereas a fresh re-share sends every
+// typed field.
+export function credPatchBody(editing, shared, { onlyChanged }) {
+  const body = {};
+  for (const key of ['username', 'password']) {
+    const v = editing[key];
+    if (!v) continue;
+    if (onlyChanged && v === (shared[key] ?? '')) continue;
+    body[key] = v;
+  }
+  return Object.keys(body).length ? body : null;
+}
+
+// The card-level "Share login" form: an app's stored default login for new
+// shares. `defaults` is app.shareDefaults ({ username, hasPassword } | null) —
+// the server never sends the stored password, so the draft never holds it.
+export function defaultsDraftFor(app) {
+  return { username: app.shareDefaults?.username ?? '', password: '', clearPassword: false };
+}
+
+export function defaultsPasswordPlaceholder(draft, defaults) {
+  if (draft.clearPassword) return 'will be removed — random per share';
+  if (defaults?.hasPassword) return `${PASSWORD_MASK} (set — type to replace)`;
+  return 'none — random per share';
+}
+
+// The PUT /share/defaults body for a draft, or null when nothing changed.
+// username: set when changed, null when emptied; password: set when typed,
+// null when "Forget password" was pressed, else omitted (keep).
+export function buildDefaultsPatch(draft, defaults) {
+  const body = {};
+  const username = draft.username.trim();
+  if (username && username !== defaults?.username) body.username = username;
+  else if (!username && defaults?.username) body.username = null;
+  if (draft.password) body.password = draft.password;
+  else if (draft.clearPassword) body.password = null;
+  return Object.keys(body).length ? body : null;
+}
+
+// The Edit form's note when a LAN share's TLS toggle is about to change: that
+// re-shares, and a re-share starts from the app's default login if it has one.
+export function resolveTlsReshareNote(auth, hasDefaultLogin) {
+  if (!auth) return 'Changing TLS re-shares the app — new link & QR.';
+  if (hasDefaultLogin) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
+  return 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).';
 }

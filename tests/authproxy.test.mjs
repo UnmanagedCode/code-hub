@@ -212,6 +212,17 @@ test('generates a strong random password and token per share', async (t) => {
   assert.notEqual(p1.token, p2.token);
 });
 
+test('startAuthProxy uses an explicit password when given; username still defaults to hub', async (t) => {
+  const up = await upstream();
+  const proxy = await startAuthProxy(up.port, { password: 'given-pw' });
+  t.after(() => { proxy.close(); up.server.close(); });
+  assert.equal(proxy.username, 'hub');
+  assert.equal(proxy.password, 'given-pw');
+  const ok = await fetch(`http://127.0.0.1:${proxy.port}/`, { headers: { authorization: basic('hub', 'given-pw') } });
+  assert.equal(ok.status, 200);
+  assert.ok(proxy.token.length >= 20); // the token is still random, never the password
+});
+
 test('auth:false forwards every HTTP request with no gate, but still pre-generates creds', async (t) => {
   const up = await upstream();
   const proxy = await startAuthProxy(up.port, { auth: false });
