@@ -4,7 +4,7 @@
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
   credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody, credFieldsShown,
-  defaultsDraftFor, shareLoginLabel, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
+  resolveTlsReshareNote,
 } from './shareState.js';
 
 function el(tag, attrs = {}, ...children) {
@@ -23,7 +23,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password,saveAsDefault} draft while editing a live share (plus {auth,tls} for LAN — see credDraftFor); defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password,saveAsDefault} draft while editing a live share (plus {auth,tls} for LAN — see credDraftFor); expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
@@ -34,8 +34,7 @@ async function api(method, path, opts = {}) {
 }
 
 // `periodic: true` marks the background poll (see the setInterval below) —
-// while a credential edit is in progress (state.credEdit or
-// state.defaultsEdit non-empty), it
+// while a credential edit is in progress (state.credEdit non-empty), it
 // skips render() so the poll can't tear down/refocus the edit's <input>s,
 // same "suppress re-render churn while something's in flight" idea as the
 // `busy` set above. Manual triggers (the refresh button, and action()'s own
@@ -48,8 +47,7 @@ async function refresh({ periodic = false } = {}) {
     state.cloudflaredAvailable = data.cloudflaredAvailable;
     state.tailscaleAvailable = data.tailscaleAvailable;
     pruneDrafts(state.credEdit, state.apps);
-    pruneDrafts(state.defaultsEdit, state.apps);
-    if (!periodic || (!Object.keys(state.credEdit).length && !Object.keys(state.defaultsEdit).length)) render();
+    if (!periodic || !Object.keys(state.credEdit).length) render();
     document.getElementById('updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (e) {
     document.getElementById('empty').textContent = `Failed to load: ${e.message}`;
@@ -282,7 +280,6 @@ function credsBlock(app, shared, kind) {
 function sharePanel(app) {
   const s = state.share[app.id];
   if (s && s.choosing) {
-    if (state.defaultsEdit[app.id]) return el('div', { class: 'share' }, defaultsBlock(app));
     return el('div', { class: 'share' },
       el('div', { class: 'share-actions' },
         el('button', { onclick: () => doShare(app, 'lan') }, 'LAN'),
@@ -296,8 +293,6 @@ function sharePanel(app) {
           title: state.tailscaleAvailable ? '' : 'tailscale not available',
           onclick: () => doShare(app, 'tailscale'),
         }, 'tailscale'),
-        el('button', { onclick: () => { state.defaultsEdit[app.id] = defaultsDraftFor(app); render(); } },
-          shareLoginLabel(app.shareDefaults)),
         el('button', { onclick: () => { delete state.share[app.id]; render(); } }, 'Cancel'),
       ));
   }
@@ -394,18 +389,16 @@ function controls(app) {
     if (!app.alwaysOn) {
       // Stop/restart tear down any active share server-side (teardownShare)
       // — clear the local share/credEdit state too, or the panel would keep
-      // showing the now-defunct URL/creds until a re-share overwrites it. The
-      // chooser closes with it, so drop its Share login draft as well: left
-      // behind with no form, it would suppress the periodic render.
+      // showing the now-defunct URL/creds until a re-share overwrites it.
       row.appendChild(el('button', { class: 'danger', disabled: isBusy,
         onclick: () => action(app.id, async () => {
           await api('POST', `api/apps/${encodeURIComponent(app.id)}/stop`);
-          delete state.share[app.id]; delete state.credEdit[app.id]; delete state.defaultsEdit[app.id];
+          delete state.share[app.id]; delete state.credEdit[app.id];
         }) }, 'Stop'));
       row.appendChild(el('button', { class: 'restart', disabled: isBusy || app.sourceMissing,
         onclick: () => action(app.id, async () => {
           await api('POST', `api/apps/${encodeURIComponent(app.id)}/restart`);
-          delete state.share[app.id]; delete state.credEdit[app.id]; delete state.defaultsEdit[app.id];
+          delete state.share[app.id]; delete state.credEdit[app.id];
         }) }, 'Restart'));
     }
     row.appendChild(el('button', {
@@ -414,53 +407,6 @@ function controls(app) {
     }, app.tunnel ? 'Shared' : 'Share'));
   }
   return row;
-}
-
-// The "Share login" form inside the Share chooser (see sharePanel()), shown in
-// place of the mode buttons: edits the app's stored default username/password
-// for NEW shares. The stored password never reaches the client, so its field
-// starts blank and blank on Save keeps it; "Forget password" is the explicit
-// way to drop it.
-function defaultsBlock(app) {
-  const draft = state.defaultsEdit[app.id];
-  const defaults = app.shareDefaults;
-  const url = `api/apps/${encodeURIComponent(app.id)}/share/defaults`;
-  return el('div', { class: 'creds' },
-    el('div', { class: 'cred-note' }, 'Default login for new shares of this app.'),
-    el('div', { class: 'cred' },
-      el('span', { class: 'cred-label' }, 'user'),
-      el('input', { class: 'cred-input', value: draft.username, placeholder: 'hub',
-        oninput: (e) => { draft.username = e.target.value; } }),
-    ),
-    el('div', { class: 'cred' },
-      el('span', { class: 'cred-label' }, 'pass'),
-      el('input', { class: 'cred-input', type: 'text', autocomplete: 'off', value: draft.password,
-        placeholder: defaultsPasswordPlaceholder(draft, defaults),
-        oninput: (e) => { draft.password = e.target.value; } }),
-      defaults?.hasPassword && !draft.clearPassword
-        ? el('button', { class: 'cred-copy', onclick: () => { draft.clearPassword = true; render(); } }, 'Forget password')
-        : null,
-    ),
-    el('div', { class: 'share-actions' },
-      el('button', { onclick: () => action(app.id, async () => {
-        const body = buildDefaultsPatch(draft, defaults);
-        if (body) {
-          await api('PUT', url, { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
-        }
-        delete state.defaultsEdit[app.id];
-      }) }, 'Save'),
-      defaults
-        ? el('button', { class: 'danger', onclick: () => action(app.id, async () => {
-            await api('DELETE', url);
-            delete state.defaultsEdit[app.id];
-          }) }, 'Clear')
-        : null,
-      el('button', { onclick: () => { delete state.defaultsEdit[app.id]; render(); } }, 'Back'),
-      el('button', { onclick: () => {
-        delete state.defaultsEdit[app.id]; delete state.share[app.id]; render();
-      } }, 'Cancel'),
-    ),
-  );
 }
 
 async function doShare(app, mode) {
