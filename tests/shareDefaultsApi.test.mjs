@@ -257,17 +257,21 @@ test('DELETE removes an orphaned entry for an id that is no known app', async (t
   assert.deepEqual({ ...(await shareDefaults.readAll()) }, { app: { username: 'alice' } });
 });
 
-test('unsharing clears passwordIsDefault: a re-share without a default password is not masked', async (t) => {
-  const { base } = await setup(t);
-  await j(base, 'PUT', '/api/apps/app/share/defaults', { username: 'alice', password: 'pw-default' });
-  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false })).body.passwordIsDefault, true);
-  await j(base, 'DELETE', '/api/apps/app/share');
-  await j(base, 'PUT', '/api/apps/app/share/defaults', { password: null });
-  const res = await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
-  assert.equal(res.body.username, 'alice');
-  assert.equal(res.body.passwordIsDefault, false);
-  assert.equal((await getApp(base)).tunnel.passwordIsDefault, false);
-});
+for (const mode of ['lan', 'tunnel', 'tailscale']) {
+  test(`unsharing a ${mode} share clears passwordIsDefault: a re-share without a default password is not masked`, async (t) => {
+    const { base } = await setup(t);
+    const body = mode === 'lan' ? { mode, tls: false } : { mode };
+    await j(base, 'PUT', '/api/apps/app/share/defaults', { username: 'alice', password: 'pw-default' });
+    assert.equal((await j(base, 'POST', '/api/apps/app/share', body)).body.passwordIsDefault, true);
+    await j(base, 'DELETE', '/api/apps/app/share');
+    await j(base, 'PUT', '/api/apps/app/share/defaults', { password: null });
+    const res = await j(base, 'POST', '/api/apps/app/share', body);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.username, 'alice');
+    assert.equal(res.body.passwordIsDefault, false);
+    assert.equal((await getApp(base)).tunnel.passwordIsDefault, false);
+  });
+}
 
 test('prototype-named app ids: unknown ones 404, real ones store and list their own entry only', async (t) => {
   const { root, base } = await setup(t, { running: false });
@@ -280,6 +284,10 @@ test('prototype-named app ids: unknown ones 404, real ones store and list their 
   await mkProject(root, '__proto__', { start: fakeAppCmd() });
   assert.equal((await getApp(base, 'constructor')).shareDefaults, null);
   assert.equal((await getApp(base, '__proto__')).shareDefaults, null);
+  // list() must not treat Object.prototype as `__proto__`'s running record —
+  // tearing that "record" down would write Object.prototype.tunnel.
+  assert.equal((await getApp(base, '__proto__')).status, 'stopped');
+  assert.ok(!Object.hasOwn(Object.prototype, 'tunnel'));
 
   const put = await j(base, 'PUT', '/api/apps/__proto__/share/defaults', { password: 'pw' });
   assert.deepEqual(put.body, { id: '__proto__', username: null, hasPassword: true });

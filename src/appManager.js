@@ -397,7 +397,9 @@ export async function list() {
     };
   };
 
-  for (const app of discovered) entries.push(await build(app, store.apps[app.id]));
+  // hasOwn: an app id is a directory name, so `__proto__`/`constructor` must not
+  // read Object.prototype members as a running record.
+  for (const app of discovered) entries.push(await build(app, Object.hasOwn(store.apps, app.id) ? store.apps[app.id] : undefined));
   for (const [id, rec] of Object.entries(store.apps)) {
     if (byId.has(id)) continue; // already built above
     entries.push(await build({ ...rec, manifest: null, manifestError: null }, rec));

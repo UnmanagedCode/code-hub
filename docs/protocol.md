@@ -30,7 +30,7 @@ Per-app default username/password that a **new** share of the app starts with, i
 - **Location:** always under `<projectsRoot>/.code-hub/`, never in a project tree.
 - **Mode `0600`:** every write goes to a tmp file created `0600`, `chmod 0600`, then renamed over the file — so the file is owner-only even if it pre-existed looser. `state.json`/`registrations.json` are written with the process umask. **Plaintext at rest** — the file mode is the only protection.
 - **Read on every call** (no in-memory cache). Writes (`update`/`clear`) are serialised in-process, so concurrent PUTs for different ids don't drop each other's entry.
-- **Corrupt file:** invalid JSON is renamed to `share-defaults.json.corrupt` with a `console.warn` and treated as empty; valid JSON that isn't an object is warned about and treated as empty.
+- **Corrupt file:** invalid JSON is renamed to `share-defaults.json.corrupt` (chmodded `0600`, since it may still hold passwords) with a `console.warn` that omits the parse error (its message can quote the file), and treated as empty; valid JSON that isn't an object is warned about and treated as empty.
 - **Not auto-deleted** when an app is unregistered or removed; `DELETE …/share/defaults` clears a stale entry.
 
 ## In-memory registration (process-lifetime only, never persisted)

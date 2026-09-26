@@ -120,6 +120,9 @@ test('concurrent updates for two ids both survive (writes are serialised)', asyn
 test('the tmp file is created 0600 before it is chmodded or published', { skip: process.platform === 'win32' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
+  // umask 0, so the create mode is decided by writeFile's `mode` alone.
+  const prevUmask = process.umask(0);
+  t.after(() => process.umask(prevUmask));
   // Observe the tmp file's mode at the moment of the chmod call — i.e. what
   // writeFile created it with — then delegate unchanged.
   const realChmod = fs.chmod;
@@ -150,7 +153,8 @@ test('a corrupt file moved aside is chmodded 0600, and the warning carries none 
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await fs.mkdir(storeRoot(), { recursive: true });
-  await fs.writeFile(file(), '{"app":{"password":"leaked-secret"', { mode: 0o644 });
+  // The secret leads the content, so even a logged prefix of the raw input shows.
+  await fs.writeFile(file(), 'leaked-secret{"app":{"password":"x"', { mode: 0o644 });
   await fs.chmod(file(), 0o644);
   const realWarn = console.warn;
   const warnings = [];
@@ -160,7 +164,7 @@ test('a corrupt file moved aside is chmodded 0600, and the warning carries none 
   console.warn = realWarn;
   assert.equal((await fs.stat(file() + '.corrupt')).mode & 0o777, 0o600);
   assert.equal(warnings.length, 1);
-  assert.ok(!warnings[0].includes('leaked-secret'), warnings[0]);
+  assert.ok(!warnings[0].includes('leaked'), warnings[0]);
   assert.ok(!/JSON at position|Unexpected/.test(warnings[0]), warnings[0]);
 });
 
