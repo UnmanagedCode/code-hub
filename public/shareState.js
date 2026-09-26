@@ -108,9 +108,10 @@ export function resolveCredNote(shared) {
 // Masking an app's DEFAULT share password. `passwordIsDefault` (from the server)
 // marks a live share whose password is the app's stored default (seeded from
 // it, or saved as it by a ticked "Also save as this app's default login");
-// generated and other share-time-edited passwords stay plaintext. The mask is a fixed width so it doesn't reveal the length. The
-// real value stays in `shared.password` for Copy, but is never put into an
-// <input> — the edit drafts below start blank instead, and blank means keep.
+// generated and other share-time-edited passwords stay plaintext. The mask is
+// a fixed width so it doesn't reveal the length. The real value stays in
+// `shared.password` for Copy, but is never put into an <input> — the edit
+// drafts below start blank instead, and blank means keep.
 // Masking guards against shoulder-surfing only: list() still serves the real
 // password to the browser while the share is live.
 export const PASSWORD_MASK = '••••••••';

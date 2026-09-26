@@ -726,8 +726,9 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
 //
 // `saveAsDefault: true` also writes the share's resulting login (each blank
 // field = the live value, so an untouched generated password is included) as
-// the app's default, then marks the share `passwordIsDefault` — the live
-// password equals the stored one by construction. The file write happens
+// the app's default, then applies that whole login to the proxy and marks the
+// share `passwordIsDefault` — the live password equals the stored one by
+// construction. The file write happens
 // before the proxy is touched, so a failed write (500) leaves the live login
 // as it was. If the share is replaced during the write, the default stays
 // written (it's what was asked for) but the new/absent share is left alone (409).
@@ -751,13 +752,16 @@ export async function updateShareCredentials(id, { username, password, saveAsDef
   if (hasPassword && (typeof password !== 'string' || !password.trim())) {
     const e = new Error('password must be a non-empty string'); e.statusCode = 400; throw e;
   }
+  // Resolved once, before any await: a ticked save writes exactly this and
+  // then applies all of it, so an edit landing during the write is overwritten
+  // (last writer wins) rather than left live under a `passwordIsDefault` flag.
   const next = {
-    username: hasUsername ? username.trim() : undefined,
-    password: hasPassword ? password.trim() : undefined,
+    username: hasUsername ? username.trim() : (saveAsDefault ? proxy.username : undefined),
+    password: hasPassword ? password.trim() : (saveAsDefault ? proxy.password : undefined),
   };
   if (saveAsDefault) {
     try {
-      await shareDefaults.update(id, { username: next.username ?? proxy.username, password: next.password ?? proxy.password });
+      await shareDefaults.update(id, next);
     } catch (err) {
       const e = new Error(`saving '${id}'s default share login failed: ${err.message}`); e.statusCode = 500; throw e;
     }

@@ -390,23 +390,97 @@ test('rejected saveAsDefault requests write nothing and leave the live login', a
   assert.equal(await status((await getApp(base)).tunnel.proxyPort), 200);
 });
 
-// Invariant: a ticked Save is all-or-nothing — the proxy isn't touched until
-// the default is written.
+// Invariant: a ticked Save is all-or-nothing — the proxy and the mask aren't
+// touched until the default is written.
 test('a failed default write returns 500 and leaves the live login and mask untouched', async (t) => {
   const { base } = await setup(t);
+  const { password } = (await j(base, 'POST', '/api/apps/app/share', shareBody('lan'))).body; // generated, unmasked
   await j(base, 'PUT', '/api/apps/app/share/defaults', { username: 'alice', password: 'pw-default' });
-  await j(base, 'POST', '/api/apps/app/share', shareBody('lan'));
   const pp = (await getApp(base)).tunnel.proxyPort;
   // A directory where the file belongs: reading it fails with EISDIR, even as root.
   await fs.rm(shareDefaults.shareDefaultsFile());
   await fs.mkdir(shareDefaults.shareDefaultsFile());
-  const res = await j(base, 'PATCH', PATCH_CREDS, { password: 'x', saveAsDefault: true });
+  const res = await j(base, 'PATCH', PATCH_CREDS, { saveAsDefault: true });
   assert.equal(res.status, 500);
   assert.match(res.body.error, /default share login/);
-  assert.equal(await status(pp, 'alice', 'pw-default'), 200);
-  assert.equal(await status(pp, 'alice', 'x'), 401);
+  assert.equal(await status(pp, 'hub', password), 200);
   await fs.rm(shareDefaults.shareDefaultsFile(), { recursive: true }); // list() reads the file
-  assert.equal((await getApp(base)).tunnel.passwordIsDefault, true);
+  assert.equal((await getApp(base)).tunnel.passwordIsDefault, false);
+});
+
+// Hold share-defaults.json's publishing rename until release() is called:
+// `reached` resolves once a write is parked there. Restored after the test.
+function gateDefaultsWrite(t) {
+  const realRename = fs.rename;
+  let release, reached;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  fs.rename = async (from, to) => {
+    if (to === shareDefaults.shareDefaultsFile()) { reached(); await gate; }
+    return realRename(from, to);
+  };
+  t.after(() => { fs.rename = realRename; });
+  return { parked, release };
+}
+
+// Invariant: whatever interleaves with a ticked Save, passwordIsDefault is true
+// only while the live password is the stored default, and then that stored
+// pair is the one the proxy accepts.
+test('an unflagged password edit during a ticked Save cannot leave a false mask', async (t) => {
+  const { base } = await setup(t);
+  await j(base, 'POST', '/api/apps/app/share', shareBody('lan'));
+  const { parked, release } = gateDefaultsWrite(t);
+  const ticked = j(base, 'PATCH', PATCH_CREDS, { saveAsDefault: true });
+  await parked;
+  assert.equal((await j(base, 'PATCH', PATCH_CREDS, { password: 'z' })).status, 200);
+  release();
+  assert.equal((await ticked).status, 200);
+
+  const app = await getApp(base);
+  const stored = (await shareDefaults.readAll()).app;
+  assert.equal(app.tunnel.passwordIsDefault, app.tunnel.password === stored.password);
+  if (app.tunnel.passwordIsDefault) {
+    assert.equal(app.tunnel.username, stored.username);
+    assert.equal(await status(app.tunnel.proxyPort, stored.username, stored.password), 200);
+  }
+});
+
+// Invariant: a share that replaces (or ends) the edited one mid-write is never
+// mutated or flagged; the requested default is still written, and the PATCH
+// fails with a clean 409.
+test('a ticked Save whose share is unshared mid-write returns 409 and keeps the default', async (t) => {
+  const { base } = await setup(t);
+  const { password } = (await j(base, 'POST', '/api/apps/app/share', shareBody('lan'))).body;
+  const { parked, release } = gateDefaultsWrite(t);
+  const ticked = j(base, 'PATCH', PATCH_CREDS, { username: 'carol', saveAsDefault: true });
+  await parked;
+  assert.equal((await j(base, 'DELETE', '/api/apps/app/share')).status, 200);
+  release();
+  const res = await ticked;
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /share ended/);
+  assert.deepEqual({ ...(await shareDefaults.readAll()).app }, { username: 'carol', password });
+  assert.equal((await getApp(base)).tunnel, null);
+});
+
+test('a ticked Save whose share is replaced mid-write returns 409 and leaves the new share alone', async (t) => {
+  const { base } = await setup(t);
+  const { password } = (await j(base, 'POST', '/api/apps/app/share', shareBody('lan'))).body;
+  const { parked, release } = gateDefaultsWrite(t);
+  const ticked = j(base, 'PATCH', PATCH_CREDS, { username: 'carol', saveAsDefault: true });
+  await parked;
+  const fresh = (await j(base, 'POST', '/api/apps/app/share', shareBody('lan'))).body; // read the file before the rename
+  assert.equal(fresh.passwordIsDefault, false);
+  release();
+  const res = await ticked;
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /share ended/);
+  assert.deepEqual({ ...(await shareDefaults.readAll()).app }, { username: 'carol', password });
+  const app = await getApp(base);
+  assert.equal(app.tunnel.passwordIsDefault, false);
+  assert.equal(app.tunnel.username, fresh.username);
+  assert.equal(app.tunnel.password, fresh.password);
+  assert.equal(await status(app.tunnel.proxyPort, fresh.username, fresh.password), 200);
 });
 
 // Invariant: after a ticked TLS Save (re-share, then flagged PATCH), the new

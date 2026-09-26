@@ -23,7 +23,7 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
-const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password} draft while editing a live share; defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
+const state = { apps: [], cloudflaredAvailable: false, tailscaleAvailable: false, share: {}, credEdit: {}, defaultsEdit: {}, sort: 'edited', expanded: new Set() }; // share: id → {choosing:true} | 'loading' | {url,kind,...} | {error}; credEdit: id → {username,password,saveAsDefault} draft while editing a live share (plus {auth,tls} for LAN — see credDraftFor); defaultsEdit: id → {username,password,clearPassword} draft of the app's default share login; expanded: project names with worktrees shown
 const busy = new Set(); // ids with an in-flight action (suppresses re-render churn)
 
 async function api(method, path, opts = {}) {
