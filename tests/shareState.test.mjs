@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
-  PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
+  PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody, credFieldsShown,
   defaultsDraftFor, shareLoginLabel, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
 } from '../public/shareState.js';
 
@@ -173,12 +173,21 @@ test('pruneDrafts: drops drafts for ids no longer listed, keeps the rest', () =>
   assert.deepEqual(empty, {});
 });
 
-test('credDraftFor: a default password starts blank (never in the DOM); LAN also carries auth/tls', () => {
-  assert.deepEqual(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true }, 'tunnel'), { username: 'u', password: '' });
-  assert.deepEqual(credDraftFor({ username: 'u', password: 'gen' }, 'tailscale'), { username: 'u', password: 'gen' });
+test('credDraftFor: a default password starts blank (never in the DOM); LAN also carries auth/tls; save-as-default starts unticked', () => {
+  assert.deepEqual(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true }, 'tunnel'), { username: 'u', password: '', saveAsDefault: false });
+  assert.deepEqual(credDraftFor({ username: 'u', password: 'gen' }, 'tailscale'), { username: 'u', password: 'gen', saveAsDefault: false });
   assert.deepEqual(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true, auth: true, tls: false }, 'lan'),
-    { auth: true, tls: false, username: 'u', password: '' });
-  assert.deepEqual(credDraftFor({ username: null, password: null, auth: false }, 'lan'), { auth: false, tls: true, username: '', password: '' });
+    { auth: true, tls: false, username: 'u', password: '', saveAsDefault: false });
+  assert.deepEqual(credDraftFor({ username: null, password: null, auth: false }, 'lan'), { auth: false, tls: true, username: '', password: '', saveAsDefault: false });
+});
+
+test('credFieldsShown: always for tunnel/tailscale; for LAN only while auth is on', () => {
+  for (const kind of ['tunnel', 'tailscale']) {
+    assert.equal(credFieldsShown({ auth: false }, kind), true);
+    assert.equal(credFieldsShown({}, kind), true);
+  }
+  assert.equal(credFieldsShown({ auth: true }, 'lan'), true);
+  assert.equal(credFieldsShown({ auth: false }, 'lan'), false);
 });
 
 test('credPasswordPlaceholder: masked hint for a default, keep hint when blank, none once typed', () => {
@@ -191,11 +200,20 @@ test('credPasswordPlaceholder: masked hint for a default, keep hint when blank, 
 
 test('credPatchBody: omits blanks; onlyChanged omits unchanged; null when empty', () => {
   const shared = { username: 'u', password: 'p' };
-  assert.deepEqual(credPatchBody({ username: 'u', password: '' }, shared, { onlyChanged: false }), { username: 'u' });
-  assert.deepEqual(credPatchBody({ username: 'u', password: 'p' }, shared, { onlyChanged: true }), null);
-  assert.deepEqual(credPatchBody({ username: 'v', password: 'p' }, shared, { onlyChanged: true }), { username: 'v' });
-  assert.deepEqual(credPatchBody({ username: 'u', password: 'q' }, shared, { onlyChanged: true }), { password: 'q' });
-  assert.equal(credPatchBody({ username: '', password: '' }, shared, { onlyChanged: false }), null);
+  assert.deepEqual(credPatchBody({ username: 'u', password: '', saveAsDefault: false }, shared, { onlyChanged: false }), { username: 'u' });
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'p', saveAsDefault: false }, shared, { onlyChanged: true }), null);
+  assert.deepEqual(credPatchBody({ username: 'v', password: 'p', saveAsDefault: false }, shared, { onlyChanged: true }), { username: 'v' });
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'q', saveAsDefault: false }, shared, { onlyChanged: true }), { password: 'q' });
+  assert.equal(credPatchBody({ username: '', password: '', saveAsDefault: false }, shared, { onlyChanged: false }), null);
+});
+
+test('credPatchBody: a ticked save-as-default always yields a body carrying the flag', () => {
+  const shared = { username: 'u', password: 'p' };
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'p', saveAsDefault: true }, shared, { onlyChanged: true }), { saveAsDefault: true });
+  assert.deepEqual(credPatchBody({ username: '', password: '', saveAsDefault: true }, shared, { onlyChanged: false }), { saveAsDefault: true });
+  assert.deepEqual(credPatchBody({ username: 'v', password: 'p', saveAsDefault: true }, shared, { onlyChanged: true }), { username: 'v', saveAsDefault: true });
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'p', saveAsDefault: true }, shared, { onlyChanged: false }),
+    { username: 'u', password: 'p', saveAsDefault: true });
 });
 
 test('defaultsDraftFor: prefills the username, never the password', () => {

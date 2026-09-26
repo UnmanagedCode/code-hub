@@ -106,9 +106,9 @@ export function resolveCredNote(shared) {
 }
 
 // Masking an app's DEFAULT share password. `passwordIsDefault` (from the server)
-// marks a live share still holding the password it was seeded with from the
-// app's stored default; generated and share-time-edited passwords stay
-// plaintext. The mask is a fixed width so it doesn't reveal the length. The
+// marks a live share whose password is the app's stored default (seeded from
+// it, or saved as it by a ticked "Also save as this app's default login");
+// generated and other share-time-edited passwords stay plaintext. The mask is a fixed width so it doesn't reveal the length. The
 // real value stays in `shared.password` for Copy, but is never put into an
 // <input> — the edit drafts below start blank instead, and blank means keep.
 // Masking guards against shoulder-surfing only: list() still serves the real
@@ -130,13 +130,21 @@ export function pruneDrafts(drafts, apps) {
 }
 
 // The Edit form's initial draft for a live share. `kind` 'lan' also carries the
-// auth/TLS toggles, which only a LAN share has.
+// auth/TLS toggles, which only a LAN share has. "Also save as this app's
+// default login" starts unticked.
 export function credDraftFor(shared, kind) {
   const creds = {
     username: shared.username ?? '',
     password: shared.passwordIsDefault ? '' : (shared.password ?? ''),
+    saveAsDefault: false,
   };
   return kind === 'lan' ? { auth: shared.auth !== false, tls: shared.tls !== false, ...creds } : creds;
+}
+
+// Whether the Edit form shows the user/pass fields and the save-as-default
+// checkbox: always for an always-gated share, for LAN only while auth is on.
+export function credFieldsShown(editing, kind) {
+  return kind !== 'lan' || editing.auth;
 }
 
 export function credPasswordPlaceholder(editing, shared) {
@@ -147,7 +155,8 @@ export function credPasswordPlaceholder(editing, shared) {
 // A credentials PATCH body from an Edit draft, or null when there's nothing to
 // send. Blank fields mean "keep"; `onlyChanged` also drops a field equal to
 // the live value (an in-place edit), whereas a fresh re-share sends every
-// typed field.
+// typed field. A ticked save-as-default always sends a body (the flag alone
+// pins the share's current login as the default).
 export function credPatchBody(editing, shared, { onlyChanged }) {
   const body = {};
   for (const key of ['username', 'password']) {
@@ -156,6 +165,7 @@ export function credPatchBody(editing, shared, { onlyChanged }) {
     if (onlyChanged && v === (shared[key] ?? '')) continue;
     body[key] = v;
   }
+  if (editing.saveAsDefault) body.saveAsDefault = true;
   return Object.keys(body).length ? body : null;
 }
 
