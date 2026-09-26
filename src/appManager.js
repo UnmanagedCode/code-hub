@@ -16,6 +16,7 @@ import { startAuthProxy } from './authproxy.js';
 import { generateSelfSigned } from './selfsigned.js';
 import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 import * as conductorProjects from './conductorProjects.js';
+import * as shareDefaults from './shareDefaults.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -25,6 +26,21 @@ let store = { apps: {} };
 // Live auth-proxy handles, keyed by app id. In-memory only: the password and
 // the proxy server never survive a code-hub restart (see init teardown).
 const proxies = new Map();
+
+// Ids whose live proxy was seeded with the app's stored default password and
+// still holds it (a share-time password edit removes the id). Drives the
+// `passwordIsDefault` flag the UI masks on. Cleared in teardownShare.
+const defaultPasswordShares = new Set();
+
+// startAuthProxy options for an app's stored default login: only the fields
+// that are set, so an unset username stays 'hub' and an unset password stays
+// random.
+function credOpts(creds) {
+  return {
+    ...(creds.username ? { username: creds.username } : {}),
+    ...(creds.password ? { password: creds.password } : {}),
+  };
+}
 
 // True when `dir` is `root` itself or a descendant of it. Used to decide
 // whether the injected host-conductor dir is reachable by discoverApps()'s
@@ -192,6 +208,7 @@ function killShareChild(id, t, { verify = false } = {}) {
 function teardownShare(id, rec, opts) {
   const proxy = proxies.get(id);
   if (proxy) { proxy.close(); proxies.delete(id); }
+  defaultPasswordShares.delete(id);
   if (rec?.tunnel) killShareChild(id, rec.tunnel, opts);
   if (rec) rec.tunnel = null;
   qrCache.delete(id);
@@ -263,6 +280,7 @@ async function cachedQrSvg(id, { url, authUrl }) {
 export async function list() {
   const discovered = await discoverApps();
   const byId = new Map(discovered.map((a) => [a.id, a]));
+  const defaults = await shareDefaults.readAll();
   const entries = [];
   let mutated = false;
 
@@ -313,7 +331,9 @@ export async function list() {
           fixedPortFallback: rec.tunnel.fixedPortFallback === true,
           fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
           auth, tls: rec.tunnel.tls === true,
-          username, password,
+          // `password` is the real value (the UI's Copy needs it); this flag
+          // only tells the UI to mask it on screen.
+          username, password, passwordIsDefault: auth && defaultPasswordShares.has(base.id),
           ...(authUrl ? { authUrl } : {}),
           ...(svg ? { qrSvg: svg } : {}),
         };
@@ -368,6 +388,7 @@ export async function list() {
       outOfDate: !!(startedSha && currentSha && startedSha !== currentSha),
       sourceMissing,
       routes,
+      shareDefaults: shareDefaults.describe(defaults[base.id]),
       tunnel: tunnelInfo,
       error,
       manifestError,
@@ -376,7 +397,9 @@ export async function list() {
     };
   };
 
-  for (const app of discovered) entries.push(await build(app, store.apps[app.id]));
+  // hasOwn: an app id is a directory name, so `__proto__`/`constructor` must not
+  // read Object.prototype members as a running record.
+  for (const app of discovered) entries.push(await build(app, Object.hasOwn(store.apps, app.id) ? store.apps[app.id] : undefined));
   for (const [id, rec] of Object.entries(store.apps)) {
     if (byId.has(id)) continue; // already built above
     entries.push(await build({ ...rec, manifest: null, manifestError: null }, rec));
@@ -479,8 +502,11 @@ export async function restart(id) {
 //   unlike cloudflared's random hostname it is stable across restarts. Always
 //   gated. Funnel occupies port 443 machine-wide, so only ONE tailscale share
 //   can exist at a time (409 naming the holder).
-// For a gated share, a fresh token + password are generated per share, kept
-// in memory only (see the `proxies` map). The QR/authUrl carries the token
+// For a gated share, a fresh token is generated per share; the username and
+// password are the app's stored default share login where set (see
+// shareDefaults.js — each field falls back independently to 'hub' / a random
+// password), all kept in memory only for the share (see the `proxies` map).
+// The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
 // — no credentials ever appear in the URL); username/password remain
 // available as a Basic-Auth fallback for curl/API clients, and persist
@@ -497,6 +523,11 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
   if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
+  // Read BEFORE the mode branches: the tailscale branch's slot claim must have
+  // no await between its check and the claim.
+  const creds = await shareDefaults.get(id);
+  // Called right after each branch's proxies.set.
+  const markDefault = () => { if (creds.password) defaultPasswordShares.add(id); };
 
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
@@ -521,7 +552,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     let fixedPortHolder = null;
     if (rec.fixedPort && lanIps.length) {
       try {
-        proxy = await startAuthProxy(rec.port, { host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
+        proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
       } catch (e) {
         if (e.code !== 'EADDRINUSE') throw e;
         fixedPortFallback = true;
@@ -559,8 +590,9 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
         console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
       }
     }
-    if (!proxy) proxy = await startAuthProxy(rec.port, { host: '0.0.0.0', auth, tls: tlsOpt });
+    if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
     proxies.set(id, proxy);
+    markDefault();
     const scheme = useTls ? 'https' : 'http';
     // Drop the loopback entry — it's not reachable from another device, and in
     // the fixed-port case that's load-bearing rather than cosmetic: the proxy
@@ -577,7 +609,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
       return { kind: 'lan', url, urls, auth: false, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
   if (mode === 'tailscale') {
@@ -611,7 +643,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
 
       // No `tls` option: tailscaled terminates TLS on-machine and forwards plain
       // HTTP here, exactly as cloudflared does (see authproxy.js).
-      const proxy = await startAuthProxy(rec.port);
+      const proxy = await startAuthProxy(rec.port, credOpts(creds));
       let url, pid;
       try {
         ({ url, pid } = await tailscale.startFunnel(proxy.port));
@@ -636,6 +668,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
         e.statusCode = 409; throw e;
       }
       proxies.set(id, proxy);
+      markDefault();
       rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
       funnelSlot = { id, pid, pending: false };
       // Past this point the funnel is up and recorded, so the slot names
@@ -644,7 +677,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
       await persist();
 
       const authUrl = withToken(url, proxy.token);
-      return { kind: 'tailscale', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+      return { kind: 'tailscale', url, auth: true, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
     } catch (e) {
       // Hand the slot back to whoever held it, if their funnel survived this
       // attempt: a refusal thrown BEFORE teardownShare (an unavailable daemon)
@@ -664,7 +697,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
   }
   teardownShare(id, rec); // replace any existing share
 
-  const proxy = await startAuthProxy(rec.port);
+  const proxy = await startAuthProxy(rec.port, credOpts(creds));
   let url, pid;
   try {
     ({ url, pid } = await tunnel.startTunnel(proxy.port));
@@ -673,18 +706,21 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
     throw e;
   }
   proxies.set(id, proxy);
+  markDefault();
   rec.tunnel = { kind: 'tunnel', url, pid, proxyPort: proxy.port, auth: true };
   await persist();
 
   const authUrl = withToken(url, proxy.token);
-  return { kind: 'tunnel', url, auth: true, authUrl, username: proxy.username, password: proxy.password, qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+  return { kind: 'tunnel', url, auth: true, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
 }
 
 // Edit the active share's Basic-Auth credentials in place — mutates the live
 // proxy (see authproxy.js's setCredentials), so the share URL/token/proxy
-// port never change. Custom creds are per-share-instance only: share()
-// always tears down and recreates the proxy, so the next share starts fresh
-// with an auto-generated password again.
+// port never change. Custom creds are per-share-instance only and never touch
+// the app's stored default (share-defaults.json): share() always tears down
+// and recreates the proxy, so the next share starts again from the app's
+// default login if one is set, else 'hub' + an auto-generated password. A
+// password edit ends `passwordIsDefault` for this share.
 export async function updateShareCredentials(id, { username, password } = {}) {
   const proxy = proxies.get(id);
   if (!proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
@@ -704,6 +740,7 @@ export async function updateShareCredentials(id, { username, password } = {}) {
     username: hasUsername ? username.trim() : undefined,
     password: hasPassword ? password.trim() : undefined,
   });
+  if (hasPassword) defaultPasswordShares.delete(id);
   // The QR encodes the token URL, which is stable across a creds edit (the
   // token/proxy/URL are untouched), so this is a cache hit — but the field is
   // still returned so the caller can fold it back into its share state on the
@@ -713,6 +750,7 @@ export async function updateShareCredentials(id, { username, password } = {}) {
   const authUrl = withToken(url, proxy.token);
   return {
     id, username: proxy.username, password: proxy.password,
+    passwordIsDefault: defaultPasswordShares.has(id),
     qrSvg: await cachedQrSvg(id, { url, authUrl }),
   };
 }
@@ -748,6 +786,32 @@ export async function unshare(id) {
   const rec = store.apps[id];
   if (rec?.tunnel || proxies.has(id)) { teardownShare(id, rec); await persist(); }
   return { id, tunnel: null };
+}
+
+// An app's stored default share login (see shareDefaults.js). Get/set 404 an
+// id code-hub doesn't know; clear never does, so an entry orphaned by a
+// removed app can still be deleted.
+async function assertKnownApp(id) {
+  if (Object.hasOwn(store.apps, id) || isHostConductorId(id)) return;
+  if ((await discoverApps()).some((a) => a.id === id)) return;
+  const e = new Error(`unknown app '${id}'`); e.statusCode = 404; throw e;
+}
+
+const NO_DEFAULTS = { username: null, hasPassword: false };
+
+export async function getShareDefaults(id) {
+  await assertKnownApp(id);
+  return { id, ...(shareDefaults.describe((await shareDefaults.readAll())[id]) ?? NO_DEFAULTS) };
+}
+
+export async function setShareDefaults(id, body) {
+  await assertKnownApp(id);
+  return { id, ...((await shareDefaults.update(id, body)) ?? NO_DEFAULTS) };
+}
+
+export async function clearShareDefaults(id) {
+  await shareDefaults.clear(id);
+  return { id, ...NO_DEFAULTS };
 }
 
 async function hasManifestFile(dir) {

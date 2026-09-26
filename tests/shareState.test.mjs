@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote } from '../public/shareState.js';
+import {
+  resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
+  PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody,
+  defaultsDraftFor, defaultsPasswordPlaceholder, buildDefaultsPatch, resolveTlsReshareNote,
+} from '../public/shareState.js';
 
 // These cover the client behaviors the server tests can't: how sharePanel
 // resolves the Open link and QR between the in-memory share response (state.
@@ -151,4 +155,87 @@ test('resolveCredNote: the four LAN arms are unchanged by the tailscale split', 
     'via LAN (HTTPS, self-signed — your browser warns on first visit), no authentication — anyone on the network can reach this app');
   assert.equal(resolveCredNote({ kind: 'lan', url: 'http://192.0.2.1:5001', auth: false }),
     'via LAN, no authentication — anyone on the network can reach this app');
+});
+
+test('credRowValues: a default password is shown masked but Copy gets the real one; others are plaintext', () => {
+  assert.equal(PASSWORD_MASK, '••••••••');
+  assert.deepEqual(credRowValues({ password: 'real', passwordIsDefault: true }), { display: PASSWORD_MASK, copy: 'real' });
+  assert.deepEqual(credRowValues({ password: 'gen', passwordIsDefault: false }), { display: 'gen', copy: 'gen' });
+  assert.deepEqual(credRowValues({ password: 'gen' }), { display: 'gen', copy: 'gen' });
+});
+
+test('pruneDrafts: drops drafts for ids no longer listed, keeps the rest', () => {
+  const drafts = { a: { username: 'x' }, gone: { username: 'y' }, 'p:wt': {} };
+  pruneDrafts(drafts, [{ id: 'a' }, { id: 'b' }]);
+  assert.deepEqual(drafts, { a: { username: 'x' } });
+  const empty = {};
+  pruneDrafts(empty, []);
+  assert.deepEqual(empty, {});
+});
+
+test('credDraftFor: a default password starts blank (never in the DOM); LAN also carries auth/tls', () => {
+  assert.deepEqual(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true }, 'tunnel'), { username: 'u', password: '' });
+  assert.deepEqual(credDraftFor({ username: 'u', password: 'gen' }, 'tailscale'), { username: 'u', password: 'gen' });
+  assert.deepEqual(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true, auth: true, tls: false }, 'lan'),
+    { auth: true, tls: false, username: 'u', password: '' });
+  assert.deepEqual(credDraftFor({ username: null, password: null, auth: false }, 'lan'), { auth: false, tls: true, username: '', password: '' });
+});
+
+test('credPasswordPlaceholder: masked hint for a default, keep hint when blank, none once typed', () => {
+  const masked = { passwordIsDefault: true };
+  assert.equal(credPasswordPlaceholder({ password: '' }, masked), '•••••••• (default — type to replace)');
+  assert.equal(credPasswordPlaceholder({ password: 'x' }, masked), '');
+  assert.equal(credPasswordPlaceholder({ password: '' }, {}), 'leave blank to keep current');
+  assert.equal(credPasswordPlaceholder({ password: 'x' }, {}), '');
+});
+
+test('credPatchBody: omits blanks; onlyChanged omits unchanged; null when empty', () => {
+  const shared = { username: 'u', password: 'p' };
+  assert.deepEqual(credPatchBody({ username: 'u', password: '' }, shared, { onlyChanged: false }), { username: 'u' });
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'p' }, shared, { onlyChanged: true }), null);
+  assert.deepEqual(credPatchBody({ username: 'v', password: 'p' }, shared, { onlyChanged: true }), { username: 'v' });
+  assert.deepEqual(credPatchBody({ username: 'u', password: 'q' }, shared, { onlyChanged: true }), { password: 'q' });
+  assert.equal(credPatchBody({ username: '', password: '' }, shared, { onlyChanged: false }), null);
+});
+
+test('defaultsDraftFor: prefills the username, never the password', () => {
+  assert.deepEqual(defaultsDraftFor({ shareDefaults: { username: 'u', hasPassword: true } }), { username: 'u', password: '', clearPassword: false });
+  assert.deepEqual(defaultsDraftFor({ shareDefaults: null }), { username: '', password: '', clearPassword: false });
+});
+
+test('defaultsPasswordPlaceholder: set / will be removed / none', () => {
+  const draft = { password: '', clearPassword: false };
+  assert.equal(defaultsPasswordPlaceholder(draft, { hasPassword: true }), '•••••••• (set — type to replace)');
+  assert.equal(defaultsPasswordPlaceholder({ ...draft, clearPassword: true }, { hasPassword: true }), 'will be removed — random per share');
+  assert.equal(defaultsPasswordPlaceholder(draft, { hasPassword: false }), 'none — random per share');
+  assert.equal(defaultsPasswordPlaceholder(draft, null), 'none — random per share');
+});
+
+test('buildDefaultsPatch: emptied → null, unchanged → omitted, blank pw keeps, clearPassword → null, no change → null', () => {
+  const d = (o) => ({ username: '', password: '', clearPassword: false, ...o });
+  const stored = { username: 'u', hasPassword: true };
+  assert.deepEqual(buildDefaultsPatch(d({ username: '' }), stored), { username: null });
+  assert.equal(buildDefaultsPatch(d({ username: 'u' }), stored), null);
+  assert.deepEqual(buildDefaultsPatch(d({ username: ' v ' }), stored), { username: 'v' });
+  assert.deepEqual(buildDefaultsPatch(d({ username: 'u', password: 'new' }), stored), { password: 'new' });
+  assert.deepEqual(buildDefaultsPatch(d({ username: 'u', clearPassword: true }), stored), { password: null });
+  assert.equal(buildDefaultsPatch(d({}), null), null);
+  assert.deepEqual(buildDefaultsPatch(d({ username: 'a', password: 'b' }), null), { username: 'a', password: 'b' });
+});
+
+test('resolveTlsReshareNote: the three wordings, keyed on a stored default password', () => {
+  assert.equal(resolveTlsReshareNote(false, { username: null, hasPassword: true }), 'Changing TLS re-shares the app — new link & QR.');
+  assert.equal(resolveTlsReshareNote(true, { username: null, hasPassword: true }), "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).");
+  assert.equal(resolveTlsReshareNote(true, null), 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).');
+  // Keyed on a stored default PASSWORD: a username-only default still gets a random password on re-share.
+  assert.equal(resolveTlsReshareNote(true, { username: 'u', hasPassword: false }), resolveTlsReshareNote(true, null));
+});
+
+test('mergeSharePatch carries passwordIsDefault', () => {
+  const cur = { password: 'real', passwordIsDefault: true };
+  mergeSharePatch(cur, { password: 'edited', passwordIsDefault: false });
+  assert.equal(cur.passwordIsDefault, false);
+  const cur2 = { passwordIsDefault: true };
+  mergeSharePatch(cur2, { qrSvg: '<svg/>' }); // absent → untouched
+  assert.equal(cur2.passwordIsDefault, true);
 });

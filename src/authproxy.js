@@ -84,9 +84,11 @@ function rawHeaderLines(rawHeaders) {
 
 // Start an auth proxy in front of `targetPort`. Resolves once it is listening.
 // Returns { port, hosts, auth, username, password, token, setCredentials(), setAuth(), close() }.
-// Secrets are generated with a CSPRNG per call and held in memory only
-// (never logged/persisted; the cookie secret is never even returned — only
-// its cookie form matters). `host` defaults to loopback-only (cloudflared and
+// The password is the caller's `password` (an app's default share login — see
+// appManager.share) or, when none is given, CSPRNG-generated; the token and
+// cookie secret are always CSPRNG-generated per call. All are held in memory
+// only (never logged/persisted; the cookie secret is never even returned —
+// only its cookie form matters). `host` defaults to loopback-only (cloudflared and
 // tailscale shares); a LAN share passes '0.0.0.0' so other devices can
 // reach the proxy directly, or an ARRAY of specific LAN IPs when it needs to
 // leave a particular port free on the other addresses (the fixed-port LAN
@@ -97,16 +99,16 @@ function rawHeaderLines(rawHeaders) {
 // rejects with Node's error (`code: 'EADDRINUSE'`) after closing any servers
 // already bound, so a partial bind is never leaked.
 //
-// Secrets (password/token/cookie secret) are ALWAYS generated, even when
+// Secrets (password/token/cookie secret) ALWAYS exist, even when
 // starting with `auth: false` — this is what lets `setAuth(true)` gate the
 // proxy later with no restart and no new token, so a URL/QR handed out while
 // unauthed (or before an off→on toggle) stays valid for the proxy's whole
 // lifetime. `auth: false` only skips the gate itself: every HTTP request and
 // WS upgrade is forwarded unconditionally, and `username`/`password` read as
 // `null` (they're hidden, not absent) until auth is turned on.
-export async function startAuthProxy(targetPort, { username = 'hub', host = '127.0.0.1', port = 0, auth = true, tls = null } = {}) {
+export async function startAuthProxy(targetPort, { username = 'hub', password = null, host = '127.0.0.1', port = 0, auth = true, tls = null } = {}) {
   let currentUsername = username;
-  let currentPassword = crypto.randomBytes(18).toString('base64url');
+  let currentPassword = password ?? crypto.randomBytes(18).toString('base64url');
   let currentAuth = auth;
   const token = crypto.randomBytes(18).toString('base64url');
   const cookieSecret = crypto.randomBytes(18).toString('base64url');
