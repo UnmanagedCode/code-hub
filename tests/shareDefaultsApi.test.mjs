@@ -400,10 +400,11 @@ test('a failed default write returns 500 and leaves the live login and mask unto
   // A directory where the file belongs: reading it fails with EISDIR, even as root.
   await fs.rm(shareDefaults.shareDefaultsFile());
   await fs.mkdir(shareDefaults.shareDefaultsFile());
-  const res = await j(base, 'PATCH', PATCH_CREDS, { saveAsDefault: true });
+  const res = await j(base, 'PATCH', PATCH_CREDS, { password: 'x', saveAsDefault: true });
   assert.equal(res.status, 500);
   assert.match(res.body.error, /default share login/);
   assert.equal(await status(pp, 'hub', password), 200);
+  assert.equal(await status(pp, 'hub', 'x'), 401);
   await fs.rm(shareDefaults.shareDefaultsFile(), { recursive: true }); // list() reads the file
   assert.equal((await getApp(base)).tunnel.passwordIsDefault, false);
 });
@@ -419,7 +420,8 @@ function gateDefaultsWrite(t) {
     if (to === shareDefaults.shareDefaultsFile()) { reached(); await gate; }
     return realRename(from, to);
   };
-  t.after(() => { fs.rename = realRename; });
+  // release() too: a failed assertion must not park the write queue for later tests.
+  t.after(() => { release(); fs.rename = realRename; });
   return { parked, release };
 }
 
@@ -438,6 +440,7 @@ test('an unflagged password edit during a ticked Save cannot leave a false mask'
 
   const app = await getApp(base);
   const stored = (await shareDefaults.readAll()).app;
+  assert.equal(app.tunnel.passwordIsDefault, true); // the ticked Save, landing last, wins
   assert.equal(app.tunnel.passwordIsDefault, app.tunnel.password === stored.password);
   if (app.tunnel.passwordIsDefault) {
     assert.equal(app.tunnel.username, stored.username);
