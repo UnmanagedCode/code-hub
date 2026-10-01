@@ -135,6 +135,8 @@ input:focus, select:focus, button:focus-visible,
   min-height: 32px; display: inline-flex; align-items: center; justify-content: center;
 }
 .controls button:active, .route .open:active, .share-actions button:active, .share-actions .btn-link:active { transform: translateY(1px); }
+/* The base rule's cursor outranks the global button:disabled one. */
+.controls button:disabled, .share-actions button:disabled { cursor: not-allowed; }
 /* An anchor styled as a button misses the global button:hover rule. */
 .share-actions .btn-link:hover { background: #262b3d; }
 /* Variant colors — compound selectors so they beat the (0,1,1) base rule
