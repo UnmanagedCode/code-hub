@@ -38,7 +38,9 @@ test("declares the host shell's token names on :root", () => {
 });
 
 test(':root sets the host font stack at 14px', () => {
-  assert.match(root, /(^|[;\s])font-family\s*:/);
+  const family = root.match(/(?:^|[;\s])font-family\s*:\s*([^;]+)/);
+  assert.ok(family, ':root declares no font-family');
+  assert.equal(family[1].trim(), `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`);
   assert.match(root, /(^|[;\s])font-size\s*:\s*14px\s*(;|$)/);
 });
 
@@ -48,7 +50,7 @@ const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
   .map((m) => ({ selectors: m[1].split(',').map((s) => s.trim().replace(/\s+/g, ' ')), body: m[2] }));
 
 test('every disabled button styled cursor: pointer resolves to not-allowed', () => {
-  // A button selector: its last compound starts with the `button` type.
+  // Covers only selectors that end in a `button` element; a class-only selector on a button is not seen.
   const isButton = (sel) => /(^|[\s>+~])button(?![\w-])[^\s>+~]*$/.test(sel);
   const pointer = rules
     .filter((r) => /(^|[;\s])cursor\s*:\s*pointer/.test(r.body))
