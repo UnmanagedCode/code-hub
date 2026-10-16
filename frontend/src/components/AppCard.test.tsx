@@ -140,18 +140,20 @@ describe('share panel', () => {
 });
 
 describe('worktrees', () => {
-  // Invariant: the worktree list starts collapsed, its toggle reports the state, and expanding shows the subcards;
-  // the only style then present is Radix's own collapsible bookkeeping, never content.
+  // Invariant: the worktree list starts collapsed, its toggle reports the state, and expanding shows the subcards,
+  // each named apart from its parent; the only style then present is Radix's own collapsible bookkeeping, never content.
   it('the toggle flips aria-expanded and shows the subcards', async () => {
     const user = userEvent.setup();
-    const wts = [app({ id: 'web:b', project: 'web', isWorktree: true, branch: 'beta' }), app({ id: 'web:a', project: 'web', isWorktree: true, branch: 'alpha' })];
+    // Worktrees inherit the project's name; a detached one has no branch.
+    const wts = [app({ id: 'web:b', project: 'web', name: 'web', isWorktree: true, branch: 'beta' }), app({ id: 'web:a', project: 'web', name: 'web', isWorktree: true, branch: null })];
     renderCard(app({ id: 'web' }), wts);
     const toggle = screen.getByRole('button', { name: '2 worktrees' });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(screen.queryByRole('article', { name: 'web:a' })).toBeNull();
+    expect(screen.queryByRole('article', { name: 'web — beta' })).toBeNull();
     await user.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(screen.getByRole('article', { name: 'web:a' })).toBeTruthy();
+    // Each card is told apart from its parent by branch, else id.
+    expect(screen.getAllByRole('article').map((a) => a.getAttribute('aria-label'))).toStrictEqual(['web', 'web — beta', 'web — web:a']);
     for (const el of card('web').querySelectorAll('[style]')) {
       expect(el.getAttribute('data-slot')).toBe('collapsible-content');
       for (const decl of (el.getAttribute('style') ?? '').split(';').map((d) => d.trim()).filter(Boolean)) {

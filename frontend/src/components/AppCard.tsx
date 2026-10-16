@@ -76,13 +76,16 @@ function Worktrees({ project, worktrees }: { project: string; worktrees: App[] }
   );
 }
 
+// A worktree usually inherits its project's name, so its card is told apart by branch (else id).
+const cardLabel = (app: App) => (app.isWorktree ? `${app.name} — ${app.branch || app.id}` : app.name);
+
 export function AppCard({ app, worktrees = [], subcard = false }: { app: App; worktrees?: App[]; subcard?: boolean }) {
   const hub = useHub();
   const tone = statusTone(app.status);
   const meta = metaItems(app, Date.now());
   const actionError = hub.actionError[app.id];
   return (
-    <CardShell id={app.id} subcard={subcard} label={app.name}>
+    <CardShell id={app.id} subcard={subcard} label={cardLabel(app)}>
       <div className="flex items-center gap-2">
         <span className={cn('size-2.5 shrink-0 rounded-full', DOT[tone])} aria-hidden />
         <h2 className="min-w-0 flex-1 truncate font-semibold">{app.name}</h2>

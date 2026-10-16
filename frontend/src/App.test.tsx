@@ -128,7 +128,7 @@ describe('actions', () => {
   // unavailable mode is disabled and says why.
   it('Share → LAN posts {mode:"lan"} and shows the share', async () => {
     const user = userEvent.setup();
-    const wt = running({ id: 'web:k', project: 'web', isWorktree: true, branch: 'feat' });
+    const wt = running({ id: 'web:k', project: 'web', name: 'web', isWorktree: true, branch: 'feat' });
     const shareResponse: Tunnel = { ...LAN, auth: false, username: null, password: null, authUrl: undefined };
     const { calls } = stubFetch({
       'GET api/apps': listing([app({ id: 'web' }), wt], { tailscaleAvailable: false }),
@@ -136,7 +136,7 @@ describe('actions', () => {
     });
     render(<App />);
     await user.click(await screen.findByRole('button', { name: '1 worktree' }));
-    const card = screen.getByRole('article', { name: 'web:k' });
+    const card = screen.getByRole('article', { name: 'web — feat' });
     await user.click(within(card).getByRole('button', { name: 'Share' }));
     const tailscale = within(card).getByRole('button', { name: 'tailscale' }) as HTMLButtonElement;
     expect(tailscale.disabled).toBe(true);
