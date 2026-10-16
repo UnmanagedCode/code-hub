@@ -180,6 +180,8 @@ describe('refused URLs', () => {
     renderCard(app({ id: 'x', status: 'running', routes: [{ name: 'Main', path: '/', urls: ['javascript:alert(1)'] }] }));
     const routes = screen.getByRole('list', { name: 'Routes' });
     expect(within(routes).queryByText(/^Open/)).toBeNull();
+    expect(within(routes).queryByRole('button', { name: /open/i })).toBeNull();
+    expect(within(routes).queryByRole('link', { name: /open/i })).toBeNull();
     expect(within(routes).getAllByText('javascript:alert(1)')).toHaveLength(1);
     expectOnlyRealButtons(routes);
   });
@@ -190,11 +192,15 @@ describe('refused URLs', () => {
     renderCard(app({ id: 'x', status: 'running', tunnel: { kind: 'tunnel', url: 'https://x.trycloudflare.com', authUrl: 'javascript:alert(1)', auth: true, username: 'hub', password: 'pw', qrSvg: QR } }));
     const share = screen.getByRole('region', { name: 'Share' });
     expect(within(share).queryByText(/^Open/)).toBeNull();
+    expect(within(share).queryByRole('button', { name: /open/i })).toBeNull();
+    expect(within(share).queryByRole('link', { name: /open/i })).toBeNull();
     expect(within(share).queryByText('javascript:alert(1)')).toBeNull();
     expectOnlyRealButtons(share);
     await user.click(within(share).getByRole('button', { name: 'Enlarge QR code' }));
     const dialog = await screen.findByRole('dialog', { name: 'Scan to open' });
     expect(within(dialog).queryByText(/^Open/)).toBeNull();
+    expect(within(dialog).queryByRole('button', { name: /open/i })).toBeNull();
+    expect(within(dialog).queryByRole('link', { name: /open/i })).toBeNull();
     expect(within(dialog).queryByText('javascript:alert(1)')).toBeNull();
     expectOnlyRealButtons(dialog);
   });

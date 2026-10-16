@@ -50,7 +50,26 @@ const PALETTE = 'red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|i
 const COLOR_UTIL = 'bg|text|border(?:-[xytrblse])?|ring|fill|stroke|outline|decoration|shadow|from|via|to|divide|accent|caret';
 // An arbitrary value that is a colour: `color:`-hinted, a hex, a colour function, or a bare keyword (`[red]`).
 const ARBITRARY = String.raw`\[(?:color:[^\]]+|#[0-9a-fA-F]{3,8}|(?:rgba?|hsla?|oklch|oklab|lab|lch|hwb|color)\([^\]]*\)|[a-zA-Z]+)\]`;
-const LITERAL = new RegExp(`#[0-9a-fA-F]{3,8}\\b|\\brgba?\\(|\\bhsla?\\(|\\boklch\\(|\\b(?:${COLOR_UTIL})-(?:(?:${PALETTE})\\b|${ARBITRARY})`);
+// The CSS named colours (CSS Color 4), matched only as whole tokens in a value position.
+const NAMED = ('aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood '
+  + 'cadetblue chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen '
+  + 'darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray '
+  + 'darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia '
+  + 'gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender '
+  + 'lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink '
+  + 'lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen magenta '
+  + 'maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen mediumturquoise '
+  + 'mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid '
+  + 'palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple rebeccapurple red '
+  + 'rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow '
+  + 'springgreen steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen').split(' ').join('|');
+// `_` is Tailwind's space in an arbitrary value, so it separates tokens like any non-name character.
+const WORD = String.raw`(?<![A-Za-z0-9-])(?:${NAMED})(?![A-Za-z0-9-])`;
+// (a) a named colour anywhere inside a utility's arbitrary value: `bg-[linear-gradient(red,blue)]`.
+const IN_BRACKET = String.raw`-\[[^\]\s]*?${WORD}[^\]\s]*\]`;
+// (b) a named colour in the value of a property that takes a colour: `color: red`, `border: 1px solid tomato`.
+const COLOR_PROP = String.raw`(?<![\w-])(?:color|background(?:-color|-image)?|border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?(?:-color)?|outline(?:-color)?|fill|stroke|caret-color|accent-color|text-decoration(?:-color)?|box-shadow|text-shadow|column-rule(?:-color)?)\s*:\s*[^;{}\n]*?${WORD}`;
+const LITERAL = new RegExp(`#[0-9a-fA-F]{3,8}\\b|\\brgba?\\(|\\bhsla?\\(|\\boklch\\(|\\b(?:${COLOR_UTIL})-(?:(?:${PALETTE})\\b|${ARBITRARY})|${IN_BRACKET}|${COLOR_PROP}`, 'i');
 const own = sourceFiles().filter(([n]) => n.startsWith('src/') && !n.startsWith('src/components/ui/') && n !== 'src/cc-theme-fallback.css');
 
 // Invariant: the plugin's own code uses colours only through the theme tokens; the card accent palette
@@ -67,20 +86,27 @@ test('own code has no literal colours', () => {
 // and lets token utilities, arbitrary sizes and var() through.
 test('the literal-colour pattern: what it catches and what it lets through', () => {
   for (const hit of ['text-red-500', 'border-l-sky-400', 'bg-[#fff]', 'text-[red]', 'text-[color:red]', 'dark:bg-[oklch(0.5_0.1_10)]',
-    'ring-[rgb(1,2,3)]', 'color: #abc', 'rgba(0,0,0,.5)', 'oklch(0.2 0 0)']) {
+    'ring-[rgb(1,2,3)]', 'color: #abc', 'rgba(0,0,0,.5)', 'oklch(0.2 0 0)',
+    'bg-[linear-gradient(red,blue)]', 'bg-[radial-gradient(circle,_tomato_0%,_transparent)]', 'footer { color: red; }',
+    'border: 1px solid Tomato;', 'background-color:navy', "{ color: 'white' }"]) {
     assert.match(hit, LITERAL, hit);
   }
-  for (const miss of ['text-muted-foreground', 'bg-success/15', 'focus-visible:ring-[3px]', 'text-[13px]', 'bg-[var(--card)]', 'max-w-72', 'border-l-4']) {
+  for (const miss of ['text-muted-foreground', 'bg-success/15', 'focus-visible:ring-[3px]', 'text-[13px]', 'bg-[var(--card)]', 'max-w-72', 'border-l-4',
+    'required', 'bored', 'the red route', 'data-[state=open]:rotate-180', 'grid-cols-[3rem_1fr]', 'transition-[color,box-shadow]',
+    "label: 'Status'", 'color: var(--foreground);', 'border: 1px solid var(--border)', 'background: transparent', 'redirect: true',
+    "colorScheme: 'dark'", 'bg-[url(./bored.png)]', '--font-sans: Geist, sans-serif;']) {
     assert.doesNotMatch(miss, LITERAL, miss);
   }
 });
 
-// Invariant: every var(--x) in own CSS and code names a token that is declared — by the fallback (cc's tokens,
+// Invariant: every var(--x) in own frontend files (CSS, code, public/, index.html) names a token that is declared — by the fallback (cc's tokens,
 // both modes) or by the @theme inline map — so no reference silently resolves to nothing standalone.
 test('every var(--x) in own CSS and code resolves to a declared token', () => {
   const theme = indexCss.match(/@theme inline\s*\{([\s\S]*?)\n\}/)?.[1];
   const tokens = new Set([...declared(block(fallback, ':root')), ...declared(block(fallback, '.dark')), ...declared(theme)]);
-  const files = sourceFiles().filter(([n]) => n.startsWith('src/') && !n.startsWith('src/components/ui/'));
+  // All own frontend files: index.html, public/** and src/**, minus the copied components.
+  const files = sourceFiles().filter(([n]) => !n.startsWith('src/components/ui/'));
+  assert.ok(files.some(([n]) => n === 'public/theme-init.js') && files.some(([n]) => n === 'index.html'), 'scans public/ and index.html');
   let seen = 0;
   for (const [n, src] of files) {
     for (const [, name] of strip(src).matchAll(/var\(\s*(--[\w-]+)/g)) {

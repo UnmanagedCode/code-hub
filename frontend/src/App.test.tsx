@@ -409,6 +409,33 @@ describe('edit form details', () => {
     expect((within(card).getByLabelText('pass') as HTMLInputElement).value).toBe('pw');
   });
 
+  // Invariant: the Edit form's submit — by Enter in a field or by Save — is handled in script and never
+  // submits natively (the CSP's form-action 'none' would block a native submit anyway).
+  it('submitting the Edit form, by Enter or by Save, prevents the native submit', async () => {
+    const user = userEvent.setup();
+    const submits: boolean[] = [];
+    // Registered on document, so it runs after React's root listener has handled the event.
+    const onSubmit = (e: Event) => submits.push(e.defaultPrevented);
+    document.addEventListener('submit', onSubmit);
+    try {
+      stubFetch({
+        'GET api/apps': listing([running({ tunnel: TUNNEL })]),
+        'PATCH api/apps/web/share/credentials': { id: 'web', username: 'hub', password: 'x', passwordIsDefault: false },
+      });
+      render(<App />);
+      const card = await screen.findByRole('article', { name: 'web' });
+      await user.click(within(card).getByRole('button', { name: 'Edit' }));
+      await user.type(within(card).getByLabelText('pass'), '{Enter}');
+      await waitFor(() => expect(within(card).queryByRole('form', { name: 'Edit share login' })).toBeNull());
+      await user.click(within(card).getByRole('button', { name: 'Edit' }));
+      await user.click(within(card).getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(within(card).queryByRole('form', { name: 'Edit share login' })).toBeNull());
+      expect(submits).toStrictEqual([true, true]);
+    } finally {
+      document.removeEventListener('submit', onSubmit);
+    }
+  });
+
   // Invariant: ticking "Also save as this app's default login" sends saveAsDefault on the credentials PATCH.
   it('ticking save-as-default sends saveAsDefault: true', async () => {
     const user = userEvent.setup();

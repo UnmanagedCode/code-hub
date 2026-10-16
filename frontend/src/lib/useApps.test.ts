@@ -54,3 +54,8 @@ it('refresh waits out the load in flight, then loads afresh', async () => {
   expect(fn).toHaveBeenCalledTimes(2);
   expect(result.current.data?.apps[0].id).toBe('later-2');
 });
+
+// Invariant: the listing refreshes every 2s, as docs/features.md states.
+it('polls every 2 seconds', () => {
+  expect(POLL_MS).toBe(2000);
+});
