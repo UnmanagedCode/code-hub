@@ -85,7 +85,7 @@ Surfaces the projects code-conductor knows about that code-hub's own filesystem 
 | `PUT /api/apps/:id/share/defaults` | `{ username?, password? }` — per field: absent = keep, `null` = clear, non-empty string = set (trimmed) | `{ id, username, hasPassword }` after the update (`400` body not an object, neither key present, or a field that is `""`/whitespace/non-string — nothing is written; `404` unknown app). Clearing both fields deletes the entry |
 | `DELETE /api/apps/:id/share/defaults` | — | `{ id, username: null, hasPassword: false }` — idempotent, and **never `404`s**, so an entry for a removed app can still be cleared |
 
-`id` is the app id: a main checkout's directory basename, or `<project>:<key>` for a worktree (composed by `worktreeId()` in `src/projects.js`, the only place it is built). Worktree keys are scoped per project by code-conductor, so the `<project>:` qualifier is what keeps two projects' same-named worktrees distinct. **`:` is reserved**, which is what makes the id injective. Any directory name feeding an id is refused if it contains one: a root directory (else `a:b` and worktree `a/b` claim the same id) and a worktree's `<project>` or `<key>` (else `.worktrees/a/b:c` and `.worktrees/a:b/c` both claim `a:b:c`). code-hub **enforces this over its own id namespace** rather than assuming code-conductor keeps `:` out of a project name or key: such a directory is not served, and the refusal is logged (`console.warn`, naming the directory) whenever it cost something servable and silent when it cost nothing. `register_app` likewise rejects a `:`-bearing id that matches no worktree, naming the reservation rather than claiming the directory doesn't exist. The id is **opaque** — never split back apart — and always a single path segment: `:` is a legal `pchar`, so `/api/apps/:id/*` matches it either encoded or raw. `public/app.js` sends it `encodeURIComponent`'d (`:` → `%3A`), which is the right practice for an opaque id and what the tests exercise.
+`id` is the app id: a main checkout's directory basename, or `<project>:<key>` for a worktree (composed by `worktreeId()` in `src/projects.js`, the only place it is built). Worktree keys are scoped per project by code-conductor, so the `<project>:` qualifier is what keeps two projects' same-named worktrees distinct. **`:` is reserved**, which is what makes the id injective. Any directory name feeding an id is refused if it contains one: a root directory (else `a:b` and worktree `a/b` claim the same id) and a worktree's `<project>` or `<key>` (else `.worktrees/a/b:c` and `.worktrees/a:b/c` both claim `a:b:c`). code-hub **enforces this over its own id namespace** rather than assuming code-conductor keeps `:` out of a project name or key: such a directory is not served, and the refusal is logged (`console.warn`, naming the directory) whenever it cost something servable and silent when it cost nothing. `register_app` likewise rejects a `:`-bearing id that matches no worktree, naming the reservation rather than claiming the directory doesn't exist. The id is **opaque** — never split back apart — and always a single path segment: `:` is a legal `pchar`, so `/api/apps/:id/*` matches it either encoded or raw. The UI sends it `encodeURIComponent`'d (`:` → `%3A`), which is the right practice for an opaque id and what the tests exercise.
 
 The **running record** returned by `start`/`restart` is the persisted `store.apps[id]` entry: `{ id, project, path, isWorktree, branch, pid, pgid, port, fixedPort, urls, startedSha, startedAt, tunnel }`. `fixedPort` is the manifest's declared `port` (`null` for a dynamically-ported app and for every worktree); `port` is what the app actually bound, and for a fixed-port app the two are always equal — a fixed port never moves. `restart` needs no special handling: it is stop-then-start, so a fixed-port app lands back on the same port by construction.
 
@@ -143,6 +143,42 @@ Response fields: `kind` (`"tunnel"`, `"lan"` or `"tailscale"`), `url` (primary s
 ### Errors
 
 Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot start — its manifest source failed to parse or validate, and the reason is the app's `manifestError`; an invalid `share` `mode`/`auth`/`tls`; `auth:false` with `mode:"tunnel"` or `mode:"tailscale"`; a credentials-edit body that's empty/non-string (or has a non-boolean `saveAsDefault`), or targets a no-auth share; a share-defaults `PUT` body that's not an object, has neither field, or has an empty/whitespace/non-string field; a non-boolean `enabled` on an auth-toggle, or one targeting a `mode:"tunnel"`/`mode:"tailscale"` share), `404` (unknown/not-running app), `409` (already running / a declared fixed port already in use / not running for share / the single tailscale share is already held / an app stopped or restarted while its tailscale share was coming up / no active share for a credentials edit or auth toggle / a share replaced while a `saveAsDefault` edit was writing the default), `501` (`tunnel`-mode share when cloudflared is absent, `tailscale`-mode share when tailscale is unavailable — reported in preference to the tailscale `409` when both apply, since it is the more actionable of the two), `500` (unexpected). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
+
+## UI serving & headers
+
+Owned by `src/webui.js`; mounted after `/api` (so the API answers first).
+
+- **Every response** — the API's, the UI's, the 404, the 503 and error responses — carries `X-Content-Type-Options: nosniff` and exactly this `Content-Security-Policy` (`CSP` in `src/webui.js`):
+
+  ```
+  default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'
+  ```
+
+  | Directive | Why |
+  |---|---|
+  | `script-src 'self'` | The bundle, `theme-init.js`, and the host's `/pluginBridge.js` (same origin as the page inside cc). No inline script exists |
+  | `style-src 'self' 'unsafe-inline'` | `'self'`: the bundle's CSS and the host's `/pluginTheme.css`. `'unsafe-inline'`: the `<style>` element Radix Dialog's scroll lock injects (the QR dialog). Safe only because nothing emits a `style` attribute or element from content |
+  | `font-src 'self'` | The Geist fonts the host sheet names (`/pluginTheme/fonts/…`); without it they are blocked silently |
+  | `img-src 'self' data:` | `'self'`: the icon. `data:`: the share QR, an `<img>` of the server's SVG |
+  | `manifest-src 'self'` | The PWA manifest; `default-src 'none'` blocks it otherwise |
+  | `connect-src 'self'` | The relative `api/…` calls |
+  | `base-uri 'none'`, `form-action 'none'` | No `<base>`; no form ever submits natively (the Edit form's submit is handled in script) |
+  | `frame-ancestors 'self'` | Framed only by code-conductor's page (same origin) |
+
+- **Static paths** (from `frontend/dist`, `Cache-Control: no-cache`; Vite hashes the bundle names):
+
+  | Path | Content-Type |
+  |---|---|
+  | `/`, `/index.html` | `text/html` |
+  | `/assets/index-<hash>.js` | `application/javascript` |
+  | `/assets/index-<hash>.css` | `text/css` |
+  | `/theme-init.js` | `application/javascript` |
+  | `/manifest.webmanifest` | `application/manifest+json` |
+  | `/icon.svg` | `image/svg+xml` |
+
+- **No SPA fallback.** Any other path is `404 text/plain` `Not found` — including `/pluginBridge.js` and `/pluginTheme.css` standalone (inside cc, cc serves those itself, before its proxy).
+- **Not built.** While `frontend/dist/index.html` is missing, every non-`/api` path answers `503 text/plain` `UI not built — run npm install`; `/api/*` (and so `healthPath`) stays up. Checked **per request**: a build finished while the backend runs is served at once, no restart. The missing file is logged once at startup (`console.error`).
+- **Errors outside the API's JSON convention** (an error Express raises before or after the router, e.g. an undecodable path parameter): `text/plain`, status `err.status ?? err.statusCode` when it is 400–599, else 500. A 500 answers `Internal error` and is logged; any other status answers its standard reason phrase (`Bad Request`, …). The error's message is never sent.
 
 ## MCP API (`POST /api/mcp`)
 

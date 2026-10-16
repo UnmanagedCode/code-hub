@@ -1,6 +1,6 @@
 # code-hub
 
-A **mobile-first webapp** for launching, monitoring, stopping, and sharing the other webapps in your `~/cc-projects/` workspace — from your phone. Sibling to `code-conductor`; same stack (Node + Express, vanilla ES-module frontend, no build step).
+A **mobile-first webapp** for launching, monitoring, stopping, and sharing the other webapps in your `~/cc-projects/` workspace — from your phone. Sibling to `code-conductor`; same stack (a Node + Express backend, and a React + Vite + Tailwind v4 + shadcn/Radix frontend built into `frontend/dist` on `npm install`). Embedded in code-conductor, it follows code-conductor's light/dark theme live; standalone, it follows the OS.
 
 ## What it does
 
@@ -14,12 +14,15 @@ A **mobile-first webapp** for launching, monitoring, stopping, and sharing the o
 
 ## Quick start
 
+Needs Node ≥22.12.
+
 ```sh
-npm install
+npm install               # installs dependencies and builds the UI (`prepare` → frontend/dist)
 npm start                 # serves the UI on http://127.0.0.1:7000
+npm run dev               # optional: Vite dev server, `/api` proxied to :7000 (override with PLUGIN_BACKEND)
 ```
 
-Open the UI, and it lists every sibling project with a `.hub.json`. Override the port with `PORT`, the workspace scanned with `PROJECTS_ROOT`.
+Open the UI, and it lists every sibling project with a `.hub.json`. Override the port with `PORT`, the workspace scanned with `PROJECTS_ROOT`. Until the UI is built, the backend still starts but answers every UI path with a plain-text `503` ("UI not built — run npm install"); the API stays up. UI internals: `docs/architecture.md` → Frontend.
 
 ## The `.hub.json` manifest
 
@@ -74,6 +77,8 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 - **Tailscale Funnel shares** carry two limitations worth knowing before you hand the URL out:
   - **The URL is stable, not immutable.** It is the node's MagicDNS name, so it survives code-hub restarts and machine reboots — that stability is the entire reason this mode exists next to cloudflared. But it is the node's *identity*, and identity can churn: if the node ever re-registers under a name already taken in the tailnet (a container or VM rebuild is the usual cause), Tailscale appends a numeric suffix and the URL changes. This machine is already `code-conductor-1.tailb09348.ts.net` — the `-1` is exactly that having happened once. code-hub re-reads the current name from `tailscale status` on every share, so a rename yields a correct new URL rather than a stale one, but a link handed out before the rename is dead.
   - **One tailscale share at a time.** Funnel publishes on port 443 of the node, a machine-wide resource, so a second tailscale share is refused with `409` naming the app currently holding it. Unshare that one first. (LAN and cloudflared shares are unaffected and can run alongside it.)
+- **The UI is built on install.** `npm install` builds `frontend/dist` from devDependencies, so an install that skips them (`NODE_ENV=production`, `npm_config_omit=dev` — including in the environment of a code-conductor that runs the Library hook) leaves the UI unbuilt, and it answers `503` until a full `npm install`.
+- **In a code-conductor worktree, build with `npm run prepare`, never `npm install`.** The worktree's `node_modules` is a symlink to the main checkout's, so `npm install` there would install into the main checkout. The worktree hook does not build, so a fresh worktree answers `503` until `npm run prepare` runs (details: `docs/architecture.md` → Frontend).
 - **Projects on a code-conductor *registered (remote) system* are not served.** Their tree is on another machine, and code-conductor roots their worktrees on that machine too — neither is reachable by code-hub's filesystem scan, so such projects are dropped from the conductor overlay rather than rendered as a card for a directory that isn't here.
 - **A directory name containing `:` is not servable.** code-hub identifies a worktree as `<project>:<key>`, so `:` is reserved: a project directory, or a worktree's project/key directory, whose name contains one is skipped even with a perfectly valid `.hub.json`. Without the reservation a project literally named `a:b` and the worktree `a/b` would claim the same id, and `.worktrees/a/b:c` and `.worktrees/a:b/c` would claim the same id as each other — two checkouts behind one card, with every Start/Stop/Share reaching whichever the filesystem happened to list first. The skip is logged to the server console whenever it cost you a servable app, and silent when it didn't. The log names the **skipped checkout**, which is not always the directory to rename: for `.worktrees/a/b:c` the offending component is in the named path, but for `.worktrees/a:b/c` the `:` is in the *project* component, so the fix is renaming `.worktrees/a:b` (and any `<projectsRoot>/a:b` checkout of the same project, which is refused for the same reason and logged separately). `register_app` refuses such an id too, naming the reservation.
 - **Fixed ports** (`port` in `.hub.json`) are per-checkout and deliberately strict:
@@ -83,7 +88,7 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 
 ## Running under code-conductor
 
-code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`/`register_app`/`unregister_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them, and the `pluginBridge.js` script tag in `index.html` (served by the conductor when embedded) 404s harmlessly otherwise. See `docs/protocol.md` for the MCP contract.
+code-hub is the first `code-conductor` plugin: `conductor.plugin.json` (repo root) declares its start command, `GET /api/health` liveness path, and an MCP endpoint (`POST /api/mcp`, tools `list_apps`/`start_app`/`stop_app`/`register_app`/`unregister_app`) that mirrors the HTTP API. Standalone use (`npm start`) is unaffected — the plugin manifest and MCP endpoint are inert unless a conductor calls them. How the UI loads the conductor's bridge and theme, and how it behaves without them: `docs/architecture.md` → code-conductor plugin integration, Frontend. See `docs/protocol.md` for the MCP contract and the UI's CSP.
 
 When embedded, code-hub also asks the conductor where each project's tree actually is (`GET $CONDUCTOR_URL/api/projects`), and uses that answer as a strictly additive **overlay** on its own filesystem scan. The scan only sees directories directly under the projects root, so a project whose tree lives elsewhere — outside the root, or nested under a dot-dir the scan skips, like `.plugins/` — is invisible to standalone code-hub however servable it is. The overlay surfaces those projects as ordinary cards at their real path, with real git info and a working Start, on the same terms as any other project: a `.hub.json` or a `registrations.json` entry is required, and without one there is no card at all, exactly as for a manifest-less directory under the root. Their worktrees (which the conductor nests at `<projectsRoot>/.worktrees/<project>/<key>` whatever directory the tree itself lives in) then group under that card instead of under a header-only "no main checkout" one. **The filesystem scan always wins**: the overlay is consulted only for a name the root scan produced no directory for. Every failure is silent and keeps the last good answer: conductor down, restarting, slow (2s budget), or answering with a non-2xx, non-JSON or non-array body changes nothing — the listing keeps whatever the last successful answer supplied, and code-hub retries after a few seconds. A *successful* answer always replaces it, including one that lists nothing code-hub can use. Only with no successful answer yet (including standalone) is the listing purely filesystem-derived. At most one conductor call every 5 seconds, never on the request path.
 
@@ -92,7 +97,10 @@ When embedded, code-hub surfaces the host `code-conductor` checkout as an **alwa
 ## Testing
 
 ```sh
-npm test                   # node:test suite (no network, uses fakes)
+npm test                   # node:test suite (no network, uses fakes), then the frontend
+                           #   typecheck (tsc -p frontend) and Vitest suite; needs a built
+                           #   UI (npm install), which tests/dist.test.mjs checks
+npm run test:web           # just the Vitest suite
 RUN_REAL_CLOUDFLARED=1 npm test   # also runs the real-cloudflared smoke test
 RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke tests — these
                                   #   open a REAL public Funnel on this node for a
