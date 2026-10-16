@@ -164,3 +164,88 @@ describe('worktrees', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 });
+
+// Every element styled as a button is a real <button> or an http(s) link — a refused URL never leaves a
+// button-styled stand-in behind.
+function expectOnlyRealButtons(scope: Element) {
+  for (const el of scope.querySelectorAll('[data-slot="button"]')) {
+    const ok = el.tagName === 'BUTTON' || (el.tagName === 'A' && /^https?:/.test(el.getAttribute('href') ?? ''));
+    expect(ok, el.outerHTML).toBe(true);
+  }
+}
+
+describe('refused URLs', () => {
+  // Invariant: a route whose URL is refused gets no Open control of any kind.
+  it('RouteList renders no Open control for a refused route URL', () => {
+    renderCard(app({ id: 'x', status: 'running', routes: [{ name: 'Main', path: '/', urls: ['javascript:alert(1)'] }] }));
+    const routes = screen.getByRole('list', { name: 'Routes' });
+    expect(within(routes).queryByText(/^Open/)).toBeNull();
+    expect(within(routes).getAllByText('javascript:alert(1)')).toHaveLength(1);
+    expectOnlyRealButtons(routes);
+  });
+
+  // Invariant: when the share's Open URL is refused, neither the panel nor the QR dialog offers Open.
+  it('QrDialog and the share panel render no Open control for a refused open URL', async () => {
+    const user = userEvent.setup();
+    renderCard(app({ id: 'x', status: 'running', tunnel: { kind: 'tunnel', url: 'https://x.trycloudflare.com', authUrl: 'javascript:alert(1)', auth: true, username: 'hub', password: 'pw', qrSvg: QR } }));
+    const share = screen.getByRole('region', { name: 'Share' });
+    expect(within(share).queryByText(/^Open/)).toBeNull();
+    expect(within(share).queryByText('javascript:alert(1)')).toBeNull();
+    expectOnlyRealButtons(share);
+    await user.click(within(share).getByRole('button', { name: 'Enlarge QR code' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Scan to open' });
+    expect(within(dialog).queryByText(/^Open/)).toBeNull();
+    expect(within(dialog).queryByText('javascript:alert(1)')).toBeNull();
+    expectOnlyRealButtons(dialog);
+  });
+});
+
+describe('control states', () => {
+  const btn = (name: string) => screen.getByRole('button', { name }) as HTMLButtonElement;
+
+  // Invariant: Start is disabled when the source is gone or the manifest is broken, enabled otherwise.
+  it('Start: disabled with the source removed or a manifest error', () => {
+    const { unmount } = renderCard(app({ id: 'a', status: 'stopped' }));
+    expect(btn('Start').disabled).toBe(false);
+    unmount();
+    const second = renderCard(app({ id: 'a', status: 'stopped', sourceMissing: true }));
+    expect(btn('Start').disabled).toBe(true);
+    second.unmount();
+    renderCard(app({ id: 'a', status: 'stopped', manifestError: 'bad json' }));
+    expect(btn('Start').disabled).toBe(true);
+  });
+
+  // Invariant: a running app whose source is gone can be stopped but not restarted.
+  it('Restart is disabled with the source removed; Stop is not', () => {
+    renderCard(app({ id: 'a', status: 'running', sourceMissing: true }));
+    expect(btn('Restart').disabled).toBe(true);
+    expect(btn('Stop').disabled).toBe(false);
+  });
+
+  // Invariant: a shared app's Share control reads Shared and is disabled.
+  it('Shared is disabled', () => {
+    renderCard(app({ id: 'a', status: 'running', tunnel: { kind: 'lan', url: 'http://192.0.2.1:5001', auth: false } }));
+    expect(btn('Shared').disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Share' })).toBeNull();
+  });
+});
+
+describe('call sites', () => {
+  // Invariant: with a default password, the Edit form's password field starts empty and says the default is kept.
+  it('a default password: the field starts blank with the masked placeholder', async () => {
+    const user = userEvent.setup();
+    renderCard(app({ id: 'a', status: 'running', tunnel: { kind: 'tunnel', url: 'https://x.trycloudflare.com', auth: true, username: 'hub', password: 'secret-default', passwordIsDefault: true } }));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const pass = screen.getByLabelText('pass') as HTMLInputElement;
+    expect(pass.value).toBe('');
+    expect(pass.placeholder).toBe(`${PASSWORD_MASK} (default — type to replace)`);
+    expect(screen.queryByDisplayValue('secret-default')).toBeNull();
+  });
+
+  // Invariant: the "edited X ago" label carries the commit's absolute date as its title.
+  it('the edited label carries the absolute date', () => {
+    const iso = '2026-01-02T03:04:05Z';
+    renderCard(app({ id: 'a', lastCommitAt: iso }));
+    expect(screen.getByText(/^edited /).getAttribute('title')).toBe(new Date(iso).toLocaleString());
+  });
+});

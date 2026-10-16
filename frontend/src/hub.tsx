@@ -83,6 +83,9 @@ export function HubProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // A failure shows inline on the app's card until its next action or a dismiss.
+  // The card stays busy until the post-action listing is in: clearing it sooner
+  // re-enables controls drawn from the pre-action listing (a second Stop on a
+  // stopped app).
   const action = useCallback(async (id: string, kind: BusyAction, run: () => Promise<void>) => {
     setBusy((m) => ({ ...m, [id]: kind }));
     setActionError((m) => omit(m, id));
@@ -91,8 +94,8 @@ export function HubProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setActionError((m) => ({ ...m, [id]: message(e) }));
     } finally {
-      setBusy((m) => omit(m, id));
       await refresh();
+      setBusy((m) => omit(m, id));
     }
   }, [refresh]);
 

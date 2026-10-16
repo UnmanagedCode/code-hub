@@ -267,3 +267,215 @@ describe('edit form', () => {
     expect(writes(calls)).toStrictEqual([]);
   });
 });
+
+// A response held open until released, for observing the UI while a request is in flight.
+function held<T>(reply: T) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  return { release, reply: async () => { await gate; return json(reply); } };
+}
+
+describe('busy state', () => {
+  // Invariant: after an action, its controls stay disabled until the refreshed listing has landed, so a second
+  // click cannot repeat the action against the pre-action listing.
+  it('Stop stays disabled until the post-action listing arrives', async () => {
+    const user = userEvent.setup();
+    const { routes, calls } = stubFetch({ 'GET api/apps': listing([running()]), 'POST api/apps/web/stop': { id: 'web', status: 'stopped' } });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    const after = held(listing([app({ id: 'web' })]));
+    routes['GET api/apps'] = after.reply;
+    const before = gets(calls);
+    await user.click(within(card).getByRole('button', { name: 'Stop' }));
+    await waitFor(() => expect(gets(calls)).toBe(before + 1));
+    await act(async () => {});
+    const stop = within(card).getByRole('button', { name: 'Stop' }) as HTMLButtonElement;
+    expect(stop.disabled).toBe(true);
+    await user.click(stop);
+    expect(writes(calls)).toStrictEqual([{ method: 'POST', url: 'api/apps/web/stop', body: undefined }]);
+    after.release();
+    expect(await within(card).findByRole('button', { name: 'Start' })).toBeTruthy();
+    expect((within(card).getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // Invariant: while an action is in flight every control of that card is disabled.
+  it('an in-flight Restart disables Stop, Restart and Share', async () => {
+    const user = userEvent.setup();
+    const post = held({ id: 'web', status: 'starting' });
+    const { calls } = stubFetch({ 'GET api/apps': listing([running()]), 'POST api/apps/web/restart': post.reply });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Restart' }));
+    await waitFor(() => expect(writes(calls)).toHaveLength(1));
+    for (const name of ['Stop', 'Restart', 'Share']) {
+      expect((within(card).getByRole('button', { name }) as HTMLButtonElement).disabled, name).toBe(true);
+    }
+    post.release();
+    await waitFor(() => expect((within(card).getByRole('button', { name: 'Restart' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+});
+
+describe('share lifecycle', () => {
+  // Shares the app in-session over LAN and opens the Edit form, so the app has both share state and a draft.
+  async function sharedAndEditing(extra: Record<string, unknown> = {}) {
+    const user = userEvent.setup();
+    const stub = stubFetch({ 'GET api/apps': listing([running()]), 'POST api/apps/web/share': LAN, ...extra });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'LAN' }));
+    await user.click(await within(card).findByRole('button', { name: 'Edit' }));
+    within(card).getByRole('form', { name: 'Edit share login' });
+    return { user, card, ...stub };
+  }
+  const reshareOpensNoForm = async (user: ReturnType<typeof userEvent.setup>, card: HTMLElement) => {
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'LAN' }));
+    await within(card).findByRole('region', { name: 'Share' });
+    expect(within(card).queryByRole('form', { name: 'Edit share login' })).toBeNull();
+  };
+
+  // Invariant: Restart posts `restart` and drops the app's share state and draft (the server tore the share down).
+  it('Restart posts restart and clears the share and the draft', async () => {
+    const { user, card, calls } = await sharedAndEditing({ 'POST api/apps/web/restart': { id: 'web', status: 'starting' } });
+    await user.click(within(card).getByRole('button', { name: 'Restart' }));
+    await waitFor(() => expect(within(card).queryByRole('region', { name: 'Share' })).toBeNull());
+    expect(writes(calls).map((c) => `${c.method} ${c.url}`)).toStrictEqual(['POST api/apps/web/share', 'POST api/apps/web/restart']);
+    await reshareOpensNoForm(user, card);
+  });
+
+  // Invariant: Unshare sends DELETE and drops the app's share state and draft.
+  it('Unshare deletes the share and clears the share and the draft', async () => {
+    const { user, card, calls } = await sharedAndEditing({ 'DELETE api/apps/web/share': { id: 'web', tunnel: null } });
+    await user.click(within(card).getByRole('button', { name: 'Unshare' }));
+    await waitFor(() => expect(within(card).queryByRole('region', { name: 'Share' })).toBeNull());
+    expect(writes(calls).map((c) => `${c.method} ${c.url}`)).toStrictEqual(['POST api/apps/web/share', 'DELETE api/apps/web/share']);
+    await reshareOpensNoForm(user, card);
+  });
+
+  // Invariant: Cancel in the share picker closes it without a request.
+  it('Cancel in the share picker closes it and sends nothing', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({ 'GET api/apps': listing([running()]) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'Cancel' }));
+    expect(within(card).queryByRole('button', { name: 'LAN' })).toBeNull();
+    expect(writes(calls)).toStrictEqual([]);
+  });
+
+  // Invariant: Save merges the PATCH response into the in-session share state, so the panel shows the new QR and
+  // login from that response, while the share's own magic-link is kept.
+  it('Save after an in-session share shows the PATCH response, not a stale or listed one', async () => {
+    const shareResponse: Tunnel = { ...TUNNEL, qrSvg: '<svg xmlns="http://www.w3.org/2000/svg"><desc>from-share</desc></svg>' };
+    const listed: Tunnel = { ...TUNNEL, authUrl: 'https://x.trycloudflare.com/?__hubauth=LISTED', qrSvg: '<svg xmlns="http://www.w3.org/2000/svg"><desc>from-list</desc></svg>' };
+    const patched = { id: 'web', username: 'alice', password: 'pw', passwordIsDefault: false, qrSvg: '<svg xmlns="http://www.w3.org/2000/svg"><desc>from-patch</desc></svg>' };
+    const user = userEvent.setup();
+    const { routes } = stubFetch({ 'GET api/apps': listing([running()]), 'POST api/apps/web/share': shareResponse, 'PATCH api/apps/web/share/credentials': patched });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    routes['GET api/apps'] = listing([running({ tunnel: listed })]);
+    await user.click(within(card).getByRole('button', { name: 'cloudflared' }));
+    await user.click(await within(card).findByRole('button', { name: 'Edit' }));
+    const userInput = within(card).getByLabelText('user');
+    await user.clear(userInput);
+    await user.type(userInput, 'alice{Enter}');
+    await waitFor(() => expect(within(card).queryByRole('form', { name: 'Edit share login' })).toBeNull());
+    const share = within(card).getByRole('region', { name: 'Share' });
+    const qr = within(share).getByRole('button', { name: 'Enlarge QR code' }).querySelector('img')!;
+    expect(decodeURIComponent(qr.getAttribute('src')!)).toContain('from-patch');
+    expect(within(share).getByRole('link', { name: /open/i }).getAttribute('href')).toBe(TUNNEL.authUrl);
+  });
+});
+
+describe('edit form details', () => {
+  // Invariant: Cancel discards typed changes without submitting the form.
+  it('Cancel after typing sends nothing and closes the form', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({ 'GET api/apps': listing([running({ tunnel: TUNNEL })]) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Edit' }));
+    const pass = within(card).getByLabelText('pass');
+    await user.clear(pass);
+    await user.type(pass, 'typed-but-cancelled');
+    await user.click(within(card).getByRole('button', { name: 'Cancel' }));
+    expect(within(card).queryByRole('form', { name: 'Edit share login' })).toBeNull();
+    await act(async () => {});
+    expect(writes(calls)).toStrictEqual([]);
+    await user.click(within(card).getByRole('button', { name: 'Edit' }));
+    expect((within(card).getByLabelText('pass') as HTMLInputElement).value).toBe('pw');
+  });
+
+  // Invariant: ticking "Also save as this app's default login" sends saveAsDefault on the credentials PATCH.
+  it('ticking save-as-default sends saveAsDefault: true', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({
+      'GET api/apps': listing([running({ tunnel: TUNNEL })]),
+      'PATCH api/apps/web/share/credentials': { id: 'web', username: 'hub', password: 'pw', passwordIsDefault: true },
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Edit' }));
+    await user.click(within(card).getByRole('checkbox', { name: "Also save as this app's default login" }));
+    await user.click(within(card).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(writes(calls)).toHaveLength(1));
+    expect(writes(calls)).toStrictEqual([{ method: 'PATCH', url: 'api/apps/web/share/credentials', body: { saveAsDefault: true } }]);
+  });
+
+  // Invariant: a draft whose app left the listing is dropped, so it does not reopen when the app comes back.
+  it('a draft of an app that left the listing does not come back with it', async () => {
+    const user = userEvent.setup();
+    const { routes, calls } = stubFetch({ 'GET api/apps': listing([running({ tunnel: TUNNEL })]) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Edit' }));
+    const poll = async (apps: AppT[]) => {
+      routes['GET api/apps'] = listing(apps);
+      const before = gets(calls);
+      await tick();
+      await waitFor(() => expect(gets(calls)).toBe(before + 1));
+      await act(async () => {});
+    };
+    await poll([]);
+    expect(screen.queryByRole('article', { name: 'web' })).toBeNull();
+    await poll([running({ tunnel: TUNNEL })]);
+    const back = await screen.findByRole('article', { name: 'web' });
+    expect(within(back).queryByRole('form', { name: 'Edit share login' })).toBeNull();
+    expect(within(back).getByRole('button', { name: 'Edit' })).toBeTruthy();
+  });
+});
+
+describe('list details', () => {
+  // Invariant: worktrees whose main checkout isn't listed get a "no main checkout" parent, never hidden.
+  it('an orphan worktree shows under a "no main checkout" parent', async () => {
+    const user = userEvent.setup();
+    stubFetch({ 'GET api/apps': listing([app({ id: 'lost:k', project: 'lost', name: 'lost', isWorktree: true, branch: 'fix' })]) });
+    render(<App />);
+    const parent = await screen.findByRole('article', { name: 'lost' });
+    expect(within(parent).getByText('no main checkout')).toBeTruthy();
+    expect(within(parent).queryByRole('button', { name: 'Start' })).toBeNull();
+    await user.click(within(parent).getByRole('button', { name: '1 worktree' }));
+    const wt = screen.getByRole('article', { name: 'lost — fix' });
+    expect(within(wt).getByRole('button', { name: 'Start' })).toBeTruthy();
+  });
+
+  // Invariant: the toolbar's controls carry their names: the Refresh button (which reloads the listing) and each
+  // sort option's label for its value.
+  it('toolbar: Refresh is named and reloads; sort options pair label and value', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({ 'GET api/apps': listing([app({ id: 'web' })]) });
+    render(<App />);
+    await screen.findByRole('article', { name: 'web' });
+    const before = gets(calls);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(gets(calls)).toBe(before + 1));
+    const select = screen.getByRole('combobox', { name: 'Sort' }) as HTMLSelectElement;
+    expect(select.value).toBe('edited');
+    expect(within(select).getAllByRole('option').map((o) => [o.textContent, (o as HTMLOptionElement).value])).toStrictEqual([
+      ['Last edited', 'edited'], ['Name', 'name'], ['Status', 'status'],
+    ]);
+  });
+});

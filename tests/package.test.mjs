@@ -25,14 +25,15 @@ test('devDependencies carry the build, UI and test packages, without sonner or f
   assert.deepEqual(dev.filter((d) => d.startsWith('@fontsource')), []);
 });
 
-// Invariant: `npm install` builds the UI (prepare), and `npm test` runs the node suite, the typecheck and Vitest.
-test('scripts: prepare builds, test chains all three suites', () => {
+// Invariant: `npm install` builds the UI (prepare); `npm test` rebuilds it first, so tests/dist.test.mjs measures the
+// current source rather than whatever frontend/dist last held, then runs the node suite, the typecheck and Vitest.
+test('scripts: prepare builds, test rebuilds then chains all three suites', () => {
   assert.equal(pkg.scripts.start, 'node server.js');
   assert.equal(pkg.scripts.prepare, 'vite build --config frontend/vite.config.ts');
   assert.equal(pkg.scripts.dev, 'vite --config frontend/vite.config.ts');
   assert.equal(pkg.scripts.typecheck, 'tsc -p frontend');
   assert.equal(pkg.scripts['test:web'], 'vitest run --config frontend/vitest.config.ts');
-  assert.equal(pkg.scripts.test, 'NODE_OPTIONS=--max-old-space-size=512 node tests/run.mjs && npm run typecheck && npm run test:web');
+  assert.equal(pkg.scripts.test, 'npm run prepare && NODE_OPTIONS=--max-old-space-size=512 node tests/run.mjs && npm run typecheck && npm run test:web');
 });
 
 // Invariant: the Node floor Vite 8 needs is recorded.

@@ -47,7 +47,10 @@ test('index.css imports and dark variant', () => {
 });
 
 const PALETTE = 'red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose|slate|gray|zinc|neutral|stone|black|white';
-const LITERAL = new RegExp(`#[0-9a-fA-F]{3,8}\\b|\\brgba?\\(|\\bhsla?\\(|\\boklch\\(|\\b(?:bg|text|border(?:-[xytrblse])?|ring|fill|stroke|outline|decoration|shadow|from|via|to|divide|accent|caret)-(?:${PALETTE})\\b`);
+const COLOR_UTIL = 'bg|text|border(?:-[xytrblse])?|ring|fill|stroke|outline|decoration|shadow|from|via|to|divide|accent|caret';
+// An arbitrary value that is a colour: `color:`-hinted, a hex, a colour function, or a bare keyword (`[red]`).
+const ARBITRARY = String.raw`\[(?:color:[^\]]+|#[0-9a-fA-F]{3,8}|(?:rgba?|hsla?|oklch|oklab|lab|lch|hwb|color)\([^\]]*\)|[a-zA-Z]+)\]`;
+const LITERAL = new RegExp(`#[0-9a-fA-F]{3,8}\\b|\\brgba?\\(|\\bhsla?\\(|\\boklch\\(|\\b(?:${COLOR_UTIL})-(?:(?:${PALETTE})\\b|${ARBITRARY})`);
 const own = sourceFiles().filter(([n]) => n.startsWith('src/') && !n.startsWith('src/components/ui/') && n !== 'src/cc-theme-fallback.css');
 
 // Invariant: the plugin's own code uses colours only through the theme tokens; the card accent palette
@@ -58,6 +61,34 @@ test('own code has no literal colours', () => {
     if (n === 'src/lib/accent.ts') continue;
     assert.equal(LITERAL.test(src), false, `${n}: ${src.match(LITERAL)?.[0]}`);
   }
+});
+
+// Invariant: the literal-colour pattern catches palette names, raw colour values and arbitrary-value colours,
+// and lets token utilities, arbitrary sizes and var() through.
+test('the literal-colour pattern: what it catches and what it lets through', () => {
+  for (const hit of ['text-red-500', 'border-l-sky-400', 'bg-[#fff]', 'text-[red]', 'text-[color:red]', 'dark:bg-[oklch(0.5_0.1_10)]',
+    'ring-[rgb(1,2,3)]', 'color: #abc', 'rgba(0,0,0,.5)', 'oklch(0.2 0 0)']) {
+    assert.match(hit, LITERAL, hit);
+  }
+  for (const miss of ['text-muted-foreground', 'bg-success/15', 'focus-visible:ring-[3px]', 'text-[13px]', 'bg-[var(--card)]', 'max-w-72', 'border-l-4']) {
+    assert.doesNotMatch(miss, LITERAL, miss);
+  }
+});
+
+// Invariant: every var(--x) in own CSS and code names a token that is declared — by the fallback (cc's tokens,
+// both modes) or by the @theme inline map — so no reference silently resolves to nothing standalone.
+test('every var(--x) in own CSS and code resolves to a declared token', () => {
+  const theme = indexCss.match(/@theme inline\s*\{([\s\S]*?)\n\}/)?.[1];
+  const tokens = new Set([...declared(block(fallback, ':root')), ...declared(block(fallback, '.dark')), ...declared(theme)]);
+  const files = sourceFiles().filter(([n]) => n.startsWith('src/') && !n.startsWith('src/components/ui/'));
+  let seen = 0;
+  for (const [n, src] of files) {
+    for (const [, name] of strip(src).matchAll(/var\(\s*(--[\w-]+)/g)) {
+      seen += 1;
+      assert.ok(tokens.has(name), `${n}: var(${name}) is not a declared token`);
+    }
+  }
+  assert.ok(seen > 20, 'scanned the var() references');
 });
 
 // Invariant: the accent exemption covers only the left-border palette classes, nothing else literal.
