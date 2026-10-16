@@ -1,25 +1,31 @@
-// Pure helpers for the share panel's state resolution — extracted from render
-// in app.js so the fallback ordering and the auth-off merge are unit-testable
-// without a DOM. No dependencies, no DOM access.
+// Pure helpers for the share panel's state resolution, so the fallback ordering
+// and the auth-off merge are unit-testable without rendering. No dependencies,
+// no DOM access.
 
-// The panel draws from two sources: `s` = state.share[id] (the one-time share()
-// response, in-memory only — wiped on a full UI refresh) and `shared` =
-// app.tunnel (the persisted tunnelInfo from list(), rebuilt live from the
-// proxy). Right after sharing or a PATCH, `s` is the freshest; after a full UI
-// refresh `s` is gone and `shared` carries the QR + magic-link instead.
+import type { App, CredDraft, ShareDefaults, ShareKind, SharePatch, ShareState, Tunnel } from './types';
+
+// The panel draws from two sources: `s` = the UI's share state for the app (the
+// one-time share() response, in-memory only — wiped on a full UI refresh) and
+// `shared` = app.tunnel (the persisted tunnelInfo from list(), rebuilt live
+// from the proxy). Right after sharing or a PATCH, `s` is the freshest; after a
+// full UI refresh `s` is gone and `shared` carries the QR + magic-link instead.
+
+type MaybeShare = ShareState | Partial<Tunnel> | null | undefined;
+const field = <K extends keyof Tunnel>(s: MaybeShare, key: K): Tunnel[K] | undefined =>
+  s && typeof s === 'object' ? (s as Partial<Tunnel>)[key] : undefined;
 
 // Resolve the Open link URL. Prefer the in-memory magic-link, then the
 // persisted one, then the plain share URL. A no-auth share has no authUrl
 // anywhere, so it lands on the plain URL. Returns null only if shared is null.
-export function resolveOpenUrl(s, shared) {
-  return (s && s.authUrl) || (shared && shared.authUrl) || (shared && shared.url) || null;
+export function resolveOpenUrl(s: MaybeShare, shared: Partial<Tunnel> | null | undefined): string | null {
+  return field(s, 'authUrl') || (shared && shared.authUrl) || (shared && shared.url) || null;
 }
 
 // Resolve the QR SVG. Prefer the in-memory copy (freshest right after a share
 // or a PATCH merged in), then the persisted tunnelInfo's (served by list(),
 // which survives a full UI refresh). Returns null if neither has one.
-export function resolveQrSvg(s, shared) {
-  return (s && s.qrSvg) || (shared && shared.qrSvg) || null;
+export function resolveQrSvg(s: MaybeShare, shared: Partial<Tunnel> | null | undefined): string | null {
+  return field(s, 'qrSvg') || (shared && shared.qrSvg) || null;
 }
 
 // Fold a credentials/auth PATCH response into the in-memory share state so the
@@ -34,14 +40,21 @@ export function resolveQrSvg(s, shared) {
 // live credential on a later re-gate. A from-the-start auth:false share has no
 // s.authUrl to delete, so it's unaffected.
 //
-// `cur` is state.share[id] — may be null/undefined if nothing's on screen.
-export function mergeSharePatch(cur, patched) {
+// `cur` is the app's share state — may be null/undefined if nothing's on
+// screen. Mutates `cur`; callers holding React state pass a copy.
+export function mergeSharePatch(cur: unknown, patched: SharePatch): void {
   if (!cur || typeof cur !== 'object') return;
-  if ('qrSvg' in patched) cur.qrSvg = patched.qrSvg;
-  if ('username' in patched) cur.username = patched.username;
-  if ('password' in patched) cur.password = patched.password;
-  if ('passwordIsDefault' in patched) cur.passwordIsDefault = patched.passwordIsDefault;
-  if (patched.auth === false) delete cur.authUrl;
+  const t = cur as Partial<Tunnel>;
+  if ('qrSvg' in patched) t.qrSvg = patched.qrSvg;
+  if ('username' in patched) t.username = patched.username;
+  if ('password' in patched) t.password = patched.password;
+  if ('passwordIsDefault' in patched) t.passwordIsDefault = patched.passwordIsDefault;
+  if (patched.auth === false) delete t.authUrl;
+}
+
+export interface FixedPortNotice {
+  level: 'warn' | 'note';
+  text: string;
 }
 
 // Resolve the fixed-port fallback notice for a LAN share, or null when there's
@@ -62,7 +75,7 @@ export function mergeSharePatch(cur, patched) {
 //             exposed, only what follows if it binds all interfaces.
 //   'other'   the port is positively not wildcard-held, so this app is not
 //             what answers on the LAN there. Nothing to warn about.
-export function resolveFixedPortNotice(app, shared) {
+export function resolveFixedPortNotice(app: Pick<App, 'port'> | null | undefined, shared: Partial<Tunnel> | null | undefined): FixedPortNotice | null {
   if (!shared || shared.kind !== 'lan' || !shared.fixedPortFallback) return null;
   const fixed = app && app.port;
   const actual = shared.proxyPort;
@@ -86,14 +99,13 @@ export function resolveFixedPortNotice(app, shared) {
 }
 
 // Resolve the share panel's mode/credentials note — the one line under the URL
-// saying how this share is reachable. Extracted from app.js's render so the
-// wording is unit-testable without a DOM (there are no DOM tests).
+// saying how this share is reachable.
 //
 // `kind` drives the split, NOT "is it LAN": a tailscale share is public like a
 // tunnel but is NOT a cloudflared tunnel, and calling it one would misdescribe
 // where TLS terminates and how stable the URL is. Anything unrecognised falls
-// through to the tunnel wording, which is the pre-existing default.
-export function resolveCredNote(shared) {
+// through to the tunnel wording, which is the default for a share without a kind.
+export function resolveCredNote(shared: Partial<Tunnel>): string {
   const kind = (shared && shared.kind) || 'tunnel';
   if (kind === 'tailscale') return 'via Tailscale Funnel — public URL';
   if (kind !== 'lan') return 'via public tunnel';
@@ -117,15 +129,15 @@ export function resolveCredNote(shared) {
 export const PASSWORD_MASK = '••••••••';
 
 // The share panel's `pass` row: what it shows, and what its Copy writes.
-export function credRowValues(shared) {
+export function credRowValues(shared: Partial<Tunnel>): { display: string | null | undefined; copy: string | null | undefined } {
   return { display: shared.passwordIsDefault ? PASSWORD_MASK : shared.password, copy: shared.password };
 }
 
-// Drop edit drafts (state.credEdit) whose app is no
-// longer in the listing — e.g. a removed worktree. An orphaned draft would
-// otherwise hold off the periodic render forever, since its form can never
-// be saved or cancelled.
-export function pruneDrafts(drafts, apps) {
+// Drop edit drafts whose app is no longer in the listing — e.g. a removed
+// worktree — so a form that can never be saved or cancelled doesn't linger and
+// reappear if the id comes back. Mutates `drafts`; callers holding React state
+// pass a copy.
+export function pruneDrafts(drafts: Record<string, unknown>, apps: Pick<App, 'id'>[]): void {
   const ids = new Set(apps.map((a) => a.id));
   for (const id of Object.keys(drafts)) if (!ids.has(id)) delete drafts[id];
 }
@@ -133,7 +145,7 @@ export function pruneDrafts(drafts, apps) {
 // The Edit form's initial draft for a live share. `kind` 'lan' also carries the
 // auth/TLS toggles, which only a LAN share has. "Also save as this app's
 // default login" starts unticked.
-export function credDraftFor(shared, kind) {
+export function credDraftFor(shared: Partial<Tunnel>, kind: ShareKind): CredDraft {
   const creds = {
     username: shared.username ?? '',
     password: shared.passwordIsDefault ? '' : (shared.password ?? ''),
@@ -144,13 +156,19 @@ export function credDraftFor(shared, kind) {
 
 // Whether the Edit form shows the user/pass fields and the save-as-default
 // checkbox: always for an always-gated share, for LAN only while auth is on.
-export function credFieldsShown(editing, kind) {
-  return kind !== 'lan' || editing.auth;
+export function credFieldsShown(editing: Pick<CredDraft, 'auth'>, kind: ShareKind): boolean {
+  return kind !== 'lan' || !!editing.auth;
 }
 
-export function credPasswordPlaceholder(editing, shared) {
+export function credPasswordPlaceholder(editing: Pick<CredDraft, 'password'>, shared: Partial<Tunnel>): string {
   if (shared.passwordIsDefault && !editing.password) return `${PASSWORD_MASK} (default — type to replace)`;
   return editing.password ? '' : 'leave blank to keep current';
+}
+
+export interface CredPatchBody {
+  username?: string;
+  password?: string;
+  saveAsDefault?: true;
 }
 
 // A credentials PATCH body from an Edit draft, or null when there's nothing to
@@ -158,9 +176,9 @@ export function credPasswordPlaceholder(editing, shared) {
 // the live value (an in-place edit), whereas a fresh re-share sends every
 // typed field. A ticked save-as-default always sends a body (the flag alone
 // pins the share's current login as the default).
-export function credPatchBody(editing, shared, { onlyChanged }) {
-  const body = {};
-  for (const key of ['username', 'password']) {
+export function credPatchBody(editing: CredDraft, shared: Partial<Tunnel>, { onlyChanged }: { onlyChanged: boolean }): CredPatchBody | null {
+  const body: CredPatchBody = {};
+  for (const key of ['username', 'password'] as const) {
     const v = editing[key];
     if (!v) continue;
     if (onlyChanged && v === (shared[key] ?? '')) continue;
@@ -174,8 +192,84 @@ export function credPatchBody(editing, shared, { onlyChanged }) {
 // re-shares, and a re-share starts from the app's default login if it has one.
 // `defaults` is app.shareDefaults; keyed on a stored default PASSWORD, since
 // with only a default username the password still resets to a random one.
-export function resolveTlsReshareNote(auth, defaults) {
+export function resolveTlsReshareNote(auth: boolean | undefined, defaults: ShareDefaults | null | undefined): string {
   if (!auth) return 'Changing TLS re-shares the app — new link & QR.';
   if (defaults?.hasPassword) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
   return 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).';
+}
+
+// Whether Save would flip a LAN share's TLS. TLS can't flip on a live proxy, so
+// this is what makes Save re-share. Only a LAN draft carries `tls`.
+export function tlsChanging(editing: CredDraft, shared: Partial<Tunnel>): boolean {
+  return typeof editing.tls === 'boolean' && editing.tls !== (shared.tls !== false);
+}
+
+export interface ShareMode {
+  mode: ShareKind;
+  label: string;
+  /** Why the mode can't be picked now, or null when it can. */
+  disabledReason: string | null;
+}
+
+// The share picker's modes in order. LAN needs nothing installed.
+export function shareModes(cloudflaredAvailable: boolean, tailscaleAvailable: boolean): ShareMode[] {
+  return [
+    { mode: 'lan', label: 'LAN', disabledReason: null },
+    { mode: 'tunnel', label: 'cloudflared', disabledReason: cloudflaredAvailable ? null : 'cloudflared not installed' },
+    { mode: 'tailscale', label: 'tailscale', disabledReason: tailscaleAvailable ? null : 'tailscale not available' },
+  ];
+}
+
+export type SharePanelView =
+  | { view: 'choosing' }
+  | { view: 'loading' }
+  | { view: 'error'; error: string }
+  | { view: 'none' }
+  | {
+      view: 'active';
+      shared: Tunnel;
+      kind: ShareKind;
+      openUrl: string;
+      qrSvg: string | null;
+      credNote: string;
+      fixedPortNotice: FixedPortNotice | null;
+      /** The share's further URLs (the other LAN addresses), past the one shown. */
+      extraUrls: string[];
+      /** Whether the creds area shows: the Edit form while editing, else the user/pass rows. */
+      showCreds: boolean;
+      /** Whether Edit is offered: on any LAN share (it is how auth is turned back on), else only with creds. */
+      canEdit: boolean;
+    };
+
+// What the share panel shows, in precedence order: the mode picker, a share in
+// flight, a failed share (over a live app.tunnel too, so the failure is seen),
+// nothing, or the live share. `editing` is whether the app's Edit form is open.
+export function sharePanelView(s: ShareState | undefined, app: Pick<App, 'tunnel' | 'port'>, editing: boolean): SharePanelView {
+  if (s && typeof s === 'object' && 'choosing' in s) return { view: 'choosing' };
+  if (s === 'loading') return { view: 'loading' };
+  const shared = app.tunnel || (s && typeof s === 'object' && 'url' in s && s.url ? s : null);
+  if (s && typeof s === 'object' && 'error' in s && s.error) return { view: 'error', error: s.error };
+  if (!shared) return { view: 'none' };
+  const kind = shared.kind || 'tunnel';
+  const hasCreds = shared.auth !== false && !!shared.username && !!shared.password;
+  return {
+    view: 'active',
+    shared,
+    kind,
+    openUrl: resolveOpenUrl(s, shared) as string,
+    qrSvg: resolveQrSvg(s, shared),
+    credNote: resolveCredNote(shared),
+    fixedPortNotice: resolveFixedPortNotice(app, shared),
+    extraUrls: shared.urls && shared.urls.length > 1 ? shared.urls.slice(1) : [],
+    showCreds: editing || hasCreds,
+    canEdit: kind === 'lan' || hasCreds,
+  };
+}
+
+// The QR as an <img> source: a data: URL of the server's SVG, which an <img>
+// renders without running any script it carries. Anything that is not an SVG
+// document yields null, and no QR is shown.
+export function qrImageSrc(svg: unknown): string | null {
+  if (typeof svg !== 'string' || !svg.trimStart().startsWith('<svg')) return null;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }

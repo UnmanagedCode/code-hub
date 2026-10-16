@@ -56,7 +56,7 @@ export function isPortFree(port) {
 // before the kernel ever considers the port — for every port, held or free.
 // This probe is therefore permanently 'inconclusive' on those hosts, which is
 // exactly why callers must fail safe on that answer instead of reading it as
-// "nothing is wrong" (see appManager.share and public/shareState.js).
+// "nothing is wrong" (see appManager.share and frontend/src/lib/shareState.ts).
 // CODEHUB_WILDCARD_PROBE_ADDR overrides the alias so tests can exercise that
 // host class on Linux; nothing else should set it. Read per call (like
 // projectsRoot's PROJECTS_ROOT) so it doesn't depend on module-load ordering.

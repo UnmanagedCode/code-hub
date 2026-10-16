@@ -576,7 +576,7 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
         // reloader restarting the server frees the port machine-wide for a
         // moment, during which something else could take the wildcard. So 'app' means "almost
         // certainly the app", and every message built from it is phrased to
-        // match (see public/shareState.js).
+        // match (see frontend/src/lib/shareState.ts).
         //
         // 'inconclusive' maps to 'unknown', which callers must treat as
         // possible exposure rather than as an all-clear: on a host with no
