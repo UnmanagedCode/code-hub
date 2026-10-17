@@ -45,6 +45,35 @@ test('readyWhen regex drives readiness from stdout', async (t) => {
   await waitFor(() => !pidAlive(rec.pgid));
 });
 
+test('readyWhen matches a ready line split across two output chunks', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd('split') });
+  const app = { id: 'rwsplit', path: dir, manifest: { start: fakeAppCmd('split'), healthPath: null, readyWhen: 'listening on \\d+' } };
+
+  const port = await allocatePort();
+  const rec = await runner.start(app, port);
+  t.after(() => runner.stop({ id: 'rwsplit', pgid: rec.pgid }));
+  await waitFor(() => runner.runtime('rwsplit')?.status === 'ready');
+  runner.stop({ id: 'rwsplit', pgid: rec.pgid });
+  await waitFor(() => !pidAlive(rec.pgid));
+});
+
+// Pins: the runner advances the matcher's `total` with every chunk. A frozen
+// total makes each scan cover only the overlap tail, so a ready line followed
+// by at least READY_OVERLAP_CHARS more output in the same tick is never seen.
+test('readyWhen still finds a ready line buried under more than READY_OVERLAP_CHARS of later output', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd('flood') });
+  const app = { id: 'rwflood', path: dir, manifest: { start: fakeAppCmd('flood'), healthPath: null, readyWhen: 'listening on \\d+' } };
+
+  const port = await allocatePort();
+  const rec = await runner.start(app, port);
+  t.after(() => runner.stop({ id: 'rwflood', pgid: rec.pgid }));
+  await waitFor(() => runner.runtime('rwflood')?.status === 'ready');
+});
+
 test('a start command that exits immediately is reported crashed with a tail', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));

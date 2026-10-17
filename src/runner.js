@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
+import { createReadyMatcher } from './readyWhen.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
@@ -12,7 +13,7 @@ const SPAWN_SETTLE_MS = 400; // window to catch a fast EADDRINUSE crash before c
 // In-memory runtime for children spawned by THIS code-hub process. Apps
 // adopted after a restart have no entry here (we can't recapture their
 // stdout) and are treated as already-ready by the app manager.
-const children = new Map(); // id → { proc, pgid, status, error, output }
+const children = new Map(); // id → { proc, pgid, status, error, output, total }
 
 export function runtime(id) {
   const c = children.get(id);
@@ -22,6 +23,7 @@ export function runtime(id) {
 
 function appendOutput(c, chunk) {
   c.output += chunk;
+  c.total += chunk.length;
   if (c.output.length > OUTPUT_CAP) c.output = c.output.slice(-OUTPUT_CAP);
 }
 
@@ -40,7 +42,7 @@ function spawnChild(app, port) {
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '' };
+  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0 };
 
   const onData = (d) => appendOutput(c, d.toString());
   proc.stdout.on('data', onData);
@@ -112,8 +114,8 @@ export async function start(app, port, { fixed = false } = {}) {
 function detectReady(app, port, c) {
   const { readyWhen, healthPath } = app.manifest;
   if (readyWhen) {
-    const re = new RegExp(readyWhen);
-    return poll(() => re.test(c.output));
+    const m = createReadyMatcher(readyWhen);
+    return poll(() => m.scan(c.output, c.total));
   }
   if (healthPath) {
     return poll(() => httpOk(port, healthPath));
@@ -126,8 +128,8 @@ function poll(pred, { timeoutMs = READY_TIMEOUT_MS, intervalMs = 200 } = {}) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const tick = async () => {
-      let ok = false;
-      try { ok = await pred(); } catch { ok = false; }
+      let ok;
+      try { ok = await pred(); } catch (e) { return reject(e); }
       if (ok) return resolve();
       if (Date.now() >= deadline) return reject(new Error('readiness not confirmed within timeout'));
       setTimeout(tick, intervalMs);
