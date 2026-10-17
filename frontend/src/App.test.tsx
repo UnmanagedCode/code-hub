@@ -124,7 +124,7 @@ describe('layout', () => {
       expect(list.classList.contains(c), c).toBe(true);
     }
     routes['GET api/apps'] = () => json({ error: 'down' }, 502);
-    await tick();
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Refresh' }));
     expect((await screen.findByRole('alert')).classList.contains('col-span-full')).toBe(true);
   });
 });
