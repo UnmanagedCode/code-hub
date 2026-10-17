@@ -1,6 +1,6 @@
 # Features (user-facing)
 
-code-hub is a single-page, phone-first UI. Embedded in code-conductor it uses code-conductor's palette and fonts and follows its light/dark theme live (the sidebar toggle, or the OS while code-conductor's theme is "system"); standalone it follows the OS light/dark setting, live. It has no theme toggle of its own. It lists every servable app grouped by project and lets you drive each one.
+code-hub is a single-page, phone-first UI. Embedded in code-conductor it uses code-conductor's palette and fonts and follows its light/dark theme live (the sidebar toggle, or the OS while code-conductor's theme is "system"); standalone it follows the OS light/dark setting, live. It has no theme toggle of its own. Embedded, the page width follows code-conductor's session-column width (Full width included) and wide columns show cards side by side; standalone it is a 42rem column. It lists every servable app grouped by project and lets you drive each one.
 
 ## App list
 

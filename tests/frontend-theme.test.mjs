@@ -99,8 +99,25 @@ test('the literal-colour pattern: what it catches and what it lets through', () 
   }
 });
 
+// Set on <html> by cc's plugin bridge (/pluginBridge.js) when embedded and unset standalone, so every use needs a fallback.
+const HOST_PROPS = new Set(['--cc-session-width']);
+// The `var(--x…)` heads in `src` that neither name a declared token nor a host property given a fallback.
+const badVars = (src, tokens) => [...strip(src).matchAll(/var\(\s*(--[\w-]+)\s*(,)?/g)]
+  .filter(([, name, comma]) => !(tokens.has(name) || (HOST_PROPS.has(name) && comma)))
+  .map(([head]) => head);
+
+// Invariant: a host property passes only with a fallback; an unknown name fails with or without one; a declared token passes.
+test('badVars: host property needs a fallback, unknown names always fail', () => {
+  const tokens = new Set(['--card']);
+  assert.deepEqual(badVars('max-w-[var(--cc-session-width)]', tokens), ['var(--cc-session-width']);
+  assert.deepEqual(badVars('var(--nope)', tokens), ['var(--nope']);
+  assert.deepEqual(badVars('var(--nope,1px)', tokens), ['var(--nope,']);
+  assert.deepEqual(badVars('max-w-[var(--cc-session-width,42rem)]', tokens), []);
+  assert.deepEqual(badVars('bg-[var(--card)]', tokens), []);
+});
+
 // Invariant: every var(--x) in own frontend files (CSS, code, public/, index.html) names a token that is declared — by the fallback (cc's tokens,
-// both modes) or by the @theme inline map — so no reference silently resolves to nothing standalone.
+// both modes) or by the @theme inline map (or is a HOST_PROPS entry with a fallback) — so no reference silently resolves to nothing standalone.
 test('every var(--x) in own CSS and code resolves to a declared token', () => {
   const theme = indexCss.match(/@theme inline\s*\{([\s\S]*?)\n\}/)?.[1];
   const tokens = new Set([...declared(block(fallback, ':root')), ...declared(block(fallback, '.dark')), ...declared(theme)]);
@@ -109,10 +126,8 @@ test('every var(--x) in own CSS and code resolves to a declared token', () => {
   assert.ok(files.some(([n]) => n === 'public/theme-init.js') && files.some(([n]) => n === 'index.html'), 'scans public/ and index.html');
   let seen = 0;
   for (const [n, src] of files) {
-    for (const [, name] of strip(src).matchAll(/var\(\s*(--[\w-]+)/g)) {
-      seen += 1;
-      assert.ok(tokens.has(name), `${n}: var(${name}) is not a declared token`);
-    }
+    seen += [...strip(src).matchAll(/var\(\s*--[\w-]+/g)].length;
+    assert.deepEqual(badVars(src, tokens), [], `${n}: undeclared token, or host property without a fallback`);
   }
   assert.ok(seen > 20, 'scanned the var() references');
 });

@@ -14,7 +14,7 @@ export function App() {
   const [sort, setSort] = useState<SortKey>('edited');
   return (
     <HubProvider>
-      <main className="mx-auto flex min-h-full max-w-2xl flex-col gap-3 p-3 sm:p-4">
+      <main className="mx-auto flex min-h-full max-w-[var(--cc-session-width,42rem)] flex-col gap-3 p-3 sm:p-4">
         <Header />
         <Toolbar sort={sort} onSort={setSort} />
         <div className="flex-1">

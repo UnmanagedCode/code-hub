@@ -91,6 +91,28 @@ describe('list states', () => {
   });
 });
 
+describe('layout', () => {
+  // Invariant: <main> is capped by cc's session width, falling back to 42rem standalone.
+  it('main follows --cc-session-width with a 42rem fallback', () => {
+    stubFetch({ 'GET api/apps': listing([]) });
+    render(<App />);
+    const main = screen.getByRole('main');
+    expect(main.classList.contains('max-w-[var(--cc-session-width,42rem)]')).toBe(true);
+    expect(main.classList.contains('max-w-2xl')).toBe(false);
+  });
+
+  // Invariant: the cards sit in an auto-fill grid, and the stale alert spans every column.
+  it('cards flow in an auto-fill grid; the stale alert spans all columns', async () => {
+    const { routes } = stubFetch({ 'GET api/apps': listing([app({ id: 'web' })]) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    expect(card.parentElement!.classList.contains('grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))]')).toBe(true);
+    routes['GET api/apps'] = () => json({ error: 'down' }, 502);
+    await tick();
+    expect((await screen.findByRole('alert')).classList.contains('col-span-full')).toBe(true);
+  });
+});
+
 describe('actions', () => {
   // Invariant: a failed action shows inline on its card (no browser alert), and the next action clears it.
   it('a failed Start shows an inline alert, never window.alert', async () => {
