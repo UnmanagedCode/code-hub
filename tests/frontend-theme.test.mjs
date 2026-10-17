@@ -101,7 +101,7 @@ test('the literal-colour pattern: what it catches and what it lets through', () 
 
 // Set on <html> by cc's plugin bridge (/pluginBridge.js) when embedded and unset standalone, so every use needs a fallback.
 const HOST_PROPS = new Set(['--cc-session-width']);
-// The `var(--x…)` heads in `src` that neither name a declared token nor a host property given a fallback.
+// The `var(--x…)` heads in one own frontend file's source that neither name a declared token nor a host property given a fallback.
 const badVars = (src, tokens) => [...strip(src).matchAll(/var\(\s*(--[\w-]+)\s*(,)?/g)]
   .filter(([, name, comma]) => !(tokens.has(name) || (HOST_PROPS.has(name) && comma)))
   .map(([head]) => head);
@@ -118,7 +118,7 @@ test('badVars: host property needs a fallback, unknown names always fail', () =>
 
 // Invariant: every var(--x) in own frontend files (CSS, code, public/, index.html) names a token that is declared — by the fallback (cc's tokens,
 // both modes) or by the @theme inline map (or is a HOST_PROPS entry with a fallback) — so no reference silently resolves to nothing standalone.
-test('every var(--x) in own CSS and code resolves to a declared token', () => {
+test('every var(--x) in own CSS and code resolves to a declared token, or a host property given a fallback', () => {
   const theme = indexCss.match(/@theme inline\s*\{([\s\S]*?)\n\}/)?.[1];
   const tokens = new Set([...declared(block(fallback, ':root')), ...declared(block(fallback, '.dark')), ...declared(theme)]);
   // All own frontend files: index.html, public/** and src/**, minus the copied components.

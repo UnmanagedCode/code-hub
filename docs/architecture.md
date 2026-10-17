@@ -119,6 +119,7 @@ frontend/
 - `<main>` is `max-w-[var(--cc-session-width,42rem)]`. Embedded, cc's bridge sets `--cc-session-width` on `<html>` (`<N>px`, or `none` for Full width) before first paint and live; standalone it is unset, so the 42rem fallback (= `max-w-2xl`) applies. Own code only adds the class: it never sets the property.
 - Header and Toolbar sit inside `<main>`, so they follow it. Dialogs are fixed overlays that size themselves.
 - The card list (`components/AppList.tsx`) is an auto-fill grid with `minmax(min(36rem,100%),1fr)` columns: one column at the 42rem cap and on phones, more when wide. The stale alert and the empty text span all columns (`col-span-full`).
+- `src/index.css` excludes `*.test.{ts,tsx}` from Tailwind's source scan (`@source not`), so class names quoted in tests generate no CSS and `tests/dist.test.mjs` sees only what the app uses.
 
 **Security model** (the CSP itself: `docs/protocol.md` → UI serving & headers):
 - **Text, never markup.** Content renders as React text children. No `innerHTML` family, `dangerouslySetInnerHTML`, `eval` / `new Function`, `window.parent`, `location.hash` write or `code-conductor:` storage key (`tests/frontend.test.mjs`).

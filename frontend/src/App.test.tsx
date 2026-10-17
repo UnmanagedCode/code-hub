@@ -106,10 +106,23 @@ describe('layout', () => {
     const { routes } = stubFetch({ 'GET api/apps': listing([app({ id: 'web' })]) });
     render(<App />);
     const card = await screen.findByRole('article', { name: 'web' });
-    expect(card.parentElement!.classList.contains('grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))]')).toBe(true);
+    const list = card.parentElement!;
+    for (const c of ['grid', 'grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))]', '[&>*]:min-w-0']) {
+      expect(list.classList.contains(c), c).toBe(true);
+    }
     routes['GET api/apps'] = () => json({ error: 'down' }, 502);
     await tick();
     expect((await screen.findByRole('alert')).classList.contains('col-span-full')).toBe(true);
+  });
+});
+
+describe('layout empty state', () => {
+  // Invariant: the empty-state text spans every grid column.
+  it('the empty text spans all columns', async () => {
+    stubFetch({ 'GET api/apps': listing([]) });
+    render(<App />);
+    const text = await screen.findByText('No apps found. Add a .hub.json to a sibling project.');
+    expect(text.classList.contains('col-span-full')).toBe(true);
   });
 });
 
