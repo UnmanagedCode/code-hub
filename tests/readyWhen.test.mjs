@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { createReadyMatcher, READY_WINDOW_CHARS, READY_OVERLAP_CHARS, READY_MATCH_DEADLINE_MS } from '../src/readyWhen.js';
 
@@ -28,26 +29,36 @@ test('a match longer than READY_WINDOW_CHARS is never found even though the buff
   assert.equal(createReadyMatcher(pattern).scan(text, text.length), false);
 });
 
-test('a marker at the start of the retained output is found after the ring trimmed past the last scan', () => {
+// Pins: a marker at the start of the retained output is found after the ring
+// trimmed past the last scan position. (The start clamp only bounds work, so
+// this does not and cannot pin the clamp itself.)
+test('a marker at the start of the retained output is found after the ring trimmed', () => {
   const L = 2 * READY_WINDOW_CHARS;
   const m = createReadyMatcher('READY');
   m.scan('x', 1);
   assert.equal(m.scan('READY' + fill(L - 5), 10 * L + 2), true);
 });
 
+// Runs in a child process: irregexp cannot be preempted by node:test's timeout,
+// so a lost deadline would hang the suite. A killed child fails the test instead.
 test('a pattern that outruns the deadline throws naming the pattern, after about READY_MATCH_DEADLINE_MS', () => {
-  const m = createReadyMatcher('(a|a)+$');
-  const t0 = Date.now();
-  assert.throws(
-    () => m.scan('a'.repeat(40) + '!', 41),
-    (e) => e.message.includes('(a|a)+$') && /deadline/.test(e.message) && /stopped/.test(e.message),
-  );
-  const elapsed = Date.now() - t0;
-  assert.ok(elapsed >= 0.8 * READY_MATCH_DEADLINE_MS, `stopped too early: ${elapsed}ms`);
-  assert.ok(elapsed < READY_MATCH_DEADLINE_MS + 1000, `stopped too late: ${elapsed}ms`);
+  const bound = READY_MATCH_DEADLINE_MS + 1000;
+  const code = `
+    import { createReadyMatcher } from ${JSON.stringify(new URL('../src/readyWhen.js', import.meta.url).href)};
+    const t0 = Date.now();
+    try { createReadyMatcher('(a|a)+$').scan('a'.repeat(40) + '!', 41); console.log(JSON.stringify({ threw: false })); }
+    catch (e) { console.log(JSON.stringify({ threw: true, message: e.message, elapsed: Date.now() - t0 })); }
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { timeout: bound + 2000, encoding: 'utf8' });
+  assert.equal(r.error, undefined, `child did not finish: ${r.error?.message}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.threw, true);
+  assert.ok(out.message.includes('(a|a)+$') && /deadline/.test(out.message) && /stopped/.test(out.message), out.message);
+  assert.ok(out.elapsed >= 0.8 * READY_MATCH_DEADLINE_MS, `stopped too early: ${out.elapsed}ms`);
+  assert.ok(out.elapsed < bound, `stopped too late: ${out.elapsed}ms`);
 });
 
 test('the matcher still matches after a deadline was hit', () => {
-  assert.throws(() => createReadyMatcher('(a|a)+$').scan('a'.repeat(40) + '!', 41));
+  assert.throws(() => createReadyMatcher('(a|a)+$').scan('a'.repeat(40) + '!', 41), /deadline/);
   assert.equal(createReadyMatcher('listening on \\d+').scan('listening on 3000', 17), true);
 });

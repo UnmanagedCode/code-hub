@@ -19,10 +19,14 @@
 //   split       → same as default, but the ready line arrives in two writes
 //                 ("listen" now, "ing on <port>" 600ms later) so a readiness
 //                 check sees the first half alone on at least one poll tick.
+//   flood       → same as default, but prints 2×READY_OVERLAP_CHARS of filler in the
+//                 same tick as the ready line, so the ready line is gone from the
+//                 overlap tail by the first poll tick.
 //   backtrack   → prints 32 'a's and a '!' before binding, then behaves as
 //                 default. Output that makes a pattern like (a|a)+$ take
 //                 tens of seconds per unprotected check.
 import http from 'node:http';
+import { READY_OVERLAP_CHARS } from '../../src/readyWhen.js';
 
 if (process.env.FAKE_APP_MODE === 'crash') {
   console.error('boom: could not start');
@@ -54,6 +58,7 @@ server.listen(port, host, () => {
     setTimeout(() => console.log(`ing on ${port}`), 600);
   } else {
     console.log(`listening on ${port}`);
+    if (process.env.FAKE_APP_MODE === 'flood') console.log('x'.repeat(2 * READY_OVERLAP_CHARS));
   }
 });
 

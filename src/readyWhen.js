@@ -53,14 +53,6 @@ function findNestedQuantifier(source) {
     } else if (c === '(') {
       stack.push({ start: i, repeats: false });
       i++;
-      if (source[i] === '?') {
-        if (source[i + 1] === '<' && (source[i + 2] === '=' || source[i + 2] === '!')) i += 3;
-        else if (source[i + 1] === '<') i = source.indexOf('>', i) + 1 || source.length;
-        else {
-          while (i < source.length && !':=!'.includes(source[i])) i++;
-          i++;
-        }
-      }
     } else if (c === ')' && stack.length > 1) {
       const f = stack.pop();
       const q = quantifierAt(source, i + 1);
@@ -90,7 +82,7 @@ export function readyWhenProblem(source) {
   }
   const fragment = findNestedQuantifier(source);
   if (fragment) {
-    return `nests a repeating quantifier inside a repeated group ("${fragment}"), which can take exponential time on output that doesn't match; rewrite it so no repeated group contains a repeating quantifier`;
+    return `nests a repeating quantifier inside a repeated group ("${fragment}"); this shape is rejected because patterns of it can backtrack exponentially on output that doesn't match — rewrite it so no repeated group contains a repeating quantifier`;
   }
   return null;
 }

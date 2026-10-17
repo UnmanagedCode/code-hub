@@ -72,12 +72,12 @@ test('rejects a port outside 1024-65535 or of the wrong type, naming value + ran
   }
 });
 
-test('rejects a readyWhen that nests a repeating quantifier, naming file, field and the exponential-time reason', () => {
+test('rejects a readyWhen that nests a repeating quantifier, naming file, field and the rule', () => {
   const F = 'proj/.hub.json';
-  for (const re of ['(a+)+', '(a*)*$', '(\\w+\\s?)+$', '(a{1,5})+', '(?:x*y)*', '((a+)b)+', '(a+){2,}', '(?<n>a+)+']) {
+  for (const re of ['(a+)+', '(a*)*$', '(\\w+\\s?)+$', '(a{1,5})+', '(?:x*y)*', '((a+)b)+', '(a+){2,}', '(a+){1,2}', '(?<n>a+)+']) {
     assert.throws(
       () => parseManifest(JSON.stringify({ start: 'x', readyWhen: re }), F),
-      /proj\/\.hub\.json: "readyWhen" nests a repeating quantifier.*exponential time/,
+      /proj\/\.hub\.json: "readyWhen" nests a repeating quantifier.*backtrack exponentially/,
       re,
     );
   }
@@ -88,7 +88,7 @@ test('rejects a readyWhen that nests a repeating quantifier, naming file, field 
 });
 
 test('accepts readyWhen patterns that only look nested', () => {
-  for (const re of ['listening on \\d+', 'Local:\\s+http', '(ab)+', '(a?)+', '(a+)?', '(a{2})+', '(a+){1}', '(a+)b+', '[(a+)+]', '\\(a+\\)+', '(?:a+)', 'hopgate listening on http']) {
+  for (const re of ['listening on \\d+', 'Local:\\s+http', '(ab)+', '(a?)+', '(a+)?', '(a{2})+', '(a+){1}', '(a+){0,1}', '(a+){1,1}', '(a+)b+', '[(a+)+]', '\\(a+\\)+', '(?:a+)', 'hopgate listening on http']) {
     assert.equal(parseManifest(JSON.stringify({ start: 'x', readyWhen: re }), 'proj/.hub.json').readyWhen, re, re);
   }
 });
