@@ -532,3 +532,33 @@ test('embedded: CONDUCTOR_PROJECT_DIR still wins over the conductor\'s record of
   assert.equal(main.currentSha, runningSha);
   assert.equal(res.body.apps.find((a) => a.id === 'code-conductor:ab12cd').project, 'code-conductor');
 });
+
+// Invariant: the host code-conductor (which code-hub can't start) takes a
+// default login but never the auto-start/auto-share toggles.
+test('embedded: PUT autoStart on the host code-conductor is a 400; a login is accepted', async (t) => {
+  const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
+  const root = await mkRoot();
+  await mkProject(root, 'code-conductor', { start: fakeAppCmd() });
+  const { server, base } = await bootHub();
+  t.after(async () => {
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    unregisterInMemory('code-conductor');
+    server.close();
+    conductorSrv.close();
+    await rmRoot(root);
+  });
+  const put = (body) => fetch(`${base}/api/apps/code-conductor/settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  for (const body of [{ autoStart: true }, { autoShare: { mode: 'lan' } }]) {
+    const res = await put(body);
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /'code-conductor' is the host code-conductor/);
+  }
+  const ok = await put({ username: 'alice' });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.autoStart, false);
+});

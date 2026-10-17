@@ -1,5 +1,6 @@
 import { LoaderCircleIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { SettingsDialog } from '@/components/SettingsDialog';
 import { useHub, type BusyAction } from '@/hub';
 import { controlsFor } from '@/lib/appView';
 import type { App } from '@/lib/types';
@@ -35,6 +36,7 @@ export function AppControls({ app }: { app: App }) {
           {c.share.label}
         </Button>
       )}
+      <SettingsDialog app={app} />
     </div>
   );
 }

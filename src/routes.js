@@ -22,9 +22,10 @@ export function buildRoutes() {
   r.post('/apps/:id/share', wrap((req) => appManager.share(req.params.id, { mode: req.body?.mode, auth: req.body?.auth, tls: req.body?.tls })));
   r.patch('/apps/:id/share/credentials', wrap((req) => appManager.updateShareCredentials(req.params.id, req.body)));
   r.patch('/apps/:id/share/auth', wrap((req) => appManager.setShareAuth(req.params.id, req.body?.enabled)));
-  r.get('/apps/:id/share/defaults', wrap((req) => appManager.getShareDefaults(req.params.id)));
-  r.put('/apps/:id/share/defaults', wrap((req) => appManager.setShareDefaults(req.params.id, req.body)));
-  r.delete('/apps/:id/share/defaults', wrap((req) => appManager.clearShareDefaults(req.params.id)));
+  r.get('/apps/:id/settings', wrap((req) => appManager.getAppSettings(req.params.id)));
+  r.put('/apps/:id/settings', wrap((req) => appManager.setAppSettings(req.params.id, req.body)));
+  r.delete('/apps/:id/settings', wrap((req) => appManager.clearAppSettings(req.params.id)));
+  r.get('/apps/:id/settled', wrap((req) => appManager.awaitSettled(req.params.id)));
   r.delete('/apps/:id/share', wrap((req) => appManager.unshare(req.params.id)));
 
   // MCP tool-call bridge for code-conductor: unlike wrap()'s statusCode

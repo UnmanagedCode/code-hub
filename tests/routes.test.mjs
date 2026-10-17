@@ -951,7 +951,7 @@ test('a funnel that dies on its own is reaped, and frees the slot for another ap
 });
 
 // share() must reap a dead holder ITSELF, not rely on a poll having happened
-// first — the UI can post a share between polls, and a 409 citing a funnel
+// first — the UI can post a share between listings, and a 409 citing a funnel
 // that no longer exists would wedge the feature until a restart. Deliberately
 // no GET /api/apps anywhere in this test.
 test('a dead holder does not block the next share even with no poll in between', async (t) => {

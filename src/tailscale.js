@@ -13,7 +13,7 @@ const EXIT_TIMEOUT_MS = 5000;
 
 // `tailscale status --json`, parsed — or null if the binary is missing, the
 // daemon isn't answering, or the output isn't JSON. `--peers=false` keeps the
-// payload bounded on a large tailnet: available() runs on every list() poll.
+// payload bounded on a large tailnet: available() runs on every list() call.
 function status() {
   return new Promise((resolve) => {
     execFile(bin(), ['status', '--json', '--peers=false'], (err, stdout) => {

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AppCard } from './AppCard';
 import { FEEDBACK_MS } from './CopyButton';
 import { HubProvider } from '@/hub';
@@ -19,8 +19,6 @@ function renderCard(a: App, worktrees: App[] = []) {
 
 const card = (name: string) => screen.getByRole('article', { name });
 
-// The poll is driven by hand; testing-library's own waits keep real timeouts.
-beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('content renders as text', () => {
@@ -117,7 +115,7 @@ describe('share panel', () => {
   it('Copy writes the real password, shows Copied, then reverts', async () => {
     const writeText = vi.fn(async () => {});
     vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     renderCard(shared());
     expect(screen.getByText(PASSWORD_MASK)).toBeTruthy();
     expect(screen.queryByText('real-pass')).toBeNull();

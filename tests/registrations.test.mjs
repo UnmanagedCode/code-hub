@@ -264,7 +264,7 @@ test('registerApp: a conductor id whose recorded tree is gone is refused, and wr
   // snapshot is up to its TTL stale, so a project the conductor still lists
   // may name a directory that no longer exists. Writing a registry entry for
   // it would persist a key naming nothing — unusable, and logged as an
-  // orphaned key on every 2s poll.
+  // orphaned key on every listing.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });
@@ -277,7 +277,7 @@ test('registerApp: a conductor id whose recorded tree is gone is refused, and wr
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'), /ENOENT/);
 
   // And the refusal leaves nothing behind that discovery then complains
-  // about: the orphan-key warning would otherwise fire on every 2s poll.
+  // about: the orphan-key warning would otherwise fire on every listing.
   const warnings = [];
   const orig = console.warn;
   console.warn = (msg) => warnings.push(String(msg));

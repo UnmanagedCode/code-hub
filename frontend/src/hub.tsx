@@ -1,10 +1,11 @@
 // App-level UI state and the actions that change it. Every map is keyed by app
-// id (expansion by project), at this level so it survives polls, re-sorting
-// and a collapsed worktree list.
+// id (expansion by project), at this level so it survives refreshes,
+// re-sorting and a collapsed worktree list.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '@/lib/api';
 import { applyCredSave, planCredSave, stepRequest, type SaveStep } from '@/lib/shareSave';
 import { credDraftFor, pruneDrafts } from '@/lib/shareState';
+import type { SettingsPatch } from '@/lib/settingsForm';
 import { useApps, type AppsFeed } from '@/lib/useApps';
 import type { CredDraft, ShareKind, ShareState, Tunnel } from '@/lib/types';
 
@@ -28,6 +29,8 @@ export interface Hub extends AppsFeed {
   updateDraft: (id: string, patch: Partial<CredDraft>) => void;
   cancelEdit: (id: string) => void;
   saveEdit: (id: string, shared: Tunnel, kind: ShareKind) => Promise<void>;
+  /** PUTs the app's settings, then reloads the listing. Throws to its caller, which shows the error in place. */
+  saveSettings: (id: string, body: SettingsPatch) => Promise<void>;
   dismissError: (id: string) => void;
   toggleExpanded: (project: string) => void;
 }
@@ -144,6 +147,10 @@ export function HubProvider({ children }: { children: ReactNode }) {
       if (result.error) throw result.error;
       setCredEdit((m) => omit(m, id));
     }),
+    saveSettings: async (id: string, body: SettingsPatch) => {
+      await api(appPath(id, 'settings'), json('PUT', body));
+      await refresh();
+    },
     dismissError: (id: string) => setActionError((m) => omit(m, id)),
     toggleExpanded: (project: string) => setExpanded((s) => {
       const next = new Set(s);

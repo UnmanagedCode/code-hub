@@ -18,7 +18,7 @@ export function CredEditForm({ app, shared, kind, draft }: { app: App; shared: T
   const isLan = kind === 'lan';
   const saving = hub.busy[app.id] === 'save';
   const set = (patch: Partial<CredDraft>) => hub.updateDraft(app.id, patch);
-  const check = (key: 'auth' | 'tls' | 'saveAsDefault', label: string) => (
+  const check = (key: 'auth' | 'tls', label: string) => (
     <div className="flex items-center gap-2">
       <Checkbox id={`${ids}-${key}`} checked={!!draft[key]} onCheckedChange={(v) => set({ [key]: v === true })} />
       <Label htmlFor={`${ids}-${key}`} className="font-normal">{label}</Label>
@@ -38,7 +38,7 @@ export function CredEditForm({ app, shared, kind, draft }: { app: App; shared: T
       {isLan && check('tls', 'TLS (HTTPS)')}
       {/* TLS can't flip in place: Save re-shares, so the link, QR and password all regenerate. */}
       {tlsChanging(draft, shared) && (
-        <p className="text-xs text-muted-foreground">{resolveTlsReshareNote(draft.auth, app.shareDefaults)}</p>
+        <p className="text-xs text-muted-foreground">{resolveTlsReshareNote(draft.auth, app.settings)}</p>
       )}
       {credFieldsShown(draft, kind) && (
         <>
@@ -60,7 +60,6 @@ export function CredEditForm({ app, shared, kind, draft }: { app: App; shared: T
               onChange={(e) => set({ password: e.target.value })}
             />
           </div>
-          {check('saveAsDefault', "Also save as this app's default login")}
         </>
       )}
       <div className="flex justify-end gap-2">

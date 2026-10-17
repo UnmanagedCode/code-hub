@@ -138,7 +138,7 @@ test('API responses carry the headers: health 200 and the malformed-JSON 400', a
 // answers plain text with the headers and never echoes the error's message.
 test('an undecodable path param is a text/plain 400 with the headers and no detail', async (t) => {
   const base = await serve(t, await writeDist(await tmpDir(t)));
-  const r = await rawGet(base, '/api/apps/%E0%A4%A/share/defaults');
+  const r = await rawGet(base, '/api/apps/%E0%A4%A/settings');
   assert.equal(r.status, 400);
   assert.match(r.type, /^text\/plain/);
   assert.equal(r.body, 'Bad Request');

@@ -141,6 +141,15 @@ export function metaItems(app: App, now: number): MetaItem[] {
   return items;
 }
 
+/** A card's accessible name. A worktree usually inherits its project's name, so it is told apart by branch (else id). */
+export const cardLabel = (app: Pick<App, 'isWorktree' | 'name' | 'branch' | 'id'>): string =>
+  (app.isWorktree ? `${app.name} — ${app.branch || app.id}` : app.name);
+
+/** The card's notice for a failed boot auto-start, or null. */
+export function autoStartNotice(app: Pick<App, 'autoStartError'>): string | null {
+  return app.autoStartError ? `Auto-start failed: ${app.autoStartError}` : null;
+}
+
 export type ListState = 'loading' | 'error' | 'empty' | 'list';
 
 // `loaded`: a listing has arrived at least once. `error`: the latest load failed.

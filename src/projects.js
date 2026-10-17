@@ -541,7 +541,7 @@ export async function discoverApps() {
     // resolves this id. That is the bootstrap route: `register_app` exists to
     // make a project servable without a `.hub.json`, so the id has to resolve
     // before any registration exists. Registering creates the source, and the
-    // card appears on the next poll.
+    // card appears on the next listing.
     const res = await resolve(name);
     if (!res.source) continue;
     out.push({

@@ -27,10 +27,14 @@ function appendOutput(c, chunk) {
   if (c.output.length > OUTPUT_CAP) c.output = c.output.slice(-OUTPUT_CAP);
 }
 
+// The single exit from 'starting': resolves the child's `settled` promise
+// with the status it settled to, whichever path (readiness, an early exit,
+// a spawn error) got there first.
 function settle(c, status, error = null) {
   if (c.status !== 'starting') return;
   c.status = status;
   c.error = error;
+  c.resolveSettled(status);
 }
 
 // Spawn the manifest's blocking start command in its OWN process group
@@ -43,6 +47,7 @@ function spawnChild(app, port) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0 };
+  c.settled = new Promise((resolve) => { c.resolveSettled = resolve; });
 
   const onData = (d) => appendOutput(c, d.toString());
   proc.stdout.on('data', onData);
@@ -72,8 +77,10 @@ function raceSettle(c, ms) {
   });
 }
 
-// Returns the record fields to persist; readiness runs in the background and
-// updates the in-memory runtime status. If the freshly spawned child dies
+// Returns the record fields to persist, plus `settled` (never persisted): a
+// promise of the status the child leaves 'starting' with — 'ready', or
+// 'crashed' for an exit before readiness or an unconfirmed readiness.
+// Readiness runs in the background and updates the in-memory runtime status. If the freshly spawned child dies
 // almost immediately with EADDRINUSE — the free port `allocatePort()` handed
 // out got claimed by something else before this bind — retry on a new port
 // a bounded number of times before giving up.
@@ -107,7 +114,7 @@ export async function start(app, port, { fixed = false } = {}) {
         (e) => settle(c, 'crashed', e.message),
       );
     }
-    return { pid: c.proc.pid, pgid: c.proc.pid, port, startedAt: new Date().toISOString() };
+    return { pid: c.proc.pid, pgid: c.proc.pid, port, startedAt: new Date().toISOString(), settled: c.settled };
   }
 }
 

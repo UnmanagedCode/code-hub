@@ -10,9 +10,8 @@ export type SaveStep =
   | { kind: 'auth'; body: { enabled: boolean } }
   | { kind: 'creds'; body: CredPatchBody };
 
-// A ticked save-as-default rides on each credentials step (credPatchBody adds
-// the flag). Both LAN paths skip that step when auth is being turned off, which
-// is what keeps a ticked-then-hidden checkbox from writing the default.
+// Both LAN paths skip the credentials step when auth is being turned off: the
+// fields are hidden then, and the PATCH would 400 on an ungated share.
 export function planCredSave(editing: CredDraft, shared: Tunnel, kind: ShareKind): SaveStep[] {
   const steps: SaveStep[] = [];
   const creds = (onlyChanged: boolean) => {

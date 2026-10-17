@@ -16,7 +16,9 @@ import { startAuthProxy } from './authproxy.js';
 import { generateSelfSigned } from './selfsigned.js';
 import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOST_CONDUCTOR_ID } from './hostConductor.js';
 import * as conductorProjects from './conductorProjects.js';
-import * as shareDefaults from './shareDefaults.js';
+import * as appSettings from './appSettings.js';
+import * as autoRun from './autoRun.js';
+import { validateShareOptions } from './shareOptions.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -28,9 +30,8 @@ let store = { apps: {} };
 const proxies = new Map();
 
 // Ids whose live proxy holds the app's stored default password: added when
-// share() seeds from it or a `saveAsDefault` credentials edit writes it;
-// removed by an unflagged password edit or teardownShare. Drives the
-// `passwordIsDefault` flag the UI masks on.
+// share() seeds from it; removed by a password edit or teardownShare. Drives
+// the `passwordIsDefault` flag the UI masks on.
 const defaultPasswordShares = new Set();
 
 // startAuthProxy options for an app's stored default login: only the fields
@@ -52,6 +53,7 @@ function isUnderRoot(root, dir) {
 }
 
 export async function init() {
+  await appSettings.migrateLegacyFile();
   // The ONE awaited conductor call: it lands the project overlay before the
   // first listing, off the request path and bounded by the overlay's own
   // timeout. No-op when standalone; every later refresh is fired lazily by
@@ -258,7 +260,7 @@ function withToken(url, token) {
 // In-memory QR cache keyed by app id. The QR's only inputs are
 // { url, authUrl } (gated → the token URL via `withToken`; ungated/no-auth →
 // the plain `url`), so an entry is reused until one of them changes —
-// share()/creds-edit/auth-toggle — NOT on every list() poll. Lives in memory
+// share()/creds-edit/auth-toggle — NOT on every list() call. Lives in memory
 // like the `proxies` map and is cleared in teardownShare. This is what lets
 // list() recover the QR after a UI refresh (state.share is gone) without
 // re-rendering a QR every few seconds. Used by
@@ -281,7 +283,7 @@ async function cachedQrSvg(id, { url, authUrl }) {
 export async function list() {
   const discovered = await discoverApps();
   const byId = new Map(discovered.map((a) => [a.id, a]));
-  const defaults = await shareDefaults.readAll();
+  const settings = await appSettings.readAll();
   const entries = [];
   let mutated = false;
 
@@ -305,16 +307,16 @@ export async function list() {
       // state.json. rec.tunnel itself holds only non-secret fields. authUrl and
       // qrSvg likewise recover from the live proxy: authUrl is rebuilt from the
       // proxy token, and qrSvg is served from cachedQrSvg (regenerated only on
-      // share/creds-edit/auth-toggle, not per poll) — so a full UI refresh (which
+      // share/creds-edit/auth-toggle, not per listing) — so a full UI refresh (which
       // wipes the client's in-memory state.share) still shows the QR and Open's
       // magic-link. Omitted for a no-auth share (no token path) or a gone proxy.
       // A tailscale funnel that died on its own (OOM kill, a stray kill) leaves
       // a record advertising a public URL that answers nothing — and keeps
       // refusing every other app's tailscale share on behalf of a holder that
-      // holds nothing. Reap it on the poll that notices, before anything is
+      // holds nothing. Reap it on the listing that notices, before anything is
       // built from it. (A LAN share has pid null by design and a cloudflared
       // tunnel is untouched here — only the tailscale slot has a machine-wide
-      // consequence worth a per-poll probe.)
+      // consequence worth a per-listing probe.)
       if (rec.tunnel?.kind === 'tailscale' && !state.pidAlive(rec.tunnel.pid)) {
         teardownShare(base.id, rec); mutated = true;
       }
@@ -389,7 +391,8 @@ export async function list() {
       outOfDate: !!(startedSha && currentSha && startedSha !== currentSha),
       sourceMissing,
       routes,
-      shareDefaults: shareDefaults.describe(defaults[base.id]),
+      settings: appSettings.describe(settings[base.id]),
+      ...autoRun.view(base.id),
       tunnel: tunnelInfo,
       error,
       manifestError,
@@ -457,7 +460,7 @@ export async function start(id) {
       const e = new Error(busy); e.statusCode = 409; throw e;
     }
   }
-  store.apps[id] = {
+  const rec = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
     pid: proc.pid, pgid: proc.pgid, port, fixedPort,
@@ -466,8 +469,25 @@ export async function start(id) {
     startedAt: proc.startedAt,
     tunnel: null,
   };
+  store.apps[id] = rec;
+  // Auto-share applies to a main checkout only, whatever the file says.
+  const autoShareConfig = async () => (!app.isWorktree && (await appSettings.get(id)).autoShare) || null;
+  // A failed read here fails again in the run, which reports it on the card.
+  const wantsAutoShare = await autoShareConfig().then(Boolean, () => true);
   await persist();
-  return store.apps[id];
+  // Every start is tracked, auto-shared or not: a client's settle wait follows
+  // readiness. The auto-share runs once readiness settles and is never awaited
+  // here, so it can neither slow down nor fail this start.
+  const gen = autoRun.begin(id, { autoShare: wantsAutoShare });
+  autoRun.track(id, wantsAutoShare
+    ? autoRun.run({
+      id, gen, settled: proc.settled,
+      isCurrent: () => store.apps[id] === rec && !rec.tunnel,
+      readConfig: autoShareConfig,
+      share: (cfg) => share(id, cfg),
+    })
+    : proc.settled);
+  return rec;
 }
 
 export async function stop(id) {
@@ -478,6 +498,7 @@ export async function stop(id) {
   if (!rec) { const e = new Error(`'${id}' is not running`); e.statusCode = 404; throw e; }
   teardownShare(id, rec);
   runner.stop({ id, pgid: rec.pgid });
+  autoRun.forget(id);
   delete store.apps[id];
   await persist();
   return { id, status: 'stopped' };
@@ -505,34 +526,36 @@ export async function restart(id) {
 //   can exist at a time (409 naming the holder).
 // For a gated share, a fresh token is generated per share; the username and
 // password are the app's stored default share login where set (see
-// shareDefaults.js — each field falls back independently to 'hub' / a random
+// appSettings.js — each field falls back independently to 'hub' / a random
 // password), all kept in memory only for the share (see the `proxies` map).
 // The QR/authUrl carries the token
 // (opening it exchanges the token for an httpOnly session cookie server-side
 // — no credentials ever appear in the URL); username/password remain
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
-export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
-  if (mode !== 'tunnel' && mode !== 'lan' && mode !== 'tailscale') {
-    const e = new Error(`invalid share mode '${mode}' — must be 'tunnel', 'lan' or 'tailscale'`); e.statusCode = 400; throw e;
-  }
-  if (typeof auth !== 'boolean') { const e = new Error("'auth' must be a boolean"); e.statusCode = 400; throw e; }
-  if ((mode === 'tunnel' || mode === 'tailscale') && auth === false) {
-    const e = new Error(`authentication cannot be disabled for ${mode} shares`); e.statusCode = 400; throw e;
-  }
-  if (tls !== undefined && typeof tls !== 'boolean') { const e = new Error("'tls' must be a boolean"); e.statusCode = 400; throw e; }
+//
+// Any successful share, manual or automatic, clears the app's auto-share
+// outcome (a stale "auto-share failed" once the app is shared after all).
+export async function share(id, opts) {
+  const result = await shareNow(id, opts);
+  autoRun.clearShareOutcome(id);
+  return result;
+}
+
+async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
+  ({ mode, auth, tls } = validateShareOptions({ mode, auth, tls }));
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
   if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
   // Read BEFORE the mode branches: the tailscale branch's slot claim must have
   // no await between its check and the claim.
-  const creds = await shareDefaults.get(id);
+  const creds = await appSettings.get(id);
   // Called right after each branch's proxies.set.
   const markDefault = () => { if (creds.password) defaultPasswordShares.add(id); };
 
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
-    const useTls = tls ?? true; // TLS on by default; the UI/API `tls` flag overrides
+    const useTls = tls; // validateShareOptions defaults it to on; the UI/API `tls` flag overrides
     // Self-signed cert covering the LAN IPs + loopback, generated per share and
     // held in memory only (via the proxy) — nothing on disk. Browsers show a
     // one-time "not private" warning (self-signed); documented as a limitation.
@@ -718,33 +741,20 @@ export async function share(id, { mode = 'tunnel', auth = true, tls } = {}) {
 // Edit the active share's Basic-Auth credentials in place — mutates the live
 // proxy (see authproxy.js's setCredentials), so the share URL/token/proxy
 // port never change. Custom creds are per-share-instance only and never touch
-// the app's stored default (share-defaults.json) unless `saveAsDefault` is
-// true: share() always tears down and recreates the proxy, so the next share
-// starts again from the app's default login if one is set, else 'hub' + an
-// auto-generated password. An unflagged password edit ends
-// `passwordIsDefault` for this share.
-//
-// `saveAsDefault: true` also writes the share's resulting login (each blank
-// field = the live value, so an untouched generated password is included) as
-// the app's default, then applies that whole login to the proxy and marks the
-// share `passwordIsDefault` — the live password equals the stored one by
-// construction. The file write happens
-// before the proxy is touched, so a failed write (500) leaves the live login
-// as it was. If the share is replaced during the write, the default stays
-// written (it's what was asked for) but the new/absent share is left alone (409).
-export async function updateShareCredentials(id, { username, password, saveAsDefault } = {}) {
+// the app's stored default login (app-settings.json): share() always tears
+// down and recreates the proxy, so the next share starts again from the app's
+// default login if one is set, else 'hub' + an auto-generated password. A
+// password edit ends `passwordIsDefault` for this share.
+export async function updateShareCredentials(id, { username, password } = {}) {
   const proxy = proxies.get(id);
   if (!proxy) { const e = new Error(`'${id}' has no active share`); e.statusCode = 409; throw e; }
   if (!proxy.auth) {
     const e = new Error(`share for '${id}' has authentication disabled — nothing to edit`); e.statusCode = 400; throw e;
   }
-  if (saveAsDefault !== undefined && typeof saveAsDefault !== 'boolean') {
-    const e = new Error("'saveAsDefault' must be a boolean"); e.statusCode = 400; throw e;
-  }
   const hasUsername = username !== undefined;
   const hasPassword = password !== undefined;
-  if (!hasUsername && !hasPassword && saveAsDefault !== true) {
-    const e = new Error('provide username and/or password to update, or saveAsDefault: true'); e.statusCode = 400; throw e;
+  if (!hasUsername && !hasPassword) {
+    const e = new Error('provide username and/or password to update'); e.statusCode = 400; throw e;
   }
   if (hasUsername && (typeof username !== 'string' || !username.trim())) {
     const e = new Error('username must be a non-empty string'); e.statusCode = 400; throw e;
@@ -752,26 +762,8 @@ export async function updateShareCredentials(id, { username, password, saveAsDef
   if (hasPassword && (typeof password !== 'string' || !password.trim())) {
     const e = new Error('password must be a non-empty string'); e.statusCode = 400; throw e;
   }
-  // Resolved once, before any await: a ticked save writes exactly this and
-  // then applies all of it, so an edit landing during the write is overwritten
-  // (last writer wins) rather than left live under a `passwordIsDefault` flag.
-  const next = {
-    username: hasUsername ? username.trim() : (saveAsDefault ? proxy.username : undefined),
-    password: hasPassword ? password.trim() : (saveAsDefault ? proxy.password : undefined),
-  };
-  if (saveAsDefault) {
-    try {
-      await shareDefaults.update(id, next);
-    } catch (err) {
-      const e = new Error(`saving '${id}'s default share login failed: ${err.message}`); e.statusCode = 500; throw e;
-    }
-    if (proxies.get(id) !== proxy) {
-      const e = new Error(`'${id}'s share ended while its login was being saved as the default`); e.statusCode = 409; throw e;
-    }
-  }
-  proxy.setCredentials(next);
-  if (saveAsDefault) defaultPasswordShares.add(id);
-  else if (hasPassword) defaultPasswordShares.delete(id);
+  proxy.setCredentials({ username: hasUsername ? username.trim() : undefined, password: hasPassword ? password.trim() : undefined });
+  if (hasPassword) defaultPasswordShares.delete(id);
   // The QR encodes the token URL, which is stable across a creds edit (the
   // token/proxy/URL are untouched), so this is a cache hit — but the field is
   // still returned so the caller can fold it back into its share state on the
@@ -819,30 +811,60 @@ export async function unshare(id) {
   return { id, tunnel: null };
 }
 
-// An app's stored default share login (see shareDefaults.js). Get/set 404 an
-// id code-hub doesn't know; clear never does, so an entry orphaned by a
-// removed app can still be deleted.
-async function assertKnownApp(id) {
-  if (Object.hasOwn(store.apps, id) || isHostConductorId(id)) return;
-  if ((await discoverApps()).some((a) => a.id === id)) return;
+// An app's stored settings (see appSettings.js). Get/set 404 an id code-hub
+// doesn't know; clear never does, so an entry orphaned by a removed app can
+// still be deleted. Whether an id is a worktree comes from discovery (else its
+// running record, for a source-removed app) — never from the id's shape.
+async function appKind(id) {
+  if (isHostConductorId(id)) return { hostConductor: true, isWorktree: false };
+  const app = (await discoverApps()).find((a) => a.id === id);
+  if (app) return { hostConductor: false, isWorktree: app.isWorktree };
+  if (Object.hasOwn(store.apps, id)) return { hostConductor: false, isWorktree: !!store.apps[id].isWorktree };
   const e = new Error(`unknown app '${id}'`); e.statusCode = 404; throw e;
 }
 
-const NO_DEFAULTS = { username: null, hasPassword: false };
-
-export async function getShareDefaults(id) {
-  await assertKnownApp(id);
-  return { id, ...(shareDefaults.describe((await shareDefaults.readAll())[id]) ?? NO_DEFAULTS) };
+export async function getAppSettings(id) {
+  await appKind(id);
+  return { id, ...appSettings.describe((await appSettings.readAll())[id]) };
 }
 
-export async function setShareDefaults(id, body) {
-  await assertKnownApp(id);
-  return { id, ...((await shareDefaults.update(id, body)) ?? NO_DEFAULTS) };
+// Auto-start and auto-share act on a project's main checkout only: enabling
+// either for a worktree, or for the host conductor (which code-hub can't
+// start), is refused before anything is written. Clearing them is always
+// allowed, so a hand-edited entry can be cleaned up.
+export async function setAppSettings(id, body) {
+  const kind = await appKind(id);
+  const enables = !!body && typeof body === 'object'
+    && (body.autoStart === true || (body.autoShare !== undefined && body.autoShare !== null));
+  if (enables && (kind.isWorktree || kind.hostConductor)) {
+    const e = new Error(`auto-start and auto-share apply only to a project's main checkout — '${id}' is ${kind.isWorktree ? 'a worktree' : 'the host code-conductor'}`);
+    e.statusCode = 400; throw e;
+  }
+  return { id, ...(await appSettings.update(id, body)) };
 }
 
-export async function clearShareDefaults(id) {
-  await shareDefaults.clear(id);
-  return { id, ...NO_DEFAULTS };
+export async function clearAppSettings(id) {
+  await appSettings.clear(id);
+  return { id, ...appSettings.describe(undefined) };
+}
+
+// Long-poll for a client: resolves when `id`'s start transition (readiness,
+// plus its auto-share) has finished, or at autoRun's cap.
+export function awaitSettled(id) {
+  return autoRun.awaitSettled(id);
+}
+
+// Boot auto-start: every discovered main checkout ticked for it that isn't
+// already running (an adopted app is left alone). Called once code-hub is
+// listening, after init(). An app whose manifest is broken stays a candidate,
+// so its refusal is recorded and shows on its card.
+export async function autoStartAll() {
+  const settings = await appSettings.readAll();
+  const ids = (await discoverApps())
+    .filter((a) => !a.isWorktree && !isHostConductorId(a.id) && settings[a.id]?.autoStart === true)
+    .filter((a) => !(Object.hasOwn(store.apps, a.id) && state.pidAlive(store.apps[a.id].pid)))
+    .map((a) => a.id);
+  return autoRun.bootAutoStart(ids, start);
 }
 
 async function hasManifestFile(dir) {

@@ -28,9 +28,19 @@ export interface Tunnel {
   qrSvg?: string;
 }
 
-export interface ShareDefaults {
+/** A stored auto-share config: the options the share is made with (`tls` LAN only). */
+export interface AutoShare {
+  mode: ShareKind;
+  auth: boolean;
+  tls?: boolean;
+}
+
+/** An app's stored settings (`app.settings`); never carries the password itself. */
+export interface AppSettings {
   username: string | null;
   hasPassword: boolean;
+  autoStart: boolean;
+  autoShare: AutoShare | null;
 }
 
 export interface App {
@@ -49,7 +59,12 @@ export interface App {
   outOfDate: boolean;
   sourceMissing: boolean;
   routes: Route[];
-  shareDefaults: ShareDefaults | null;
+  settings: AppSettings;
+  /** The auto-share after the latest start: in flight, failed (see `autoShareError`), or nothing to report. */
+  autoShareStatus: 'pending' | 'failed' | null;
+  autoShareError: string | null;
+  /** Why the boot auto-start of this app failed, until its next start or stop. */
+  autoStartError: string | null;
   tunnel: Tunnel | null;
   error: string | null;
   manifestError: string | null;
@@ -78,7 +93,6 @@ export type ShareState = { choosing: true } | 'loading' | { error: string } | Tu
 export interface CredDraft {
   username: string;
   password: string;
-  saveAsDefault: boolean;
   auth?: boolean;
   tls?: boolean;
 }

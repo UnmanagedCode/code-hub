@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { applyCredSave, planCredSave, stepRequest, type SaveStep } from './shareSave';
 import type { CredDraft, Tunnel } from './types';
 
-const lanDraft = (over: Partial<CredDraft> = {}): CredDraft => ({ auth: true, tls: true, username: 'hub', password: 'pw', saveAsDefault: false, ...over });
-const credDraft = (over: Partial<CredDraft> = {}): CredDraft => ({ username: 'hub', password: 'pw', saveAsDefault: false, ...over });
+const lanDraft = (over: Partial<CredDraft> = {}): CredDraft => ({ auth: true, tls: true, username: 'hub', password: 'pw', ...over });
+const credDraft = (over: Partial<CredDraft> = {}): CredDraft => ({ username: 'hub', password: 'pw', ...over });
 const LAN: Tunnel = { kind: 'lan', url: 'https://192.0.2.1:5001', auth: true, tls: true, username: 'hub', password: 'pw' };
 const TUNNEL: Tunnel = { kind: 'tunnel', url: 'https://x.trycloudflare.com', auth: true, username: 'hub', password: 'pw' };
 
@@ -36,20 +36,19 @@ describe('planCredSave', () => {
     expect(planCredSave(lanDraft(), LAN, 'lan')).toStrictEqual([]);
   });
 
-  // Invariant: turning LAN auth off sends no creds PATCH, so a ticked (then hidden) save-as-default writes nothing.
-  it('LAN auth off sends no creds step, even with save-as-default ticked', () => {
-    expect(planCredSave(lanDraft({ auth: false, password: 'new', saveAsDefault: true }), LAN, 'lan')).toStrictEqual([
+  // Invariant: turning LAN auth off sends no creds PATCH, even with a typed (then hidden) password.
+  it('LAN auth off sends no creds step', () => {
+    expect(planCredSave(lanDraft({ auth: false, password: 'new' }), LAN, 'lan')).toStrictEqual([
       { kind: 'auth', body: { enabled: false } },
     ]);
   });
 
-  // Invariant: tunnel and tailscale shares only ever PATCH creds, and only when something changed or the box is ticked.
-  it('tunnel and tailscale send creds only when changed or ticked', () => {
+  // Invariant: tunnel and tailscale shares only ever PATCH creds, and only when something changed.
+  it('tunnel and tailscale send creds only when changed', () => {
     for (const kind of ['tunnel', 'tailscale'] as const) {
       const shared = { ...TUNNEL, kind };
       expect(planCredSave(credDraft(), shared, kind)).toStrictEqual([]);
       expect(planCredSave(credDraft({ username: 'bob' }), shared, kind)).toStrictEqual([{ kind: 'creds', body: { username: 'bob' } }]);
-      expect(planCredSave(credDraft({ saveAsDefault: true }), shared, kind)).toStrictEqual([{ kind: 'creds', body: { saveAsDefault: true } }]);
     }
   });
 });
@@ -63,8 +62,8 @@ it('stepRequest: method, path and body per step, with the id encoded', () => {
   expect(stepRequest(id, { kind: 'auth', body: { enabled: false } })).toStrictEqual({
     method: 'PATCH', path: 'api/apps/app%3Aab12cd/share/auth', body: { enabled: false },
   });
-  expect(stepRequest(id, { kind: 'creds', body: { username: 'u', saveAsDefault: true } })).toStrictEqual({
-    method: 'PATCH', path: 'api/apps/app%3Aab12cd/share/credentials', body: { username: 'u', saveAsDefault: true },
+  expect(stepRequest(id, { kind: 'creds', body: { username: 'u' } })).toStrictEqual({
+    method: 'PATCH', path: 'api/apps/app%3Aab12cd/share/credentials', body: { username: 'u' },
   });
 });
 

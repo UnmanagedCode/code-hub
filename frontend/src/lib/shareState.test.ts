@@ -5,6 +5,7 @@ import {
   resolveTlsReshareNote, sharePanelView, shareModes, tlsChanging, qrImageSrc,
 } from './shareState';
 import type { App, ShareState, Tunnel } from './types';
+import { app } from '@/test/fixtures';
 
 // These cover the client behaviors the server tests can't: how the share panel
 // resolves the Open link and QR between the in-memory share response (`s`, the
@@ -170,10 +171,10 @@ test('pruneDrafts: drops drafts for ids no longer listed, keeps the rest', () =>
 });
 
 test('credDraftFor: a default password starts blank (never in the DOM); LAN also carries auth/tls; save-as-default starts unticked', () => {
-  expect(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true }, 'tunnel')).toStrictEqual({ username: 'u', password: '', saveAsDefault: false });
-  expect(credDraftFor({ username: 'u', password: 'gen' }, 'tailscale')).toStrictEqual({ username: 'u', password: 'gen', saveAsDefault: false });
-  expect(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true, auth: true, tls: false }, 'lan')).toStrictEqual({ auth: true, tls: false, username: 'u', password: '', saveAsDefault: false });
-  expect(credDraftFor({ username: null, password: null, auth: false }, 'lan')).toStrictEqual({ auth: false, tls: true, username: '', password: '', saveAsDefault: false });
+  expect(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true }, 'tunnel')).toStrictEqual({ username: 'u', password: '' });
+  expect(credDraftFor({ username: 'u', password: 'gen' }, 'tailscale')).toStrictEqual({ username: 'u', password: 'gen' });
+  expect(credDraftFor({ username: 'u', password: 'real', passwordIsDefault: true, auth: true, tls: false }, 'lan')).toStrictEqual({ auth: true, tls: false, username: 'u', password: '' });
+  expect(credDraftFor({ username: null, password: null, auth: false }, 'lan')).toStrictEqual({ auth: false, tls: true, username: '', password: '' });
 });
 
 test('credFieldsShown: always for tunnel/tailscale; for LAN only while auth is on', () => {
@@ -195,27 +196,29 @@ test('credPasswordPlaceholder: masked hint for a default, keep hint when blank, 
 
 test('credPatchBody: omits blanks; onlyChanged omits unchanged; null when empty', () => {
   const shared = { username: 'u', password: 'p' };
-  expect(credPatchBody({ username: 'u', password: '', saveAsDefault: false }, shared, { onlyChanged: false })).toStrictEqual({ username: 'u' });
-  expect(credPatchBody({ username: 'u', password: 'p', saveAsDefault: false }, shared, { onlyChanged: true })).toStrictEqual(null);
-  expect(credPatchBody({ username: 'v', password: 'p', saveAsDefault: false }, shared, { onlyChanged: true })).toStrictEqual({ username: 'v' });
-  expect(credPatchBody({ username: 'u', password: 'q', saveAsDefault: false }, shared, { onlyChanged: true })).toStrictEqual({ password: 'q' });
-  expect(credPatchBody({ username: '', password: '', saveAsDefault: false }, shared, { onlyChanged: false })).toBe(null);
+  expect(credPatchBody({ username: 'u', password: '' }, shared, { onlyChanged: false })).toStrictEqual({ username: 'u' });
+  expect(credPatchBody({ username: 'u', password: 'p' }, shared, { onlyChanged: true })).toStrictEqual(null);
+  expect(credPatchBody({ username: 'v', password: 'p' }, shared, { onlyChanged: true })).toStrictEqual({ username: 'v' });
+  expect(credPatchBody({ username: 'u', password: 'q' }, shared, { onlyChanged: true })).toStrictEqual({ password: 'q' });
+  expect(credPatchBody({ username: '', password: '' }, shared, { onlyChanged: false })).toBe(null);
 });
 
-test('credPatchBody: a ticked save-as-default always yields a body carrying the flag', () => {
+// Invariant: the live share's Edit never writes the stored login — no body carries saveAsDefault.
+test('credPatchBody: never emits saveAsDefault', () => {
   const shared = { username: 'u', password: 'p' };
-  expect(credPatchBody({ username: 'u', password: 'p', saveAsDefault: true }, shared, { onlyChanged: true })).toStrictEqual({ saveAsDefault: true });
-  expect(credPatchBody({ username: '', password: '', saveAsDefault: true }, shared, { onlyChanged: false })).toStrictEqual({ saveAsDefault: true });
-  expect(credPatchBody({ username: 'v', password: 'p', saveAsDefault: true }, shared, { onlyChanged: true })).toStrictEqual({ username: 'v', saveAsDefault: true });
-  expect(credPatchBody({ username: 'u', password: 'p', saveAsDefault: true }, shared, { onlyChanged: false })).toStrictEqual({ username: 'u', password: 'p', saveAsDefault: true });
+  for (const onlyChanged of [true, false]) {
+    for (const body of [credPatchBody({ username: 'v', password: 'q' }, shared, { onlyChanged }), credPatchBody({ username: 'u', password: 'p' }, shared, { onlyChanged })]) {
+      expect(body && 'saveAsDefault' in body).toBeFalsy();
+    }
+  }
 });
 
 test('resolveTlsReshareNote: the three wordings, keyed on a stored default password', () => {
-  expect(resolveTlsReshareNote(false, { username: null, hasPassword: true })).toBe('Changing TLS re-shares the app — new link & QR.');
-  expect(resolveTlsReshareNote(true, { username: null, hasPassword: true })).toBe("Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).");
+  expect(resolveTlsReshareNote(false, { hasPassword: true })).toBe('Changing TLS re-shares the app — new link & QR.');
+  expect(resolveTlsReshareNote(true, app({ settings: { username: null, hasPassword: true, autoStart: false, autoShare: null } }).settings)).toBe("Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).");
   expect(resolveTlsReshareNote(true, null)).toBe('Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).');
   // Keyed on a stored default PASSWORD: a username-only default still gets a random password on re-share.
-  expect(resolveTlsReshareNote(true, { username: 'u', hasPassword: false })).toBe(resolveTlsReshareNote(true, null));
+  expect(resolveTlsReshareNote(true, { hasPassword: false })).toBe(resolveTlsReshareNote(true, null));
 });
 
 test('mergeSharePatch carries passwordIsDefault', () => {
@@ -230,7 +233,8 @@ test('mergeSharePatch carries passwordIsDefault', () => {
 // --- sharePanelView: what the panel shows, in the precedence the panel renders ---
 
 const LIVE: Tunnel = { kind: 'tunnel', url: 'https://x.trycloudflare.com', auth: true, username: 'hub', password: 'pw', authUrl: 'https://x.trycloudflare.com/?__hubauth=T', qrSvg: '<svg>live</svg>' };
-const appWith = (tunnel: Tunnel | null, port?: number): Pick<App, 'tunnel' | 'port'> => ({ tunnel, port });
+const appWith = (tunnel: Tunnel | null, port?: number, auto: Pick<App, 'autoShareStatus' | 'autoShareError'> = { autoShareStatus: null, autoShareError: null }) =>
+  ({ tunnel, port, ...auto });
 
 // Invariant: the picker beats everything, then a share in flight, then a failed share — even over a
 // live app.tunnel, so the failure is seen — then nothing, and only then the live share.
@@ -240,6 +244,19 @@ test('sharePanelView: choosing > loading > error (over a live tunnel) > none > a
   expect(sharePanelView({ error: 'boom' }, appWith(LIVE), false)).toStrictEqual({ view: 'error', error: 'boom' });
   expect(sharePanelView(undefined, appWith(null), false)).toStrictEqual({ view: 'none' });
   expect(sharePanelView(undefined, appWith(LIVE), false).view).toBe('active');
+});
+
+// Invariant: the panel shows an auto-share in flight or its failure only while nothing better applies — a live
+// share wins over a failed auto-share, and a client-side share failure wins over a pending one.
+test('sharePanelView: autoPending and autoFailed precedence', () => {
+  const pending = { autoShareStatus: 'pending' as const, autoShareError: null };
+  const failed = { autoShareStatus: 'failed' as const, autoShareError: 'funnel held' };
+  expect(sharePanelView(undefined, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'autoPending' });
+  expect(sharePanelView(undefined, appWith(null, undefined, failed), false)).toStrictEqual({ view: 'autoFailed', error: 'funnel held' });
+  expect(sharePanelView(undefined, appWith(LIVE, undefined, failed), false).view).toBe('active');
+  expect(sharePanelView({ error: 'boom' }, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'error', error: 'boom' });
+  expect(sharePanelView('loading', appWith(null, undefined, failed), false)).toStrictEqual({ view: 'loading' });
+  expect(sharePanelView({ choosing: true }, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'choosing' });
 });
 
 // Invariant: the share response alone (no app.tunnel yet) is enough to show the live share, and its
@@ -304,7 +321,7 @@ test('shareModes: order, and a reason exactly when a mode is unavailable', () =>
 
 // Invariant: only a LAN draft whose TLS differs from the live share's (absent = on) is a TLS change.
 test('tlsChanging: a LAN draft differing from the live TLS; never a draft without tls', () => {
-  const draft = (tls?: boolean) => ({ username: '', password: '', saveAsDefault: false, ...(tls === undefined ? {} : { auth: true, tls }) });
+  const draft = (tls?: boolean) => ({ username: '', password: '', ...(tls === undefined ? {} : { auth: true, tls }) });
   expect(tlsChanging(draft(true), { tls: true })).toBe(false);
   expect(tlsChanging(draft(false), { tls: true })).toBe(true);
   expect(tlsChanging(draft(true), { tls: false })).toBe(true);

@@ -20,7 +20,7 @@ export const fakeCloudflaredBin = path.join(FIXTURES, 'fake-cloudflared.mjs');
 
 // Tailscale is genuinely installed and Running on some dev machines, so every
 // test that boots the server must inject this — otherwise list() shells out to
-// the real binary on every poll and `tailscaleAvailable` becomes host-dependent.
+// the real binary on every listing and `tailscaleAvailable` becomes host-dependent.
 export const fakeTailscaleBin = path.join(FIXTURES, 'fake-tailscale.mjs');
 
 // A detached stand-in for an orphaned tailscale funnel. Deliberately the REAL

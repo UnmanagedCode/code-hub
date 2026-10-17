@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { controlsFor, groupApps, listView, metaItems, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
+import { autoStartNotice, controlsFor, groupApps, listView, metaItems, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
 import { app } from '@/test/fixtures';
 
 const ids = (list: { id: string }[]) => list.map((a) => a.id);
+
+// Invariant: a failed boot auto-start is announced on the card with its reason; otherwise nothing is.
+it('autoStartNotice: the failure text, or null', () => {
+  expect(autoStartNotice(app({ autoStartError: 'port 3000 is busy' }))).toBe('Auto-start failed: port 3000 is busy');
+  expect(autoStartNotice(app())).toBe(null);
+});
 
 describe('sortApps', () => {
   const a = app({ id: 'a', name: 'Zed', status: 'stopped', lastCommitAt: '2026-01-01T00:00:00Z' });
