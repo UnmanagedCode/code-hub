@@ -14,7 +14,7 @@ const ctx = vm.createContext({});
 const script = new vm.Script('found = false; for (const t of slices) if (re.test(t)) { found = true; break; }');
 
 // Parse the quantifier starting at source[i]; returns { end, repeats } or null.
-// `?`, `{n}` and `{0,1}` are not repeating; an unparseable `{` is a literal.
+// `?`, `{n}`, `{0,1}` and `{1,1}` are not repeating; an unparseable `{` is a literal.
 function quantifierAt(source, i) {
   let end = i;
   let repeats;
