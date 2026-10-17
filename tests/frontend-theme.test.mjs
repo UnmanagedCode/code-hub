@@ -101,7 +101,7 @@ test('the literal-colour pattern: what it catches and what it lets through', () 
 
 // Set on <html> by cc's plugin bridge (/pluginBridge.js) when embedded and unset standalone, so every use needs a fallback.
 const HOST_PROPS = new Set(['--cc-session-width']);
-// The `var(--x…)` heads in one own frontend file's source that neither name a declared token nor a host property given a fallback.
+// The `var(--x…)` heads in a single own frontend file that neither name a declared token nor a host property given a fallback.
 const badVars = (src, tokens) => [...strip(src).matchAll(/var\(\s*(--[\w-]+)\s*(,)?/g)]
   .filter(([, name, comma]) => !(tokens.has(name) || (HOST_PROPS.has(name) && comma)))
   .map(([head]) => head);

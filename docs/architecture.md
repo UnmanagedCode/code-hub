@@ -88,7 +88,7 @@ frontend/
   src/
     main.tsx  App.tsx   App = HubProvider around Header, Toolbar, AppList and the "updated" footer
     hub.tsx             app-level UI state and the actions that change it (I/O)
-    index.css           the recipe's block verbatim; imports cc-theme-fallback.css
+    index.css           the recipe's block verbatim, plus a `@source not` that keeps test files out of Tailwind's scan; imports cc-theme-fallback.css
     components/         AppCard (+ OrphanCard), AppControls, AppList, CopyButton, CredEditForm,
                         ExternalLink, Header, QrDialog, RouteList, SharePanel, Toolbar
     components/ui/      copied from code-conductor's web/src/components/ui, one file per component used
