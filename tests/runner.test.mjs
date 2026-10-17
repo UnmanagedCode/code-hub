@@ -45,6 +45,19 @@ test('readyWhen regex drives readiness from stdout', async (t) => {
   await waitFor(() => !pidAlive(rec.pgid));
 });
 
+test('readyWhen matches a ready line split across two output chunks', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd('split') });
+  const app = { id: 'rwsplit', path: dir, manifest: { start: fakeAppCmd('split'), healthPath: null, readyWhen: 'listening on \\d+' } };
+
+  const port = await allocatePort();
+  const rec = await runner.start(app, port);
+  await waitFor(() => runner.runtime('rwsplit')?.status === 'ready');
+  runner.stop({ id: 'rwsplit', pgid: rec.pgid });
+  await waitFor(() => !pidAlive(rec.pgid));
+});
+
 test('a start command that exits immediately is reported crashed with a tail', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));

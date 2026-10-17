@@ -16,6 +16,12 @@
 //                 where a fixed-port LAN share CANNOT take the app's port (a
 //                 wildcard bind conflicts with a specific-address bind on the same
 //                 port), so the gated share falls back to a free one.
+//   split       → same as default, but the ready line arrives in two writes
+//                 ("listen" now, "ing on <port>" 600ms later) so a readiness
+//                 check sees the first half alone on at least one poll tick.
+//   backtrack   → prints 32 'a's and a '!' before binding, then behaves as
+//                 default. Output that makes a pattern like (a|a)+$ take
+//                 tens of seconds per unprotected check.
 import http from 'node:http';
 
 if (process.env.FAKE_APP_MODE === 'crash') {
@@ -41,8 +47,14 @@ if (process.env.FAKE_APP_MODE === 'flaky') {
 const port = Number(process.env.PORT);
 const host = process.env.FAKE_APP_MODE === 'wildcard' ? '0.0.0.0' : '127.0.0.1';
 const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok'); });
+if (process.env.FAKE_APP_MODE === 'backtrack') console.log('a'.repeat(32) + '!');
 server.listen(port, host, () => {
-  console.log(`listening on ${port}`);
+  if (process.env.FAKE_APP_MODE === 'split') {
+    process.stdout.write('listen');
+    setTimeout(() => console.log(`ing on ${port}`), 600);
+  } else {
+    console.log(`listening on ${port}`);
+  }
 });
 
 // Keep the process alive and exit cleanly on SIGTERM so process-group kill is

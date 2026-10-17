@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as conductorProjects from './conductorProjects.js';
+import { readyWhenProblem } from './readyWhen.js';
 
 // Default projects root = parent directory of the code-hub repo, resolved
 // once at module load. Layout: <parent>/code-hub/src/projects.js →
@@ -227,6 +228,10 @@ export function validateManifestObject(obj, file = MANIFEST_FILENAME) {
     if (obj[key] != null && typeof obj[key] !== 'string') {
       throw new Error(`${file}: "${key}" must be a string`);
     }
+  }
+  if (obj.readyWhen != null) {
+    const problem = readyWhenProblem(obj.readyWhen);
+    if (problem) throw new Error(`${file}: "readyWhen" ${problem}`);
   }
   if (obj.port != null) {
     if (!Number.isInteger(obj.port) || obj.port < 1024 || obj.port > 65535) {

@@ -45,7 +45,7 @@ Place a `.hub.json` at a project's root to make it servable:
 ```
 
 - `start` must **bind `$PORT`** (injected by code-hub — a free port, or the manifest's `port` when set) and **stay up until killed**. code-hub launches it via `bash -lc` in its own process group; there is no separate stop command — code-hub stops the app by killing that group (SIGTERM, then SIGKILL after a 3s grace period).
-- **Readiness**: `readyWhen` (stdout/stderr regex) → else `healthPath` (any HTTP response) → else a default TCP connect probe on `$PORT`. Bounded to 30s; on timeout the app stays running but is flagged readiness-unconfirmed.
+- **Readiness**: `readyWhen` (stdout/stderr regex) → else `healthPath` (any HTTP response) → else a default TCP connect probe on `$PORT`. Bounded to 30s; on timeout the app stays running but is flagged readiness-unconfirmed. `readyWhen` is matched against a bounded window under a time limit, and nested-quantifier patterns are rejected at load — see `docs/protocol.md`.
 
 ## Machine-local registration (no `.hub.json` needed)
 

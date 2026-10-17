@@ -10,6 +10,7 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { qrSvg } from '../src/qr.js';
 import { storeRoot } from '../src/projects.js';
+import { READY_MATCH_DEADLINE_MS } from '../src/readyWhen.js';
 import net from 'node:net';
 import { localIPv4s } from '../src/net.js';
 import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, spawnFakeFunnel, tailscaleEvents, funnelEvents, pidAlive, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
@@ -121,6 +122,34 @@ test('a crashed app keeps manifestError null and can be restarted from the UI', 
   // restart isn't blocked by the crash tail
   res = await j(base, 'POST', '/api/apps/app/start');
   assert.equal(res.status, 200);
+});
+
+test('a pathological readyWhen leaves /api/health responsive and fails readiness with a named deadline error', async (t) => {
+  const root = await mkRoot();
+  await mkProject(root, 'app', { start: fakeAppCmd('backtrack'), readyWhen: '(a|a)+$' });
+  const { server, base } = await boot(root);
+  t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
+
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 200);
+
+  const MAX_STALL_MS = READY_MATCH_DEADLINE_MS + 500;
+  let maxLatency = 0;
+  let app;
+  const until = Date.now() + 10000;
+  while (Date.now() < until) {
+    const t0 = Date.now();
+    const health = await fetch(base + '/api/health');
+    maxLatency = Math.max(maxLatency, Date.now() - t0);
+    assert.equal(health.status, 200);
+    app = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'app');
+    if (app.status === 'crashed') break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.equal(app.status, 'crashed');
+  assert.ok(app.error.includes('(a|a)+$'), app.error);
+  assert.match(app.error, /readyWhen .*deadline.*stopped/);
+  assert.ok(maxLatency < MAX_STALL_MS, `health stalled ${maxLatency}ms`);
 });
 
 test('unknown app id → 404, and share on a stopped app → 409', async (t) => {

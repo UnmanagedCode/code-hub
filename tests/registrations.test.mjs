@@ -132,6 +132,18 @@ test('registerApp: rejects an out-of-range port, naming the range', async (t) =>
   await assert.rejects(() => fs.readFile(registryFile(), 'utf8'));
 });
 
+test('registerApp: rejects a nested-quantifier readyWhen and writes nothing', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'tool', null);
+
+  await assert.rejects(
+    () => appManager.registerApp({ id: 'tool', start: 'npm start', readyWhen: '(a+)+$' }),
+    /register_app:tool: "readyWhen" nests a repeating quantifier/,
+  );
+  await assert.rejects(() => fs.readFile(registryFile(), 'utf8'));
+});
+
 test('a registry entry\'s fixed port is stripped from that project\'s worktrees', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
