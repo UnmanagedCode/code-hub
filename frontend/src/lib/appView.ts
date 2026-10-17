@@ -89,8 +89,9 @@ export interface Controls {
 }
 
 // Stop and Restart are absent on an always-on app (the host conductor). Share
-// waits while the app is starting or an auto-share is running: the backend
-// takes one share per app at a time, and the auto-share is about to be it.
+// waits while the app is starting — it isn't listening yet, so a share would
+// hand out a dead link — and while its auto-share is running: the backend runs
+// one share operation per app at a time, and the auto-share is about to be it.
 export function controlsFor(app: App, busy: boolean): Controls {
   const running = app.status === 'starting' || app.status === 'ready' || app.status === 'running';
   if (!running) {

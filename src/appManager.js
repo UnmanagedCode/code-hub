@@ -28,6 +28,8 @@ let store = { apps: {} };
 // Live auth-proxy handles, keyed by app id. In-memory only: the password and
 // the proxy server never survive a code-hub restart (see init teardown).
 const proxies = new Map();
+// proxy → the running record it was committed for (see teardownShare).
+const proxyOwner = new WeakMap();
 
 // Ids whose live proxy holds the app's stored default password: added when
 // share() seeds from it; removed by a password edit or teardownShare. Drives
@@ -60,6 +62,14 @@ export async function init() {
   // discovery and never awaited.
   await conductorProjects.refresh();
   store = await state.load();
+  // Every record is a fresh object now, so no in-process share state can
+  // belong to one: close it all (teardownShare is record-scoped and would
+  // skip a proxy committed for a record object that no longer exists). Empty
+  // on a real boot; only a re-run init() in one process finds anything.
+  for (const proxy of proxies.values()) proxy.close();
+  proxies.clear();
+  defaultPasswordShares.clear();
+  qrCache.clear();
   // reconcile drops records whose app pid is dead — which, for an app that
   // died in the same window code-hub did, would delete the only record of a
   // still-running share child. It hands those back instead of stranding them
@@ -208,13 +218,20 @@ function killShareChild(id, t, { verify = false } = {}) {
 // be exiting afterwards — which matters only for tailscale, where a lingering
 // exit would revert the node's serve config: `expiringFunnelPid` records it
 // and the next tailscale share waits for it.
+//
+// Record-scoped: the live proxy (and the id-keyed state that describes it) is
+// touched only when it belongs to `rec`, so a caller holding a stopped or
+// replaced record can never close the share of the record that replaced it.
+// `rec` undefined means "no record left": whatever proxy remains is an orphan.
 function teardownShare(id, rec, opts) {
   const proxy = proxies.get(id);
-  if (proxy) { proxy.close(); proxies.delete(id); }
-  defaultPasswordShares.delete(id);
+  if (!proxy || !rec || proxyOwner.get(proxy) === rec) {
+    if (proxy) { proxy.close(); proxies.delete(id); }
+    defaultPasswordShares.delete(id);
+    qrCache.delete(id);
+  }
   if (rec?.tunnel) killShareChild(id, rec.tunnel, opts);
   if (rec) rec.tunnel = null;
-  qrCache.delete(id);
 }
 
 // Free the slot when the funnel it names has died on its own (an OOM kill, a
@@ -240,7 +257,7 @@ function tailscaleUnavailable() {
 function funnelBlockedBy(id) {
   reapFunnelSlot();
   if (!funnelSlot) return null;
-  if (funnelSlot.pending) return funnelSlot.id; // blocks everyone, its own app included
+  if (funnelSlot.pending) return funnelSlot.id; // blocks everyone (its own app can't get here: share() serialises an app's shares)
   return funnelSlot.id === id ? null : funnelSlot.id;
 }
 
@@ -539,14 +556,18 @@ export async function restart(id) {
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
 //
-// ONE share operation per running record at a time: a second share() of the
-// same record while one is in flight is refused with 409 rather than queued,
-// whoever the callers are (UI, auto-share, MCP, another tab). Two in flight
-// would each start a proxy and a child, and the loser would be held by
-// nothing unshare/stop/the sweep can reach. A share still in flight for a
-// record that has since been stopped or replaced doesn't block the new one:
-// it re-checks the record after every await and, finding it gone, tears down
-// what it started and 409s instead of committing.
+// ONE share operation per app at a time, whoever the callers are (the UI,
+// another tab, an auto-share after a start — there is no MCP share tool), since two in flight would each
+// start a proxy and a child and the loser would be held by nothing
+// unshare/stop/the sweep can reach:
+// - a second share of the same running record while one is in flight is
+//   refused with 409, not queued;
+// - a share for a NEW record (the app was restarted) waits for an in-flight
+//   share of the stopped or replaced record to finish — that one can no longer
+//   commit — so the new record's share, an auto-share included, isn't refused
+//   on behalf of a share that is about to be abandoned.
+// A share that is stopped, replaced, or unshared (see unshare) while in flight
+// tears down what it started and 409s instead of committing.
 //
 // Any successful share, manual or automatic, clears the app's auto-share
 // outcome (a stale "auto-share failed" once the app is shared after all).
@@ -556,41 +577,54 @@ export async function share(id, opts) {
   return result;
 }
 
-// id → the running record a share() is in flight for (see share()).
+// id → the share in flight: { rec, cancelled, done } (see share()).
 const sharing = new Map();
 
-function replacedWhileSharing(id) {
-  const e = new Error(`'${id}' was stopped or replaced while its share was starting — share it again`);
+function abandoned(id, op) {
+  const e = new Error(op.cancelled
+    ? `'${id}''s share was cancelled by an unshare while it was starting`
+    : `'${id}' was stopped or replaced while its share was starting — share it again`);
   e.statusCode = 409;
   return e;
 }
 
 async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
   ({ mode, auth, tls } = validateShareOptions({ mode, auth, tls }));
-  const rec = store.apps[id];
-  const alwaysOn = isHostConductorId(id);
-  if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
-  if (sharing.get(id) === rec) {
-    const e = new Error(`'${id}' already has a share starting — wait for it to finish before sharing again`); e.statusCode = 409; throw e;
-  }
-  sharing.set(id, rec);
-  try {
-    return await shareRecord(id, rec, { mode, auth, tls });
-  } finally {
-    if (sharing.get(id) === rec) sharing.delete(id);
+  for (;;) {
+    const rec = store.apps[id];
+    const alwaysOn = isHostConductorId(id);
+    if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
+    const inFlight = sharing.get(id);
+    if (inFlight?.rec === rec) {
+      const e = new Error(`'${id}' already has a share starting — wait for it to finish before sharing again`); e.statusCode = 409; throw e;
+    }
+    if (inFlight) {
+      await inFlight.done.catch(() => {}); // a stopped/replaced record's share, being abandoned
+      continue;
+    }
+    const op = { rec, cancelled: false, done: null };
+    sharing.set(id, op); // before shareRecord's first await
+    op.done = shareRecord(id, op, { mode, auth, tls });
+    try {
+      return await op.done;
+    } finally {
+      if (sharing.get(id) === op) sharing.delete(id);
+    }
   }
 }
 
-// The body of a share of `rec`. Every await is followed by a check that
-// `rec` is still the app's record before anything shared is touched, and the
-// commit (proxies.set, rec.tunnel) follows its last check with no await in
-// between.
-async function shareRecord(id, rec, { mode, auth, tls }) {
-  const isCurrent = () => store.apps[id] === rec;
+// The body of a share of `op.rec`. Each commit (proxies.set, rec.tunnel)
+// follows a `committable()` check with no await in between, and that check
+// comes after the last await that can have created a listener or a child — so
+// a share abandoned meanwhile closes what it started instead of committing.
+// Teardown of a previous share is record-scoped (see teardownShare), so an
+// abandoned share running it touches nothing of a newer record's.
+async function shareRecord(id, op, { mode, auth, tls }) {
+  const { rec } = op;
+  const committable = () => store.apps[id] === rec && !op.cancelled;
   // Read BEFORE the mode branches: the tailscale branch's slot claim must have
   // no await between its check and the claim.
   const creds = await appSettings.get(id);
-  if (!isCurrent()) throw replacedWhileSharing(id);
   // Called right after each branch's proxies.set.
   const markDefault = () => { if (creds.password) defaultPasswordShares.add(id); };
 
@@ -656,8 +690,9 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
       }
     }
     if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
-    if (!isCurrent()) { proxy.close(); throw replacedWhileSharing(id); }
+    if (!committable()) { proxy.close(); throw abandoned(id, op); }
     proxies.set(id, proxy);
+    proxyOwner.set(proxy, rec);
     markDefault();
     const scheme = useTls ? 'https' : 'http';
     // Drop the loopback entry — it's not reachable from another device, and in
@@ -685,9 +720,8 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
       // "tailscale isn't available" is the more actionable message when both
       // are true, so it is reported in preference to the 409.
       if (!(await tailscale.available())) throw tailscaleUnavailable();
-      const e = new Error(blocker === id
-        ? `'${id}' already has a tailscale share starting — wait for it to come up before sharing again`
-        : `'${blocker}' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide, so only one is possible at a time; unshare it first`);
+      // Always another app's: shares of one app run one at a time (share()).
+      const e = new Error(`'${blocker}' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide, so only one is possible at a time; unshare it first`);
       e.statusCode = 409; throw e;
     }
     // Claim the slot SYNCHRONOUSLY — no await between the check above and
@@ -697,7 +731,6 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
     let committed = false;
     try {
       if (!(await tailscale.available())) throw tailscaleUnavailable();
-      if (!isCurrent()) throw replacedWhileSharing(id);
       teardownShare(id, rec); // replace any existing share
 
       // A funnel still shutting down reverts the node's WHOLE serve config
@@ -727,13 +760,14 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
       // referenced by nothing, so unshare/stop cannot reach it, never persisted
       // so a restart loses it entirely, and — being alive — never reaped by
       // funnelBlockedBy, which would 409 every future share on every app.
-      if (!isCurrent()) {
+      if (!committable()) {
         tailscale.stopFunnel(pid);
         expiringFunnelPid = pid;
         proxy.close();
-        throw replacedWhileSharing(id);
+        throw abandoned(id, op);
       }
       proxies.set(id, proxy);
+      proxyOwner.set(proxy, rec);
       markDefault();
       rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
       funnelSlot = { id, pid, pending: false };
@@ -761,7 +795,6 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
   }
-  if (!isCurrent()) throw replacedWhileSharing(id);
   teardownShare(id, rec); // replace any existing share
 
   const proxy = await startAuthProxy(rec.port, credOpts(creds));
@@ -772,12 +805,13 @@ async function shareRecord(id, rec, { mode, auth, tls }) {
     proxy.close(); // don't leak the proxy if the tunnel failed to come up
     throw e;
   }
-  if (!isCurrent()) {
+  if (!committable()) {
     tunnel.stopTunnel(pid);
     proxy.close();
-    throw replacedWhileSharing(id);
+    throw abandoned(id, op);
   }
   proxies.set(id, proxy);
+  proxyOwner.set(proxy, rec);
   markDefault();
   rec.tunnel = { kind: 'tunnel', url, pid, proxyPort: proxy.port, auth: true };
   await persist();
@@ -853,8 +887,12 @@ export async function setShareAuth(id, enabled) {
   return { id, auth: enabled, qrSvg: qr };
 }
 
+// Also cancels a share of the current record still in flight: it would
+// otherwise commit right after this answered, leaving the app shared.
 export async function unshare(id) {
   const rec = store.apps[id];
+  const inFlight = sharing.get(id);
+  if (rec && inFlight?.rec === rec) inFlight.cancelled = true;
   if (rec?.tunnel || proxies.has(id)) { teardownShare(id, rec); await persist(); }
   return { id, tunnel: null };
 }

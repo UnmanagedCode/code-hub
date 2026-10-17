@@ -4,12 +4,13 @@ import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import path from 'node:path';
+import net from 'node:net';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import * as autoRun from '../src/autoRun.js';
 import { storeRoot } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, tailscaleEvents, funnelEvents } from './helpers.mjs';
 
 // End-to-end auto-share over HTTP: a fake app, fake cloudflared and fake
 // tailscale (env-injected), and the GET …/settled long-poll as the only wait.
@@ -90,6 +91,7 @@ test('restarting a ticked, shared app shares it again', async (t) => {
   const again = await getApp(base);
   assert.equal(again.tunnel?.kind, 'tunnel');
   assert.notEqual(again.tunnel.proxyPort, first.tunnel.proxyPort);
+  assert.notEqual(again.tunnel.url, first.tunnel.url); // each fake tunnel child's URL is its own
 });
 
 // Invariant: every start path auto-shares, the MCP start_app tool included.
@@ -381,4 +383,155 @@ test('list()\'s prune of a dead adopted app clears its automation state', async 
   const after = (await appManager.list()).apps.find((a) => a.id === 'adopted');
   assert.equal(after.status, 'stopped');
   assert.deepEqual([after.autoShareStatus, after.autoShareError, after.autoStartError], [null, null, null]);
+});
+
+// --- Shares abandoned in flight (round 2) ---
+
+function gatedTailscale(t, root) {
+  const gate = path.join(root, '.tailscale-gate');
+  const log = path.join(root, '.tailscale-argv');
+  process.env.FAKE_TAILSCALE_GATE = gate;
+  process.env.FAKE_TAILSCALE_ARGV_LOG = log;
+  t.after(async () => {
+    await fs.writeFile(gate, '').catch(() => {});
+    delete process.env.FAKE_TAILSCALE_GATE;
+    delete process.env.FAKE_TAILSCALE_ARGV_LOG;
+  });
+  return { open: () => fs.writeFile(gate, ''), funnels: async (event) => funnelEvents(await tailscaleEvents(log), event) };
+}
+
+// Hold the next read of app-settings.json — the first await of a share — until
+// released, and record every server that starts listening from then on.
+function holdShareAtSettingsRead(t) {
+  const file = appSettings.appSettingsFile();
+  const realRead = fs.readFile;
+  const realListen = net.Server.prototype.listen;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  const servers = [];
+  fs.readFile = async (p, ...rest) => {
+    if (armed && p === file) { armed = false; reached(); await gate; }
+    return realRead.call(fs, p, ...rest);
+  };
+  net.Server.prototype.listen = function (...args) { servers.push(this); return realListen.apply(this, args); };
+  t.after(() => { release(); fs.readFile = realRead; net.Server.prototype.listen = realListen; });
+  return { parked, release, listening: () => servers.filter((srv) => srv.listening) };
+}
+
+const status401 = async (port) => (await fetch(`http://127.0.0.1:${port}/`)).status;
+
+// Invariant: a Restart while a tailscale auto-share is still bringing its
+// funnel up ends with the NEW process shared — the new share waits for the
+// abandoned one instead of being refused on its behalf — and the old funnel is
+// gone.
+test('Restart during a tailscale auto-share ends shared via the new process, with no failure', async (t) => {
+  quiet(t);
+  const { root, base } = await boot(t);
+  const ts = gatedTailscale(t, root);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale' } });
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => (await ts.funnels('invoke')).length === 1); // the first funnel is coming up, held
+  assert.equal((await j(base, 'POST', '/api/apps/app/restart')).status, 200);
+  await ts.open();
+  assert.deepEqual((await settled(base)).body, { id: 'app', settled: true });
+  const app = await getApp(base);
+  assert.ok(['ready', 'running'].includes(app.status));
+  assert.equal(app.tunnel?.kind, 'tailscale');
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(app.autoShareError, null);
+  const invoked = await ts.funnels('invoke');
+  assert.equal(invoked.length, 2);
+  await waitFor(async () => (await ts.funnels('exit')).some((e) => e.pid === invoked[0].pid));
+});
+
+// Invariant: a LAN share whose app is stopped while it starts commits nothing:
+// it answers 409, no proxy it started is left listening, and no share is
+// recorded.
+test('a LAN share whose app is stopped while it starts leaves no proxy and no share', async (t) => {
+  const { base } = await boot(t);
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const hold = holdShareAtSettingsRead(t);
+  const sharing = j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  await hold.parked;
+  assert.equal((await j(base, 'POST', '/api/apps/app/stop')).status, 200);
+  hold.release();
+  const res = await sharing;
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /stopped or replaced while its share was starting/);
+  assert.equal(res.body.url, undefined);
+  assert.deepEqual(hold.listening(), []);
+  const app = await getApp(base);
+  assert.equal(app.status, 'stopped');
+  assert.equal(app.tunnel, null);
+});
+
+// Invariant: a LAN share whose app is replaced (restarted) while it starts
+// commits nothing, and the new process's own share — queued behind it — goes
+// ahead untouched: the only proxy left listening is the new share's, and it
+// gates.
+test('a LAN share abandoned by a restart leaves the new process\'s share alone', async (t) => {
+  const { base } = await boot(t);
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const hold = holdShareAtSettingsRead(t);
+  const stale = j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  await hold.parked;
+  assert.equal((await j(base, 'POST', '/api/apps/app/restart')).status, 200);
+  const fresh = j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  hold.release();
+  const [a, b] = [await stale, await fresh];
+  assert.equal(a.status, 409);
+  assert.equal(b.status, 200);
+  const app = await getApp(base);
+  assert.equal(app.tunnel?.kind, 'lan');
+  assert.equal(app.tunnel.url, b.body.url);
+  assert.deepEqual(hold.listening().map((srv) => srv.address().port), [app.tunnel.proxyPort]);
+  assert.equal(await status401(app.tunnel.proxyPort), 401);
+});
+
+// Invariant: a share that finds its record replaced never touches the share
+// of the record that replaced it — here a tunnel share abandoned by a restart,
+// with the new process shared over LAN meanwhile: the LAN share stays live and
+// gated, and the abandoned share's tunnel child is killed.
+test('a tunnel share abandoned by a restart kills its child and leaves the new record\'s share live', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const stale = j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel' });
+  await waitFor(async () => (await cf.pids()).length === 1);
+  const [child] = await cf.pids();
+  assert.equal((await j(base, 'POST', '/api/apps/app/restart')).status, 200);
+  const fresh = j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  await cf.open();
+  const [a, b] = [await stale, await fresh];
+  assert.equal(a.status, 409);
+  assert.equal(b.status, 200);
+  await waitFor(() => !pidAlive(child));
+  const app = await getApp(base);
+  assert.equal(app.tunnel?.kind, 'lan');
+  assert.equal(await status401(app.tunnel.proxyPort), 401);
+  assert.equal((await cf.pids()).length, 1);
+});
+
+// Invariant: an Unshare that lands while a share is still starting cancels it:
+// the app doesn't end up shared after the Unshare, and the share's child dies.
+test('Unshare during an in-flight share cancels it: no share afterwards, no child left', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const sharing = j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel' });
+  await waitFor(async () => (await cf.pids()).length === 1);
+  const [child] = await cf.pids();
+  assert.deepEqual((await j(base, 'DELETE', '/api/apps/app/share')).body, { id: 'app', tunnel: null });
+  await cf.open();
+  const res = await sharing;
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /cancelled by an unshare/);
+  await waitFor(() => !pidAlive(child));
+  assert.equal((await getApp(base)).tunnel, null);
+  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false })).status, 200); // nothing left holding the slot
 });

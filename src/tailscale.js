@@ -10,13 +10,18 @@ function bin() {
 
 const START_TIMEOUT_MS = 15000;
 const EXIT_TIMEOUT_MS = 5000;
+// Bound on `tailscale status`: a share holds its app's one share slot while it
+// waits on this, so a wedged CLI must cost an "unavailable", not a slot held
+// forever.
+export const PROBE_TIMEOUT_MS = 5000;
 
 // `tailscale status --json`, parsed — or null if the binary is missing, the
-// daemon isn't answering, or the output isn't JSON. `--peers=false` keeps the
-// payload bounded on a large tailnet: available() runs on every list() call.
-function status() {
+// daemon isn't answering (within `timeoutMs`; the probe is then killed), or the
+// output isn't JSON. `--peers=false` keeps the payload bounded on a large
+// tailnet: available() runs on every list() call.
+function status(timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    execFile(bin(), ['status', '--json', '--peers=false'], (err, stdout) => {
+    execFile(bin(), ['status', '--json', '--peers=false'], { timeout: timeoutMs, killSignal: 'SIGKILL' }, (err, stdout) => {
       if (err) return resolve(null);
       try { resolve(JSON.parse(stdout)); } catch { resolve(null); }
     });
@@ -38,8 +43,8 @@ export async function magicDnsName() {
 // Self.CapMap for the funnel capability — that key is version-unstable, and a
 // tailnet that refuses Funnel already fails loudly at share time carrying
 // tailscale's own message (see startFunnel's exit path).
-export async function available() {
-  const s = await status();
+export async function available({ timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  const s = await status(timeoutMs);
   if (s?.BackendState !== 'Running') return false;
   return typeof s?.Self?.DNSName === 'string' && s.Self.DNSName !== '';
 }

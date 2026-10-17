@@ -80,8 +80,8 @@ function raceSettle(c, ms) {
 // Returns the record fields to persist, plus `settled` (never persisted): a
 // promise of the status the child leaves 'starting' with — 'ready', or
 // 'crashed' for an exit before readiness or an unconfirmed readiness.
-// Readiness runs in the background and updates the in-memory runtime status. If the freshly spawned child dies
-// almost immediately with EADDRINUSE — the free port `allocatePort()` handed
+// Readiness runs in the background and updates the in-memory runtime status.
+// If the freshly spawned child dies almost immediately with EADDRINUSE — the free port `allocatePort()` handed
 // out got claimed by something else before this bind — retry on a new port
 // a bounded number of times before giving up.
 //

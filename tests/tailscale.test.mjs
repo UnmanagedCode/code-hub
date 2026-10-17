@@ -174,3 +174,16 @@ test('looksLikeFunnel tells a funnel child from an unrelated process', async (t)
   assert.equal(tailscale.looksLikeFunnel(process.pid), false, 'this test runner is not a funnel');
   assert.equal(tailscale.looksLikeFunnel(null), false);
 });
+
+// Invariant: a wedged `tailscale status` answers "not available" within the
+// probe's bound instead of hanging the caller (a share would hold its app's one
+// share slot for as long as this takes).
+test('available() reports false for a status call that never answers, within its timeout', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  process.env.FAKE_TAILSCALE_MODE = 'hang';
+  t.after(() => { delete process.env.FAKE_TAILSCALE_MODE; });
+  const t0 = Date.now();
+  assert.equal(await tailscale.available({ timeoutMs: 300 }), false);
+  assert.ok(Date.now() - t0 < tailscale.PROBE_TIMEOUT_MS, 'answered within the bound, not left hanging');
+  assert.ok(tailscale.PROBE_TIMEOUT_MS > 0 && Number.isFinite(tailscale.PROBE_TIMEOUT_MS));
+});

@@ -68,7 +68,7 @@ export async function run({ id, gen, settled, isCurrent, readConfig, share }) {
     finish(id, gen, null);
   } catch (e) {
     // Shared by someone else while this one failed (a manual share landing as
-    // it hit the per-app 409, say): the app ended up shared, nothing to report.
+    // it hit the 409 for a share already in flight, say): the app ended up shared, nothing to report.
     let stillCurrent = true;
     try { stillCurrent = isCurrent(); } catch { /* report the original failure */ }
     if (!stillCurrent) return finish(id, gen, null);

@@ -101,15 +101,19 @@ test('an app ticked for auto-start and auto-share is shared after boot', async (
 });
 
 // Invariant: adoption is not a start — an adopted app is never auto-shared,
-// even though its pre-restart share was torn down at boot.
+// even though its pre-restart share was torn down at boot (its proxy closed,
+// not just dropped from the listing).
 test('an adopted app ticked for auto-share is left unshared after init() and autoStartAll()', async (t) => {
   await setup(t, [['app']]);
   await appSettings.update('app', { autoStart: true, autoShare: { mode: 'lan', tls: false } });
   await appManager.init();
   await appManager.autoStartAll();
   await appManager.awaitSettled('app');
-  assert.equal((await getApp('app')).tunnel?.kind, 'lan'); // persisted share before the "restart"
+  const before = (await getApp('app')).tunnel;
+  assert.equal(before?.kind, 'lan'); // persisted share before the "restart"
   await appManager.init();
+  // The pre-restart share's proxy is gone too, not merely unlisted.
+  await assert.rejects(fetch(`http://127.0.0.1:${before.proxyPort}/`));
   await appManager.autoStartAll();
   await appManager.awaitSettled('app');
   const app = await getApp('app');
