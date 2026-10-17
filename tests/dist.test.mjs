@@ -73,6 +73,14 @@ test('built CSS and JS reference nothing off-limits', () => {
   }
 });
 
+// Invariant: Tailwind compiled the width cap and the card grid, so a bracket-syntax slip can't silently drop them.
+test('built CSS holds the session-width cap and the card grid columns', () => {
+  const css = files.filter((f) => /^assets\/index-.*\.css$/.test(f))
+    .map((f) => read(f).replace(/\/\*[\s\S]*?\*\//g, '')).join('\n');
+  assert.match(css, /max-width:\s*var\(--cc-session-width,\s*42rem\)/);
+  assert.match(css, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(36rem,\s*100%\),\s*1fr\)\)/);
+});
+
 // Invariant: the backend serves the real build: / and every local file it references, with type and CSP.
 test('the server serves the built page and its assets', async (t) => {
   const root = await mkRoot();

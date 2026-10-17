@@ -1,6 +1,6 @@
 # code-hub
 
-A **mobile-first webapp** for launching, monitoring, stopping, and sharing the other webapps in your `~/cc-projects/` workspace — from your phone. Sibling to `code-conductor`; same stack (a Node + Express backend, and a React + Vite + Tailwind v4 + shadcn/Radix frontend built into `frontend/dist` on `npm install`). Embedded in code-conductor, it follows code-conductor's light/dark theme live; standalone, it follows the OS.
+A **mobile-first webapp** for launching, monitoring, stopping, and sharing the other webapps in your `~/cc-projects/` workspace — from your phone. Sibling to `code-conductor`; same stack (a Node + Express backend, and a React + Vite + Tailwind v4 + shadcn/Radix frontend built into `frontend/dist` on `npm install`). Embedded in code-conductor, it follows code-conductor's light/dark theme and session-column width live; standalone, its theme follows the OS and the page is a 42rem column.
 
 ## What it does
 

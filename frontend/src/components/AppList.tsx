@@ -33,16 +33,16 @@ export function AppList({ sort }: { sort: SortKey }) {
     );
   }
   return (
-    <div className="flex flex-col gap-3">
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))] items-start gap-3 [&>*]:min-w-0">
       {stale && (
-        <Alert variant="warning">
+        <Alert variant="warning" className="col-span-full">
           <AlertDescription>
             Can't reach code-hub — showing data from {hub.updatedAt?.toLocaleTimeString()}
           </AlertDescription>
         </Alert>
       )}
       {state === 'empty' ? (
-        <p className="py-8 text-center text-sm text-muted-foreground">No apps found. Add a .hub.json to a sibling project.</p>
+        <p className="col-span-full py-8 text-center text-sm text-muted-foreground">No apps found. Add a .hub.json to a sibling project.</p>
       ) : (
         groupApps(apps, sort).map((g) => (g.kind === 'app'
           ? <AppCard key={g.app.id} app={g.app} worktrees={g.worktrees} />

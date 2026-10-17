@@ -2,6 +2,9 @@
 @import 'tw-animate-css';
 @import './cc-theme-fallback.css';
 
+/* Test files quote class names as literals; keep them from generating CSS the app never uses. */
+@source not './**/*.test.{ts,tsx}';
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
