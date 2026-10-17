@@ -857,7 +857,7 @@ test('list() kills the funnel before dropping the record of an app that died unn
   const fpid = await funnelPidOf('demo');
   assert.ok(pidAlive(fpid));
 
-  // The app dies on its own. The next poll notices and drops the record.
+  // The app dies on its own. The next listing notices and drops the record.
   process.kill(-appChild.pid, 'SIGKILL');
   await waitFor(() => !pidAlive(appChild.pid));
   const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'demo');

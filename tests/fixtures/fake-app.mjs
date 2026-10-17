@@ -11,6 +11,9 @@
 //                 run (first-vs-later decided by creating $FAKE_APP_MARKER, so it
 //                 is deterministic rather than timing-dependent). Models the
 //                 transient port race the dynamic-port retry exists for.
+//   gated       → binds only once $FAKE_APP_MARKER exists (polled), so the app
+//                 stays `starting` for exactly as long as a test wants — no
+//                 timing involved.
 //   wildcard    → same as default but binds 0.0.0.0 instead of 127.0.0.1. This is
 //                 what the typical `app.listen(PORT)` app does, and it is the case
 //                 where a fixed-port LAN share CANNOT take the app's port (a
@@ -46,6 +49,11 @@ if (process.env.FAKE_APP_MODE === 'flaky') {
     console.error(`Error: listen EADDRINUSE: address already in use :::${process.env.PORT}`);
     process.exit(1);
   }
+}
+
+if (process.env.FAKE_APP_MODE === 'gated') {
+  const { existsSync } = await import('node:fs');
+  while (!existsSync(process.env.FAKE_APP_MARKER)) await new Promise((r) => setTimeout(r, 20));
 }
 
 const port = Number(process.env.PORT);

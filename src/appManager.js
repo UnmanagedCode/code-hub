@@ -359,6 +359,7 @@ export async function list() {
           // funnel would keep 443 published in front of a proxy that is about
           // to close, and would block every other app's share forever.
           teardownShare(base.id, rec);
+          autoRun.forget(base.id);
           delete store.apps[base.id]; mutated = true;
           status = 'stopped'; port = urls = startedSha = undefined; tunnelInfo = null;
         }
@@ -460,6 +461,12 @@ export async function start(id) {
       const e = new Error(busy); e.statusCode = 409; throw e;
     }
   }
+  // Auto-share applies to a main checkout only, whatever the file says. Read
+  // before the record becomes visible, so nothing awaits between that and
+  // begin()/track() below. A failed read here fails again in the run, which
+  // reports it on the card.
+  const autoShareConfig = async () => (!app.isWorktree && (await appSettings.get(id)).autoShare) || null;
+  const wantsAutoShare = await autoShareConfig().then(Boolean, () => true);
   const rec = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
@@ -469,15 +476,12 @@ export async function start(id) {
     startedAt: proc.startedAt,
     tunnel: null,
   };
-  store.apps[id] = rec;
-  // Auto-share applies to a main checkout only, whatever the file says.
-  const autoShareConfig = async () => (!app.isWorktree && (await appSettings.get(id)).autoShare) || null;
-  // A failed read here fails again in the run, which reports it on the card.
-  const wantsAutoShare = await autoShareConfig().then(Boolean, () => true);
-  await persist();
   // Every start is tracked, auto-shared or not: a client's settle wait follows
-  // readiness. The auto-share runs once readiness settles and is never awaited
-  // here, so it can neither slow down nor fail this start.
+  // readiness. Tracked in the same synchronous step that makes the record
+  // visible, so no listing can show it `starting` with nothing to wait on. The
+  // auto-share runs once readiness settles and is never awaited here, so it
+  // can neither slow down nor fail this start.
+  store.apps[id] = rec;
   const gen = autoRun.begin(id, { autoShare: wantsAutoShare });
   autoRun.track(id, wantsAutoShare
     ? autoRun.run({
@@ -487,6 +491,7 @@ export async function start(id) {
       share: (cfg) => share(id, cfg),
     })
     : proc.settled);
+  await persist();
   return rec;
 }
 
@@ -517,7 +522,7 @@ export async function restart(id) {
 //   `auth: false` (LAN only) drops the gate entirely: no token/cookie/Basic,
 //   the proxy forwards every request/upgrade unconditionally and the share
 //   URL is the plain proxy URL. `tls` (LAN only, default on — see
-//   lanTlsDefault) wraps the proxy in HTTPS with a per-share self-signed cert
+//   validateShareOptions) wraps the proxy in HTTPS with a per-share self-signed cert
 //   so the LAN hop is encrypted; set it false for plain HTTP.
 // - 'tailscale': a Tailscale Funnel points at the auth proxy, publishing the
 //   node's MagicDNS name (https://<machine>.<tailnet>.ts.net) — public, and
@@ -534,6 +539,15 @@ export async function restart(id) {
 // available as a Basic-Auth fallback for curl/API clients, and persist
 // (in-memory) for the lifetime of the share — see `list()`.
 //
+// ONE share operation per running record at a time: a second share() of the
+// same record while one is in flight is refused with 409 rather than queued,
+// whoever the callers are (UI, auto-share, MCP, another tab). Two in flight
+// would each start a proxy and a child, and the loser would be held by
+// nothing unshare/stop/the sweep can reach. A share still in flight for a
+// record that has since been stopped or replaced doesn't block the new one:
+// it re-checks the record after every await and, finding it gone, tears down
+// what it started and 409s instead of committing.
+//
 // Any successful share, manual or automatic, clears the app's auto-share
 // outcome (a stale "auto-share failed" once the app is shared after all).
 export async function share(id, opts) {
@@ -542,14 +556,41 @@ export async function share(id, opts) {
   return result;
 }
 
+// id → the running record a share() is in flight for (see share()).
+const sharing = new Map();
+
+function replacedWhileSharing(id) {
+  const e = new Error(`'${id}' was stopped or replaced while its share was starting — share it again`);
+  e.statusCode = 409;
+  return e;
+}
+
 async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
   ({ mode, auth, tls } = validateShareOptions({ mode, auth, tls }));
   const rec = store.apps[id];
   const alwaysOn = isHostConductorId(id);
   if (!rec || (!alwaysOn && !state.pidAlive(rec.pid))) { const e = new Error(`'${id}' is not running`); e.statusCode = 409; throw e; }
+  if (sharing.get(id) === rec) {
+    const e = new Error(`'${id}' already has a share starting — wait for it to finish before sharing again`); e.statusCode = 409; throw e;
+  }
+  sharing.set(id, rec);
+  try {
+    return await shareRecord(id, rec, { mode, auth, tls });
+  } finally {
+    if (sharing.get(id) === rec) sharing.delete(id);
+  }
+}
+
+// The body of a share of `rec`. Every await is followed by a check that
+// `rec` is still the app's record before anything shared is touched, and the
+// commit (proxies.set, rec.tunnel) follows its last check with no await in
+// between.
+async function shareRecord(id, rec, { mode, auth, tls }) {
+  const isCurrent = () => store.apps[id] === rec;
   // Read BEFORE the mode branches: the tailscale branch's slot claim must have
   // no await between its check and the claim.
   const creds = await appSettings.get(id);
+  if (!isCurrent()) throw replacedWhileSharing(id);
   // Called right after each branch's proxies.set.
   const markDefault = () => { if (creds.password) defaultPasswordShares.add(id); };
 
@@ -615,6 +656,7 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
       }
     }
     if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
+    if (!isCurrent()) { proxy.close(); throw replacedWhileSharing(id); }
     proxies.set(id, proxy);
     markDefault();
     const scheme = useTls ? 'https' : 'http';
@@ -655,6 +697,7 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
     let committed = false;
     try {
       if (!(await tailscale.available())) throw tailscaleUnavailable();
+      if (!isCurrent()) throw replacedWhileSharing(id);
       teardownShare(id, rec); // replace any existing share
 
       // A funnel still shutting down reverts the node's WHOLE serve config
@@ -684,12 +727,11 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
       // referenced by nothing, so unshare/stop cannot reach it, never persisted
       // so a restart loses it entirely, and — being alive — never reaped by
       // funnelBlockedBy, which would 409 every future share on every app.
-      if (store.apps[id] !== rec) {
+      if (!isCurrent()) {
         tailscale.stopFunnel(pid);
         expiringFunnelPid = pid;
         proxy.close();
-        const e = new Error(`'${id}' was stopped or replaced while its tailscale share was starting — share it again`);
-        e.statusCode = 409; throw e;
+        throw replacedWhileSharing(id);
       }
       proxies.set(id, proxy);
       markDefault();
@@ -719,6 +761,7 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
     const e = new Error('cloudflared is not installed — install it to share via a public URL');
     e.statusCode = 501; throw e;
   }
+  if (!isCurrent()) throw replacedWhileSharing(id);
   teardownShare(id, rec); // replace any existing share
 
   const proxy = await startAuthProxy(rec.port, credOpts(creds));
@@ -728,6 +771,11 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
   } catch (e) {
     proxy.close(); // don't leak the proxy if the tunnel failed to come up
     throw e;
+  }
+  if (!isCurrent()) {
+    tunnel.stopTunnel(pid);
+    proxy.close();
+    throw replacedWhileSharing(id);
   }
   proxies.set(id, proxy);
   markDefault();

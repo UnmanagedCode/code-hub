@@ -24,6 +24,9 @@ test('settingsPatch: login semantics', () => {
   expect(settingsPatch(draftOf(a, { username: '  ' }), a)).toStrictEqual({ username: null });
   expect(settingsPatch(draftOf(a, { username: ' bob ' }), a)).toStrictEqual({ username: 'bob' });
   expect(settingsPatch(draftOf(a, { password: 'new' }), a)).toStrictEqual({ password: 'new' });
+  // Sent trimmed, as the server stores it; spaces alone are blank (keep).
+  expect(settingsPatch(draftOf(a, { password: '  new  ' }), a)).toStrictEqual({ password: 'new' });
+  expect(settingsPatch(draftOf(a, { password: '   ' }), a)).toBe(null);
   expect(settingsPatch(draftOf(a, { forgetPassword: true }), a)).toStrictEqual({ password: null });
   expect(settingsPatch(draftOf(a, { forgetPassword: true, password: 'typed' }), a)).toStrictEqual({ password: 'typed' });
   const none = withSettings({});

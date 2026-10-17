@@ -593,6 +593,26 @@ describe('transitions and automation', () => {
     expect(alert.textContent).toContain("'other' already has a tailscale share");
   });
 
+  // Invariant: the card's Share control is disabled while the app is starting or its auto-share is running, and
+  // enabled again once neither holds.
+  it('Share is disabled on a starting card and on one with an auto-share pending', async () => {
+    const user = userEvent.setup();
+    const { routes } = stubFetch({
+      'GET api/apps': listing([app({ id: 'web', status: 'starting' }), app({ id: 'api', status: 'running', autoShareStatus: 'pending' })]),
+    });
+    render(<App />);
+    for (const name of ['web', 'api']) {
+      const card = await screen.findByRole('article', { name });
+      expect((within(card).getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled, name).toBe(true);
+    }
+    routes['GET api/apps'] = listing([running(), app({ id: 'api', status: 'running' })]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    for (const name of ['web', 'api']) {
+      const card = screen.getByRole('article', { name });
+      await waitFor(() => expect((within(card).getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled, name).toBe(false));
+    }
+  });
+
   // Invariant: a failed boot auto-start is visible on the card.
   it('autoStartError shows as an alert on the card', async () => {
     stubFetch({ 'GET api/apps': listing([app({ id: 'web', autoStartError: 'port 3000 is already in use' })]) });

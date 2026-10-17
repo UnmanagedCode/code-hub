@@ -668,7 +668,7 @@ test('a worktree whose key carries the reserved qualifier is refused, and warns 
 test('a refused worktree that was never going to serve anything is skipped silently', async (t) => {
   // Warn scoping, mirroring the root pass: no own manifest source and no
   // parent to inherit from means nothing was lost, so nothing is logged on
-  // every 2s discovery poll.
+  // every discovery.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkWorktree(root, 'orphan', 'we:ird', null); // no parent, no manifest
@@ -764,7 +764,7 @@ test('a qualified id never resolves to a root directory of that exact name', asy
 
 test('an unservable root dir carrying the reserved qualifier is skipped silently', async (t) => {
   // The warning exists to explain a vanished app; a dir that was never
-  // servable must not log on every 2s discovery poll.
+  // servable must not log on every discovery.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'alpha', { start: 'x' });

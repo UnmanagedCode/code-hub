@@ -51,6 +51,15 @@ describe('Settings dialog', () => {
     expect(within(dialog).queryByRole('checkbox', { name: 'Share automatically when started' })).toBeNull();
   });
 
+  // Invariant: the always-on host conductor's card has Settings too, with the login and no automation toggles.
+  it('the always-on card opens Settings with the login fields only', async () => {
+    const { dialog } = await openSettings([app({ id: 'code-conductor', status: 'running', alwaysOn: true })], 'code-conductor');
+    expect(within(dialog).getByLabelText('user')).toBeTruthy();
+    expect(within(dialog).getByLabelText('pass')).toBeTruthy();
+    expect(within(dialog).queryByRole('checkbox', { name: 'Start automatically when code-hub starts' })).toBeNull();
+    expect(within(dialog).queryByRole('checkbox', { name: 'Share automatically when started' })).toBeNull();
+  });
+
   // Invariant: Save sends exactly the helper's patch in one PUT, then reloads the listing and closes.
   it('tick auto-share, choose tailscale, Save → one PUT {autoShare:{mode:"tailscale",auth:true}}, a reload, closed', async () => {
     const { user, dialog, calls } = await openSettings([app({ id: 'web' })]);

@@ -47,15 +47,16 @@ const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>
   !!b && a.mode === b.mode && a.auth === b.auth && (a.tls ?? null) === (b.tls ?? null);
 
 /**
- * The PUT body for what the draft changed, or null when nothing did. A blanked username clears it; a typed password
- * replaces the stored one, else "forget" clears it. The toggles are sent only for an app that may carry them.
+ * The PUT body for what the draft changed, or null when nothing did. Both login fields are sent trimmed, as the server
+ * stores them. A blanked username clears it; a typed password replaces the stored one, else "forget" clears it. The toggles are sent only for an app that may carry them.
  */
 export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 'isWorktree' | 'alwaysOn'>): SettingsPatch | null {
   const s = app.settings;
   const body: SettingsPatch = {};
   const username = draft.username.trim();
   if (username !== (s.username ?? '')) body.username = username || null;
-  if (draft.password.trim()) body.password = draft.password;
+  const password = draft.password.trim();
+  if (password) body.password = password;
   else if (draft.forgetPassword && s.hasPassword) body.password = null;
   if (automationAllowed(app)) {
     if (draft.autoStart !== s.autoStart) body.autoStart = draft.autoStart;

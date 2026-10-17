@@ -67,6 +67,11 @@ export async function run({ id, gen, settled, isCurrent, readConfig, share }) {
     await share(cfg);
     finish(id, gen, null);
   } catch (e) {
+    // Shared by someone else while this one failed (a manual share landing as
+    // it hit the per-app 409, say): the app ended up shared, nothing to report.
+    let stillCurrent = true;
+    try { stillCurrent = isCurrent(); } catch { /* report the original failure */ }
+    if (!stillCurrent) return finish(id, gen, null);
     if (current(id, gen)) console.error(`[code-hub] auto-share of '${id}' failed: ${e.message}`);
     finish(id, gen, e.message);
   }

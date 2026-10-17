@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import path from 'node:path';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import * as autoRun from '../src/autoRun.js';
+import { storeRoot } from '../src/projects.js';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
 
 // End-to-end auto-share over HTTP: a fake app, fake cloudflared and fake
 // tailscale (env-injected), and the GET …/settled long-poll as the only wait.
@@ -174,4 +180,205 @@ test('GET settled for a stopped app answers at once with settled:true', async (t
   assert.deepEqual((await settled(base)).body, { id: 'app', settled: true });
   assert.ok(Date.now() - t0 < 2000);
   await waitFor(async () => (await getApp(base)).status === 'stopped');
+});
+
+// --- Deterministic in-flight states: a gated app (`starting` until its gate
+// file exists) and a gated cloudflared (its URL held back until its gate file
+// exists, each tunnel child's pid logged). Gate files are dot-files under the
+// projects root, which discovery skips.
+
+async function gatedApp(t, root, ids, id = 'app') {
+  const gate = path.join(root, `.${id}-gate`);
+  await mkProject(root, id, { start: fakeAppCmd('gated', gate) }, { git: true });
+  ids.add(id);
+  return { open: () => fs.writeFile(gate, '') };
+}
+
+function gatedCloudflared(t, root) {
+  const gate = path.join(root, '.cloudflared-gate');
+  const log = path.join(root, '.cloudflared-pids');
+  process.env.FAKE_CLOUDFLARED_GATE = gate;
+  process.env.FAKE_CLOUDFLARED_PID_LOG = log;
+  t.after(async () => {
+    await fs.writeFile(gate, '').catch(() => {}); // never leave a child parked
+    delete process.env.FAKE_CLOUDFLARED_GATE;
+    delete process.env.FAKE_CLOUDFLARED_PID_LOG;
+  });
+  const pids = async () => (await fs.readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
+  return { open: () => fs.writeFile(gate, ''), pids };
+}
+
+// Invariant: a real start of a ticked app reports its auto-share as pending
+// while the app is still starting.
+test('a listing taken while a ticked app is still starting shows autoShareStatus pending', async (t) => {
+  const { root, base, ids } = await boot(t, []);
+  const app = await gatedApp(t, root, ids);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'lan', tls: false } });
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  const listed = await getApp(base);
+  assert.equal(listed.status, 'starting');
+  assert.equal(listed.autoShareStatus, 'pending');
+  await app.open();
+  await settled(base);
+  assert.equal((await getApp(base)).tunnel?.kind, 'lan');
+});
+
+// Invariant: a share made by hand while a ticked app is starting is the one
+// the app keeps — the auto-share, once readiness settles, doesn't replace it.
+test('a manual share during startup survives the auto-share when the start settles', async (t) => {
+  const { root, base, ids } = await boot(t, []);
+  const app = await gatedApp(t, root, ids);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'lan', tls: false } });
+  await j(base, 'POST', '/api/apps/app/start');
+  const manual = await j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel' });
+  assert.equal(manual.status, 200);
+  const before = (await getApp(base)).tunnel;
+  assert.equal(before.kind, 'tunnel');
+  await app.open();
+  await settled(base);
+  const after = await getApp(base);
+  assert.ok(['ready', 'running'].includes(after.status));
+  assert.equal(after.tunnel?.kind, 'tunnel');
+  assert.equal(after.tunnel.url, before.url);
+  assert.equal(after.tunnel.proxyPort, before.proxyPort);
+  assert.equal(after.autoShareStatus, null);
+  assert.equal(after.autoShareError, null);
+});
+
+// Invariant: Stop drops the app's automation state — a failed auto-share and
+// a recorded auto-start failure don't outlive it on a stopped card.
+test('Stop after a failed auto-share leaves autoShareStatus, autoShareError and autoStartError null', async (t) => {
+  quiet(t);
+  const { base } = await boot(t);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale' } });
+  process.env.CODEHUB_TAILSCALE_BIN = '/nonexistent/tailscale';
+  t.after(() => { process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin; });
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  autoRun.recordStartError('app', 'an earlier boot start failed');
+  const failed = await getApp(base);
+  assert.equal(failed.autoShareStatus, 'failed');
+  assert.equal(failed.autoStartError, 'an earlier boot start failed');
+  assert.equal((await j(base, 'POST', '/api/apps/app/stop')).status, 200);
+  const stopped = await getApp(base);
+  assert.equal(stopped.status, 'stopped');
+  assert.equal(stopped.autoShareStatus, null);
+  assert.equal(stopped.autoShareError, null);
+  assert.equal(stopped.autoStartError, null);
+});
+
+// Invariant: an unreadable settings file during a start is reported on the
+// card, never swallowed into a silent, unshared start.
+test('an unreadable app-settings.json during a start shows an auto-share failure on the card', async (t) => {
+  quiet(t);
+  const { base } = await boot(t);
+  const file = appSettings.appSettingsFile();
+  await fs.mkdir(file, { recursive: true }); // a directory where the file belongs: EISDIR, even as root
+  t.after(() => fs.rm(file, { recursive: true, force: true }));
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await settled(base);
+  await fs.rm(file, { recursive: true }); // the listing reads the file too
+  const app = await getApp(base);
+  assert.ok(['ready', 'running'].includes(app.status));
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, 'failed');
+  assert.match(app.autoShareError, /EISDIR|directory/);
+});
+
+// Invariant: one share operation per app at a time — a share overlapping an
+// in-flight auto-share is refused, exactly one tunnel child ever runs, and
+// Unshare kills it.
+test('a manual share overlapping an in-flight auto-share is refused; one child, and Unshare kills it', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tunnel' } });
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => (await cf.pids()).length === 1); // the auto-share's child is up, URL held back
+  const clash = await j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel' });
+  assert.equal(clash.status, 409);
+  assert.match(clash.body.error, /already has a share starting/);
+  await cf.open();
+  await settled(base);
+  const app = await getApp(base);
+  assert.equal(app.tunnel?.kind, 'tunnel');
+  assert.equal(app.autoShareStatus, null);
+  const pids = await cf.pids();
+  assert.equal(pids.length, 1, 'the refused share never started a child');
+  assert.equal(pidAlive(pids[0]), true);
+  assert.equal((await j(base, 'DELETE', '/api/apps/app/share')).status, 200);
+  await waitFor(() => !pidAlive(pids[0]));
+});
+
+// Invariant: a share still in flight when its app is stopped commits nothing —
+// its tunnel child is killed and no share is left on any record.
+test('Stop during an in-flight auto-share leaves no tunnel child behind', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tunnel' } });
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => (await cf.pids()).length === 1);
+  const [pid] = await cf.pids();
+  assert.equal((await j(base, 'POST', '/api/apps/app/stop')).status, 200);
+  await cf.open();
+  await settled(base); // the auto-share's own run is the tracked transition
+  await waitFor(() => !pidAlive(pid));
+  const app = await getApp(base);
+  assert.equal(app.status, 'stopped');
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, null);
+});
+
+// Invariant: start() tracks its transition (and marks the auto-share pending)
+// in the same step that makes its record visible — a listing can't show the
+// app `starting` while a settle wait would answer at once.
+test('while start() is still persisting, the visible record is already tracked and pending', async (t) => {
+  const { root, ids } = await boot(t, []);
+  const app = await gatedApp(t, root, ids);
+  await appSettings.update('app', { autoShare: { mode: 'lan', tls: false } });
+  const stateFile = path.join(storeRoot(), 'state.json');
+  const realRename = fs.rename;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  fs.rename = async (from, to) => {
+    if (armed && to === stateFile) { armed = false; reached(); await gate; }
+    return realRename(from, to);
+  };
+  t.after(() => { release(); fs.rename = realRename; });
+  const starting = appManager.start('app');
+  await parked; // the record is in the store; its persist hasn't landed
+  const listed = (await appManager.list()).apps.find((a) => a.id === 'app');
+  assert.equal(listed.status, 'starting');
+  assert.equal(listed.autoShareStatus, 'pending');
+  assert.deepEqual(await autoRun.awaitSettled('app', { capMs: 50 }), { id: 'app', settled: false });
+  release();
+  await starting;
+  await app.open();
+  assert.deepEqual(await appManager.awaitSettled('app'), { id: 'app', settled: true });
+});
+
+// Invariant: when list() drops the record of an app that died unnoticed, its
+// automation state goes with it — no stale failure on a stopped card.
+test('list()\'s prune of a dead adopted app clears its automation state', async (t) => {
+  const { root } = await boot(t, []);
+  const dir = await mkProject(root, 'adopted', { start: fakeAppCmd() }, { git: true });
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } });
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify({ apps: { adopted: {
+    id: 'adopted', project: 'adopted', path: dir, isWorktree: false, branch: null,
+    pid: child.pid, pgid: child.pid, port: 1, fixedPort: null, urls: [], startedSha: null, startedAt: null, tunnel: null,
+  } } }));
+  await appManager.init(); // adopts the live pid
+  const gen = autoRun.begin('adopted', { autoShare: true });
+  await autoRun.run({ id: 'adopted', gen, settled: Promise.resolve('crashed'), isCurrent: () => true, readConfig: async () => ({ mode: 'lan' }), share: async () => {} });
+  autoRun.recordStartError('adopted', 'boot start failed');
+  const before = (await appManager.list()).apps.find((a) => a.id === 'adopted');
+  assert.equal(before.status, 'running');
+  assert.equal(before.autoShareStatus, 'failed');
+  child.kill('SIGKILL');
+  await once(child, 'exit');
+  const after = (await appManager.list()).apps.find((a) => a.id === 'adopted');
+  assert.equal(after.status, 'stopped');
+  assert.deepEqual([after.autoShareStatus, after.autoShareError, after.autoStartError], [null, null, null]);
 });

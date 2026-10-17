@@ -136,3 +136,15 @@ test('bootAutoStart: a start that rejects for B still starts A and C, and record
   autoRun.begin('bootB', { autoShare: false });
   assert.equal(autoRun.view('bootB').autoStartError, null);
 });
+
+// Invariant: a share that fails because the app got shared by someone else
+// meanwhile (the per-app 409) leaves no failure behind — the app is shared.
+test('a share rejecting after the start stopped being current records no failure', async () => {
+  const gen = autoRun.begin('raced', { autoShare: true });
+  let shared = false;
+  await autoRun.run({
+    id: 'raced', gen, settled: Promise.resolve('ready'), isCurrent: () => !shared, readConfig: async () => CFG,
+    share: async () => { shared = true; throw Object.assign(new Error("'raced' already has a share starting"), { statusCode: 409 }); },
+  });
+  assert.deepEqual(autoRun.view('raced'), { autoShareStatus: null, autoShareError: null, autoStartError: null });
+});

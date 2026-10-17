@@ -88,7 +88,9 @@ export interface Controls {
   share: (Control & { label: 'Share' | 'Shared' }) | null;
 }
 
-// Stop and Restart are absent on an always-on app (the host conductor).
+// Stop and Restart are absent on an always-on app (the host conductor). Share
+// waits while the app is starting or an auto-share is running: the backend
+// takes one share per app at a time, and the auto-share is about to be it.
 export function controlsFor(app: App, busy: boolean): Controls {
   const running = app.status === 'starting' || app.status === 'ready' || app.status === 'running';
   if (!running) {
@@ -98,7 +100,10 @@ export function controlsFor(app: App, busy: boolean): Controls {
     start: null,
     stop: app.alwaysOn ? null : { disabled: busy },
     restart: app.alwaysOn ? null : { disabled: busy || app.sourceMissing },
-    share: { label: app.tunnel ? 'Shared' : 'Share', disabled: busy || !!app.tunnel },
+    share: {
+      label: app.tunnel ? 'Shared' : 'Share',
+      disabled: busy || !!app.tunnel || app.status === 'starting' || app.autoShareStatus === 'pending',
+    },
   };
 }
 
