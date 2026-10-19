@@ -425,6 +425,7 @@ export async function list() {
       sourceMissing,
       routes,
       settings: appSettings.describe(settings[base.id]),
+      manifestPort: base.manifest?.port ?? null,
       ...autoRun.view(base.id),
       tunnel: tunnelInfo,
       error,
@@ -470,9 +471,12 @@ export async function start(id) {
   // drops a record: tear the share down first.
   if (existing?.tunnel) teardownShare(id, existing);
   const app = await findDiscovered(id);
-  // A manifest `port` pins the app's port for this checkout. projects.js already
-  // nulls it for worktrees, so this is only ever set for a default checkout.
-  const fixedPort = app.manifest.port ?? null;
+  // Read strictly: an unreadable store can't say whether the app has a fixed
+  // port, and starting anyway could silently move it.
+  const settings = await appSettings.get(id);
+  // The app's Settings port beats its manifest's; a worktree never has one (its
+  // manifest port is stripped in discovery, and a hand-written settings port is ignored).
+  const fixedPort = app.isWorktree ? null : (settings.port ?? app.manifest.port ?? null);
   const busy = `port ${fixedPort} is already in use — '${id}' declares a fixed port and will not fall back to a free one`;
   if (fixedPort !== null) {
     const holder = Object.values(store.apps).find((r) => r.port === fixedPort && state.pidAlive(r.pid));
@@ -493,11 +497,9 @@ export async function start(id) {
       const e = new Error(busy); e.statusCode = 409; throw e;
     }
   }
-  // Read before the record becomes visible, so nothing awaits between that
-  // and trackTransition() below. A failed read here fails again in the run,
-  // which reports it on the card.
+  // The run re-reads its config once ready, and reports a failed read on the card.
   const readConfig = autoShareConfigFor(id, app.isWorktree);
-  const wantsAutoShare = await readConfig().then(Boolean, () => true);
+  const wantsAutoShare = !app.isWorktree && !!settings.autoShare;
   const rec = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
@@ -960,22 +962,24 @@ export async function getAppSettings(id) {
   return { id, ...appSettings.describe((await appSettings.readAll())[id]) };
 }
 
-// Auto-start and auto-share act on a project's main checkout only: enabling
-// either for a worktree is refused, and so is enabling auto-start for the host
-// conductor (always on, code-hub never starts it; its auto-share applies, see
-// autoShareAlwaysOn). A refused body writes nothing. Clearing them is always
-// allowed, so a hand-edited entry can be cleaned up.
+// Auto-start, auto-share and a fixed port act on a project's main checkout
+// only: enabling any of them for a worktree is refused, and so is enabling
+// auto-start or a port for the host conductor (always on, code-hub never starts
+// it; its auto-share applies, see autoShareAlwaysOn). A refused body writes
+// nothing. Clearing them is always allowed, so a hand-edited entry can be
+// cleaned up.
 export async function setAppSettings(id, body) {
   const kind = await appKind(id);
   const isObject = !!body && typeof body === 'object';
   const enablesAutoStart = isObject && body.autoStart === true;
   const enablesAutoShare = isObject && body.autoShare !== undefined && body.autoShare !== null;
-  if (kind.isWorktree && (enablesAutoStart || enablesAutoShare)) {
-    const e = new Error(`auto-start and auto-share apply only to a project's main checkout — '${id}' is a worktree`);
+  const enablesPort = isObject && body.port !== undefined && body.port !== null;
+  if (kind.isWorktree && (enablesAutoStart || enablesAutoShare || enablesPort)) {
+    const e = new Error(`auto-start, auto-share and a fixed port apply only to a project's main checkout — '${id}' is a worktree`);
     e.statusCode = 400; throw e;
   }
-  if (kind.hostConductor && enablesAutoStart) {
-    const e = new Error(`auto-start doesn't apply to '${id}' — it is the host code-conductor, which is always on (auto-share does apply)`);
+  if (kind.hostConductor && (enablesAutoStart || enablesPort)) {
+    const e = new Error(`auto-start and a fixed port don't apply to '${id}' — it is the host code-conductor, which is always on (auto-share does apply)`);
     e.statusCode = 400; throw e;
   }
   return { id, ...(await appSettings.update(id, body)) };

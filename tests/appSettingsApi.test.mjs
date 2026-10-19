@@ -56,7 +56,7 @@ async function setup(t, { running = true } = {}) {
   return { root, server, base };
 }
 
-const OFF = { autoStart: false, autoShare: null };
+const OFF = { autoStart: false, autoShare: null, port: null };
 const NONE = { username: null, hasPassword: false, ...OFF };
 
 const status = async (port, user, pass) =>
@@ -304,9 +304,10 @@ test('prototype-named app ids: unknown ones 404, real ones store and list their 
 // and neither its answer nor the listing ever carries the password.
 test('PUT then GET round-trips autoStart and autoShare; neither GET nor the listing leaks the password', async (t) => {
   const { base } = await setup(t, { running: false });
-  const put = await j(base, 'PUT', '/api/apps/app/settings', { password: 'pw-secret', autoStart: true, autoShare: { mode: 'lan', tls: false } });
+  const put = await j(base, 'PUT', '/api/apps/app/settings', { password: 'pw-secret', autoStart: true, autoShare: { mode: 'lan', tls: false }, port: 4100 });
   assert.equal(put.status, 200);
-  const want = { id: 'app', username: null, hasPassword: true, autoStart: true, autoShare: { mode: 'lan', auth: true, tls: false } };
+  // Invariant: the endpoint and the listing agree on the stored port.
+  const want = { id: 'app', username: null, hasPassword: true, autoStart: true, autoShare: { mode: 'lan', auth: true, tls: false }, port: 4100 };
   assert.deepEqual(put.body, want);
   const got = await j(base, 'GET', '/api/apps/app/settings');
   assert.deepEqual(got.body, want);
@@ -326,13 +327,13 @@ test('a worktree id refuses autoStart/autoShare with a 400 naming the rule, but 
   await mkWorktree(root, 'app', 'feat', { start: fakeAppCmd() }, { git: true });
   await j(base, 'PUT', '/api/apps/app%3Afeat/settings', { username: 'wt-user' });
   const before = await fs.readFile(appSettings.appSettingsFile(), 'utf8');
-  for (const body of [{ autoStart: true }, { autoShare: { mode: 'lan' } }, { username: 'x', autoStart: true }]) {
+  for (const body of [{ autoStart: true }, { autoShare: { mode: 'lan' } }, { username: 'x', autoStart: true }, { port: 4100 }, { username: 'x', port: 4100 }]) {
     const res = await j(base, 'PUT', '/api/apps/app%3Afeat/settings', body);
     assert.equal(res.status, 400, JSON.stringify(body));
     assert.match(res.body.error, /only to a project's main checkout — 'app:feat' is a worktree/);
   }
   assert.equal(await fs.readFile(appSettings.appSettingsFile(), 'utf8'), before);
-  assert.equal((await j(base, 'PUT', '/api/apps/app%3Afeat/settings', { autoStart: false, autoShare: null })).status, 200);
+  assert.equal((await j(base, 'PUT', '/api/apps/app%3Afeat/settings', { autoStart: false, autoShare: null, port: null })).status, 200);
   const res = await j(base, 'PUT', '/api/apps/app%3Afeat/settings', { username: 'wt-user2' });
   assert.equal(res.status, 200);
   assert.deepEqual(res.body, { id: 'app:feat', username: 'wt-user2', hasPassword: false, ...OFF });
@@ -358,4 +359,18 @@ test('the listing\'s settings is always an object, toggles off for an app with n
   const { base } = await setup(t, { running: false });
   await assert.rejects(fs.access(appSettings.appSettingsFile()));
   assert.deepEqual((await getApp(base)).settings, NONE);
+});
+
+// Invariant: the listing exposes the manifest's port beside the stored setting,
+// and a worktree has no manifest port.
+test('the listing exposes the manifest port beside the settings port', async (t) => {
+  const { root, base } = await setup(t, { running: false });
+  await mkProject(root, 'pinned', { start: fakeAppCmd(), port: 4200 }, { git: true });
+  await mkWorktree(root, 'pinned', 'feat', { start: fakeAppCmd(), port: 4200 }, { git: true });
+  await j(base, 'PUT', '/api/apps/pinned/settings', { port: 4300 });
+  const main = await getApp(base, 'pinned');
+  assert.equal(main.manifestPort, 4200);
+  assert.equal(main.settings.port, 4300);
+  assert.equal((await getApp(base, 'pinned:feat')).manifestPort, null);
+  assert.equal((await getApp(base)).manifestPort, null);
 });

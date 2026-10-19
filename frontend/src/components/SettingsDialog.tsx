@@ -8,15 +8,16 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useHub } from '@/hub';
 import { cardLabel } from '@/lib/appView';
-import { automationFor, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
+import { automationFor, mainCheckoutSettingsAllowed, portError, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
 import { PASSWORD_MASK, shareModes } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
 /**
  * An app's stored settings, reachable from its card in every state: the default share login, and — for a main
- * checkout — the automation toggles `automationFor` offers (auto-start at boot, auto-share on start; the always-on
- * conductor's auto-start shows disabled with its reason). The draft is local: it is seeded when the dialog opens,
- * and the modal dialog keeps the listing's rare refreshes from reaching it.
+ * checkout — the fixed port (where `mainCheckoutSettingsAllowed`) and the automation toggles `automationFor` offers
+ * (auto-start at boot, auto-share on start; the always-on conductor's auto-start shows disabled with its reason).
+ * The draft is local: it is seeded when the dialog opens, and the modal dialog keeps the listing's rare refreshes
+ * from reaching it.
  */
 export function SettingsDialog({ app }: { app: App }) {
   const hub = useHub();
@@ -33,7 +34,10 @@ export function SettingsDialog({ app }: { app: App }) {
     }
     setOpen(next);
   };
+  const portErr = portError(draft.port);
+  const note = portNote(app);
   const save = async () => {
+    if (portErr) return;
     const body = settingsPatch(draft, app);
     if (!body) return setOpen(false);
     setSaving(true);
@@ -109,6 +113,24 @@ export function SettingsDialog({ app }: { app: App }) {
               {app.settings.hasPassword && check('forgetPassword', 'Forget stored password')}
               <p className="text-xs text-muted-foreground">Applies to new shares; a live share keeps its login.</p>
             </fieldset>
+            {mainCheckoutSettingsAllowed(app) && (
+              <fieldset className="flex flex-col gap-2">
+                <legend className="mb-1 text-sm font-medium">Port</legend>
+                <Label htmlFor={`${ids}-port`}>Fixed port</Label>
+                <Input
+                  id={`${ids}-port`}
+                  inputMode="numeric"
+                  value={draft.port}
+                  placeholder={portPlaceholder(app)}
+                  aria-invalid={!!portErr}
+                  aria-describedby={portErr ? `${ids}-port-error` : undefined}
+                  onChange={(e) => set({ port: e.target.value })}
+                />
+                {portErr && <p id={`${ids}-port-error`} className="text-xs text-destructive">{portErr}</p>}
+                <p className="text-xs text-muted-foreground">Blank uses the manifest's port when it has one, else a free port. A busy port refuses the start.</p>
+                {note && <p className="text-xs text-muted-foreground">{note}</p>}
+              </fieldset>
+            )}
             {(automation.autoStart || automation.autoShare) && (
               <fieldset className="flex flex-col gap-2">
                 <legend className="mb-1 text-sm font-medium">Automation</legend>
@@ -150,7 +172,7 @@ export function SettingsDialog({ app }: { app: App }) {
             )}
             <div className="flex justify-end gap-2">
               <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button type="submit" size="sm" disabled={saving}>
+              <Button type="submit" size="sm" disabled={saving || !!portErr}>
                 {saving && <LoaderCircleIcon className="animate-spin" aria-hidden />}
                 Save
               </Button>

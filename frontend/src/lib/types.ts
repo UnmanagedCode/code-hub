@@ -41,6 +41,7 @@ export interface AppSettings {
   hasPassword: boolean;
   autoStart: boolean;
   autoShare: AutoShare | null;
+  port: number | null;
 }
 
 export interface App {
@@ -60,6 +61,9 @@ export interface App {
   sourceMissing: boolean;
   routes: Route[];
   settings: AppSettings;
+  /** The manifest/registration `port`, what a blank Settings port falls back to; null for a worktree. */
+  manifestPort: number | null;
+  source: 'manifest' | 'registry' | 'memory';
   /** The auto-share after the latest start: in flight, failed (see `autoShareError`), or nothing to report. */
   autoShareStatus: 'pending' | 'failed' | null;
   autoShareError: string | null;
