@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createServer } from '../server.js';
+import { createServer, start as startServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
+import * as appSettings from '../src/appSettings.js';
 import { unregisterInMemory } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ccProject } from './helpers.mjs';
@@ -533,9 +534,10 @@ test('embedded: CONDUCTOR_PROJECT_DIR still wins over the conductor\'s record of
   assert.equal(res.body.apps.find((a) => a.id === 'code-conductor:ab12cd').project, 'code-conductor');
 });
 
-// Invariant: the host code-conductor (which code-hub can't start) takes a
-// default login but never the auto-start/auto-share toggles.
-test('embedded: PUT autoStart on the host code-conductor is a 400; a login is accepted', async (t) => {
+// Invariant: the API refuses exactly what the UI disables for the always-on
+// host code-conductor: auto-start (code-hub never starts it) — auto-share, a
+// login and clearing auto-start are accepted, and a refused body writes nothing.
+test('embedded: PUT autoStart:true on the host code-conductor is a 400; autoShare and a login are accepted', async (t) => {
   const { srv: conductorSrv, port: conductorPort } = await bootFakeConductor();
   process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
   process.env.CONDUCTOR_URL = `http://127.0.0.1:${conductorPort}`;
@@ -553,12 +555,199 @@ test('embedded: PUT autoStart on the host code-conductor is a 400; a login is ac
   const put = (body) => fetch(`${base}/api/apps/code-conductor/settings`, {
     method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   }).then(async (r) => ({ status: r.status, body: await r.json() }));
-  for (const body of [{ autoStart: true }, { autoShare: { mode: 'lan' } }]) {
-    const res = await put(body);
-    assert.equal(res.status, 400);
-    assert.match(res.body.error, /'code-conductor' is the host code-conductor/);
-  }
+  const refused = await put({ autoStart: true });
+  assert.equal(refused.status, 400);
+  assert.match(refused.body.error, /host code-conductor/);
+
+  const shared = await put({ autoShare: { mode: 'lan' } });
+  assert.equal(shared.status, 200);
+  const stored = { autoStart: false, autoShare: { mode: 'lan', auth: true, tls: true } };
+  assert.deepEqual((await j(base, 'GET', '/api/apps/code-conductor/settings')).body, { id: 'code-conductor', username: null, hasPassword: false, ...stored });
+
+  const both = await put({ autoStart: true, autoShare: { mode: 'tunnel' } });
+  assert.equal(both.status, 400);
+  assert.match(both.body.error, /host code-conductor/);
+  assert.deepEqual((await j(base, 'GET', '/api/apps/code-conductor/settings')).body, { id: 'code-conductor', username: null, hasPassword: false, ...stored });
+
+  assert.equal((await put({ autoStart: false })).status, 200);
   const ok = await put({ username: 'alice' });
   assert.equal(ok.status, 200);
   assert.equal(ok.body.autoStart, false);
+});
+
+// Embedded hub with the host conductor surfaced from an in-root checkout. The
+// caller runs init() itself, so it can tick settings first.
+async function embeddedConductor(t) {
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  const { srv, port } = await bootFakeConductor();
+  process.env.CONDUCTOR_PLUGIN_ID = 'code-hub';
+  process.env.CONDUCTOR_URL = `http://127.0.0.1:${port}`;
+  const root = await mkRoot();
+  await mkProject(root, 'code-conductor', { start: fakeAppCmd() });
+  t.after(async () => {
+    await appManager.unshare('code-conductor').catch(() => {});
+    delete process.env.CONDUCTOR_PLUGIN_ID;
+    delete process.env.CONDUCTOR_URL;
+    unregisterInMemory('code-conductor');
+    srv.close();
+    await rmRoot(root);
+  });
+  return { root, conductorPort: port };
+}
+
+const getApp = async (id) => (await appManager.list()).apps.find((a) => a.id === id);
+const LAN_PLAIN = { mode: 'lan', auth: false, tls: false };
+
+// Invariant: an always-on conductor ticked for auto-share is shared when
+// code-hub boots, with no start step — the share fronts the conductor's own port.
+test('embedded: the always-on conductor ticked for auto-share is shared at boot with no start', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  assert.equal(await appManager.autoShareAlwaysOn(), true);
+  assert.deepEqual(await appManager.awaitSettled('code-conductor'), { id: 'code-conductor', settled: true });
+  const app = await getApp('code-conductor');
+  assert.equal(app.status, 'running');
+  assert.equal(app.alwaysOn, true);
+  assert.equal(app.tunnel?.kind, 'lan');
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(app.autoShareError, null);
+  const res = await fetch(`http://127.0.0.1:${app.tunnel.proxyPort}/`);
+  assert.equal(await res.text(), 'conductor-ui');
+});
+
+// Invariant: every code-hub boot (a plugin-backend restart while cc keeps
+// running included) shares the always-on conductor again, and the previous
+// boot's share is gone rather than left alongside the new one.
+test('embedded: a plugin-backend restart while cc runs shares the conductor again, once', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  await appManager.autoShareAlwaysOn();
+  await appManager.awaitSettled('code-conductor');
+  const first = (await getApp('code-conductor')).tunnel;
+  assert.equal(first?.kind, 'lan');
+
+  await appManager.init(); // the restart
+  await assert.rejects(fetch(`http://127.0.0.1:${first.proxyPort}/`));
+  assert.equal((await getApp('code-conductor')).tunnel, null);
+  assert.equal(await appManager.autoShareAlwaysOn(), true);
+  await appManager.awaitSettled('code-conductor');
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel?.kind, 'lan');
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(await (await fetch(`http://127.0.0.1:${app.tunnel.proxyPort}/`)).text(), 'conductor-ui');
+});
+
+// Invariant: an always-on conductor that already has a share is not shared
+// again — nothing is duplicated or replaced.
+test('embedded: an already-shared always-on conductor is not shared again', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  await appManager.share('code-conductor', { mode: 'lan', tls: false });
+  const before = (await getApp('code-conductor')).tunnel;
+  assert.equal(await appManager.autoShareAlwaysOn(), false);
+  await appManager.awaitSettled('code-conductor');
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel?.proxyPort, before.proxyPort);
+  assert.equal(app.tunnel?.auth, true); // the manual share's options, not the ticked config's
+  assert.equal(app.autoShareStatus, null);
+});
+
+// Invariant: an always-on auto-share failure is reported on the card exactly
+// like a normal app's (autoShareStatus 'failed' + the reason), with no share.
+test('embedded: an always-on auto-share failure is reported like a normal app\'s', async (t) => {
+  const { root } = await embeddedConductor(t);
+  const real = console.error;
+  console.error = () => {};
+  t.after(() => { console.error = real; });
+  process.env.CODEHUB_CLOUDFLARED_BIN = path.join(root, 'no-such-cloudflared');
+  t.after(() => { process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin; });
+  await appSettings.update('code-conductor', { autoShare: { mode: 'tunnel' } });
+  await appManager.init();
+  assert.equal(await appManager.autoShareAlwaysOn(), true);
+  await appManager.awaitSettled('code-conductor');
+  const app = await getApp('code-conductor');
+  assert.equal(app.status, 'running');
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, 'failed');
+  assert.match(app.autoShareError, /cloudflared/);
+  // autoRun's outcome is process state a re-run init() keeps (a real boot is a
+  // fresh process); a successful share clears it, so later tests boot clean.
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  await appManager.share('code-conductor', { mode: 'lan', tls: false });
+});
+
+// Invariant: an unticked always-on conductor is left unshared, and no
+// transition is left for a settle wait to follow.
+test('embedded: an unticked always-on conductor is left unshared with nothing pending', async (t) => {
+  await embeddedConductor(t);
+  await appManager.init();
+  assert.equal(await appManager.autoShareAlwaysOn(), false);
+  assert.deepEqual(await appManager.awaitSettled('code-conductor'), { id: 'code-conductor', settled: true });
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, null);
+});
+
+// Invariant: the always-on boot rule never widens to adoption — a normal app
+// code-hub adopts at boot stays unshared even while the conductor is
+// auto-shared alongside it.
+test('embedded: an adopted normal app ticked for auto-share stays unshared while the conductor is auto-shared', async (t) => {
+  const { root } = await embeddedConductor(t);
+  await mkProject(root, 'web', { start: fakeAppCmd() }, { git: true });
+  t.after(() => appManager.stop('web').catch(() => {}));
+  await appSettings.update('web', { autoStart: true, autoShare: LAN_PLAIN });
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  await appManager.start('web');
+  await appManager.awaitSettled('web');
+  assert.equal((await getApp('web')).tunnel?.kind, 'lan'); // shared before the "restart"
+
+  await appManager.init(); // web's live pid is adopted
+  await appManager.autoShareAlwaysOn();
+  await appManager.autoStartAll();
+  await appManager.awaitSettled('code-conductor');
+  await appManager.awaitSettled('web');
+  const web = await getApp('web');
+  assert.ok(['ready', 'running'].includes(web.status));
+  assert.equal(web.tunnel, null);
+  assert.equal(web.autoShareStatus, null);
+  assert.equal((await getApp('code-conductor')).tunnel?.kind, 'lan');
+});
+
+// Invariant: server.js's start() runs the always-on auto-share once it is
+// listening, in the background.
+test('embedded: server start() auto-shares the always-on conductor in the background', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  const server = await startServer({ port: 0 });
+  t.after(() => new Promise((r) => server.close(r)));
+  await waitFor(async () => (await getApp('code-conductor')).tunnel?.kind === 'lan');
+  await appManager.awaitSettled('code-conductor');
+  assert.equal((await getApp('code-conductor')).autoShareStatus, null);
+});
+
+// Invariant: the boot auto-share keys on the always-on classification, not the
+// id — standalone, an adopted project named code-conductor is not auto-shared.
+test('standalone: a project named code-conductor gets no boot auto-share', async (t) => {
+  delete process.env.CONDUCTOR_PLUGIN_ID;
+  delete process.env.CONDUCTOR_URL;
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  const root = await mkRoot();
+  await mkProject(root, 'code-conductor', { start: fakeAppCmd() }, { git: true });
+  t.after(async () => { await appManager.stop('code-conductor').catch(() => {}); await rmRoot(root); });
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  await appManager.start('code-conductor');
+  await appManager.awaitSettled('code-conductor');
+  await appManager.unshare('code-conductor');
+  await appManager.init(); // adopted
+  assert.equal(await appManager.autoShareAlwaysOn(), false);
+  await appManager.awaitSettled('code-conductor');
+  const app = await getApp('code-conductor');
+  assert.equal(app.alwaysOn, false);
+  assert.equal(app.tunnel, null);
 });

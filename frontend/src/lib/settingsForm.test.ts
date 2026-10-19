@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { automationAllowed, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
+import { automationFor, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
 import type { AppSettings } from './types';
 import { app } from '@/test/fixtures';
 
@@ -33,14 +33,34 @@ test('settingsPatch: login semantics', () => {
   expect(settingsPatch(draftOf(none, { forgetPassword: true }), none)).toBe(null);
 });
 
-// Invariant: the UI never sends a toggle for a worktree or the always-on host conductor.
-test('settingsPatch: a worktree or always-on app never sends autoStart/autoShare', () => {
-  for (const over of [{ isWorktree: true, id: 'web:k' }, { alwaysOn: true }]) {
-    const a = withSettings({ autoShare: { mode: 'lan', auth: true, tls: true } }, over);
-    expect(automationAllowed(a)).toBe(false);
-    expect(settingsPatch(draftOf(a, { autoStart: true, autoShare: false, mode: 'tunnel' }), a)).toBe(null);
-    expect(settingsPatch(draftOf(a, { autoStart: true, username: 'u' }), a)).toStrictEqual({ username: 'u' });
-  }
+// Invariant: a worktree offers neither toggle; the always-on app offers auto-share, and auto-start only disabled with a
+// reason; a normal main checkout offers both, enabled.
+test('automationFor: what each kind of app offers', () => {
+  expect(automationFor(app({ isWorktree: true, id: 'web:k' }))).toStrictEqual({ autoStart: null, autoShare: null });
+  const alwaysOn = automationFor(app({ alwaysOn: true }));
+  expect(alwaysOn.autoStart?.disabledReason).toBeTruthy();
+  expect(alwaysOn.autoShare).not.toBe(null);
+  const normal = automationFor(app());
+  expect(normal.autoStart).toStrictEqual({ disabledReason: null });
+  expect(normal.autoShare).not.toBe(null);
+  expect(alwaysOn.autoShare?.label).not.toBe(normal.autoShare?.label);
+});
+
+// Invariant: the UI never sends a toggle for a worktree.
+test('settingsPatch: a worktree never sends autoStart/autoShare', () => {
+  const a = withSettings({ autoShare: { mode: 'lan', auth: true, tls: true } }, { isWorktree: true, id: 'web:k' });
+  expect(settingsPatch(draftOf(a, { autoStart: true, autoShare: false, mode: 'tunnel' }), a)).toBe(null);
+  expect(settingsPatch(draftOf(a, { autoStart: true, username: 'u' }), a)).toStrictEqual({ username: 'u' });
+});
+
+// Invariant: for the always-on app the patch sends exactly what the server accepts — never autoStart, and
+// autoShare set or cleared like a normal app's.
+test('settingsPatch: the always-on app sends autoShare but never autoStart', () => {
+  const a = withSettings({}, { alwaysOn: true });
+  expect(settingsPatch(draftOf(a, { autoStart: true }), a)).toBe(null);
+  expect(settingsPatch(draftOf(a, { autoStart: true, autoShare: true, mode: 'lan' }), a)).toStrictEqual({ autoShare: { mode: 'lan', auth: true, tls: true } });
+  const stored = withSettings({ autoShare: { mode: 'lan', auth: true, tls: true } }, { alwaysOn: true });
+  expect(settingsPatch(draftOf(stored, { autoShare: false }), stored)).toStrictEqual({ autoShare: null });
 });
 
 // Invariant: the toggle part of the patch: the auto-share shape per mode, omitted when unchanged, null when

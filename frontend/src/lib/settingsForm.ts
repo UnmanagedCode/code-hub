@@ -3,9 +3,26 @@
 
 import type { App, AutoShare, ShareKind } from './types';
 
-/** Auto-start and auto-share are offered only for a project's main checkout that code-hub can start. */
-export function automationAllowed(app: Pick<App, 'isWorktree' | 'alwaysOn'>): boolean {
-  return !app.isWorktree && !app.alwaysOn;
+/** The automation toggles the dialog offers an app; `null` when one is not offered at all. */
+export interface AutomationView {
+  /** A non-null `disabledReason` shows the toggle disabled, with that reason. */
+  autoStart: { disabledReason: string | null } | null;
+  autoShare: { label: string } | null;
+}
+
+/**
+ * A worktree gets neither toggle. The always-on host conductor gets auto-share (at code-hub's boot) and auto-start
+ * only disabled, since code-hub never starts it. Any other main checkout gets both.
+ */
+export function automationFor(app: Pick<App, 'isWorktree' | 'alwaysOn'>): AutomationView {
+  if (app.isWorktree) return { autoStart: null, autoShare: null };
+  if (app.alwaysOn) {
+    return {
+      autoStart: { disabledReason: 'Always on — code-conductor runs code-hub, so code-hub never starts it.' },
+      autoShare: { label: 'Share automatically when code-hub starts' },
+    };
+  }
+  return { autoStart: { disabledReason: null }, autoShare: { label: 'Share automatically when started' } };
 }
 
 export interface SettingsDraft {
@@ -48,7 +65,7 @@ const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>
 
 /**
  * The PUT body for what the draft changed, or null when nothing did. Both login fields are sent trimmed, as the server
- * stores them. A blanked username clears it; a typed password replaces the stored one, else "forget" clears it. The toggles are sent only for an app that may carry them.
+ * stores them. A blanked username clears it; a typed password replaces the stored one, else "forget" clears it. Each toggle is sent only where `automationFor` offers it enabled.
  */
 export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 'isWorktree' | 'alwaysOn'>): SettingsPatch | null {
   const s = app.settings;
@@ -58,8 +75,9 @@ export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 
   const password = draft.password.trim();
   if (password) body.password = password;
   else if (draft.forgetPassword && s.hasPassword) body.password = null;
-  if (automationAllowed(app)) {
-    if (draft.autoStart !== s.autoStart) body.autoStart = draft.autoStart;
+  const v = automationFor(app);
+  if (v.autoStart && !v.autoStart.disabledReason && draft.autoStart !== s.autoStart) body.autoStart = draft.autoStart;
+  if (v.autoShare) {
     if (draft.autoShare) {
       const lan = draft.mode === 'lan';
       const want: AutoShare = { mode: draft.mode, auth: lan ? draft.auth : true, ...(lan ? { tls: draft.tls } : {}) };

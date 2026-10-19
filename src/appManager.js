@@ -493,12 +493,11 @@ export async function start(id) {
       const e = new Error(busy); e.statusCode = 409; throw e;
     }
   }
-  // Auto-share applies to a main checkout only, whatever the file says. Read
-  // before the record becomes visible, so nothing awaits between that and
-  // begin()/track() below. A failed read here fails again in the run, which
-  // reports it on the card.
-  const autoShareConfig = async () => (!app.isWorktree && (await appSettings.get(id)).autoShare) || null;
-  const wantsAutoShare = await autoShareConfig().then(Boolean, () => true);
+  // Read before the record becomes visible, so nothing awaits between that
+  // and trackTransition() below. A failed read here fails again in the run,
+  // which reports it on the card.
+  const readConfig = autoShareConfigFor(id, app.isWorktree);
+  const wantsAutoShare = await readConfig().then(Boolean, () => true);
   const rec = {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
@@ -510,21 +509,51 @@ export async function start(id) {
   };
   // Every start is tracked, auto-shared or not: a client's settle wait follows
   // readiness. Tracked in the same synchronous step that makes the record
-  // visible, so no listing can show it `starting` with nothing to wait on. The
-  // auto-share runs once readiness settles and is never awaited here, so it
-  // can neither slow down nor fail this start.
+  // visible, so no listing can show it `starting` with nothing to wait on.
   store.apps[id] = rec;
+  trackTransition(id, rec, { settled: proc.settled, wantsAutoShare, readConfig });
+  await persist();
+  return rec;
+}
+
+// The stored auto-share config of `id` as autoRun reads it: applies to a main
+// checkout only, whatever the file says.
+function autoShareConfigFor(id, isWorktree) {
+  return async () => (!isWorktree && (await appSettings.get(id)).autoShare) || null;
+}
+
+// Begin and track `rec`'s transition: `settled` (the status readiness settled
+// to), followed by its auto-share when one is wanted. Synchronous, so a caller
+// can make it in the same step that makes `rec` visible. The auto-share is
+// never awaited by the caller, so it can neither slow down nor fail it.
+function trackTransition(id, rec, { settled, wantsAutoShare, readConfig }) {
   const gen = autoRun.begin(id, { autoShare: wantsAutoShare });
   autoRun.track(id, wantsAutoShare
     ? autoRun.run({
-      id, gen, settled: proc.settled,
+      id, gen, settled,
       isCurrent: () => store.apps[id] === rec && !rec.tunnel,
-      readConfig: autoShareConfig,
+      readConfig,
       share: (cfg) => share(id, cfg),
     })
-    : proc.settled);
-  await persist();
-  return rec;
+    : settled);
+}
+
+// Boot auto-share of the always-on host conductor, a rule of its own: a normal
+// app is auto-shared only after a start code-hub made, so an adopted one never
+// is; code-hub never starts the always-on app, and the one lifecycle event it
+// owns for it is its own boot, when init() builds the record afresh with no
+// share. So it is auto-shared then, when ticked. It is always running and a
+// share needs only its port, so nothing waits on readiness. Returns whether an
+// auto-share began. Called once code-hub is listening, after init().
+export async function autoShareAlwaysOn() {
+  const id = HOST_CONDUCTOR_ID;
+  const rec = store.apps[id];
+  if (!isHostConductorId(id) || !rec || rec.tunnel) return false;
+  const readConfig = autoShareConfigFor(id, false);
+  const wants = await readConfig().then(Boolean, () => true);
+  if (!wants || store.apps[id] !== rec || rec.tunnel) return false;
+  trackTransition(id, rec, { settled: Promise.resolve('ready'), wantsAutoShare: true, readConfig });
+  return true;
 }
 
 export async function stop(id) {
@@ -932,15 +961,21 @@ export async function getAppSettings(id) {
 }
 
 // Auto-start and auto-share act on a project's main checkout only: enabling
-// either for a worktree, or for the host conductor (which code-hub can't
-// start), is refused before anything is written. Clearing them is always
+// either for a worktree is refused, and so is enabling auto-start for the host
+// conductor (always on, code-hub never starts it; its auto-share applies, see
+// autoShareAlwaysOn). A refused body writes nothing. Clearing them is always
 // allowed, so a hand-edited entry can be cleaned up.
 export async function setAppSettings(id, body) {
   const kind = await appKind(id);
-  const enables = !!body && typeof body === 'object'
-    && (body.autoStart === true || (body.autoShare !== undefined && body.autoShare !== null));
-  if (enables && (kind.isWorktree || kind.hostConductor)) {
-    const e = new Error(`auto-start and auto-share apply only to a project's main checkout — '${id}' is ${kind.isWorktree ? 'a worktree' : 'the host code-conductor'}`);
+  const isObject = !!body && typeof body === 'object';
+  const enablesAutoStart = isObject && body.autoStart === true;
+  const enablesAutoShare = isObject && body.autoShare !== undefined && body.autoShare !== null;
+  if (kind.isWorktree && (enablesAutoStart || enablesAutoShare)) {
+    const e = new Error(`auto-start and auto-share apply only to a project's main checkout — '${id}' is a worktree`);
+    e.statusCode = 400; throw e;
+  }
+  if (kind.hostConductor && enablesAutoStart) {
+    const e = new Error(`auto-start doesn't apply to '${id}' — it is the host code-conductor, which is always on (auto-share does apply)`);
     e.statusCode = 400; throw e;
   }
   return { id, ...(await appSettings.update(id, body)) };
