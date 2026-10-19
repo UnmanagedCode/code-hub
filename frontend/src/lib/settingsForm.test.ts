@@ -95,7 +95,7 @@ test('settingsDraftFor: the stored port is seeded as text', () => {
 // Invariant: blank is valid (it clears), the range is inclusive, anything else is refused.
 test('portError accepts blank and the inclusive range, rejects the rest', () => {
   for (const ok of ['', '  ', ' 1024 ', '65535']) expect(portError(ok)).toBeNull();
-  for (const bad of ['1023', '65536', '30a', '3.5', '-1']) expect(portError(bad)).not.toBeNull();
+  for (const bad of ['1023', '65536', '30a', '3.5', '-1']) expect(portError(bad)).toBe('Port must be a whole number from 1024 to 65535');
 });
 
 // Invariant: the placeholder tells what a blank port falls back to, and from which file.

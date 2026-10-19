@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
 import type { App as AppT, AppSettings } from '@/lib/types';
-import { portNote, portPlaceholder } from '@/lib/settingsForm';
+import { portError, portNote, portPlaceholder } from '@/lib/settingsForm';
 import { app, json, listing, stubFetch, type Call } from '@/test/fixtures';
 
 afterEach(() => { vi.unstubAllGlobals(); });
@@ -111,15 +111,22 @@ describe('Settings dialog', () => {
     expect(puts(calls)[0].body).toStrictEqual({ port: null });
   });
 
-  // Invariant: an out-of-range port disables the submit button, which is also what stops Enter-submit.
-  it('an invalid port disables Save, and Enter in the field sends nothing', async () => {
+  // Invariant: an out-of-range port is flagged inline (message linked to the input), and its disabled submit
+  // button stops Enter-submit even with another field changed — nothing is sent and the dialog stays open.
+  it('an invalid port shows its error, disables Save, and Enter sends nothing', async () => {
     const { user, dialog, calls } = await openSettings([app({ id: 'web' })]);
+    expect(within(dialog).getByText(/^Blank uses the manifest's port/)).toBeTruthy();
     const field = within(dialog).getByLabelText('Fixed port');
+    await user.type(within(dialog).getByLabelText('user'), 'alice');
     await user.type(field, '80');
     expect(field.getAttribute('aria-invalid')).toBe('true');
+    const error = within(dialog).getByText(portError('80')!);
+    expect(error.id).toBeTruthy();
+    expect(field.getAttribute('aria-describedby')).toBe(error.id);
     expect((within(dialog).getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
     await user.type(field, '{Enter}');
     expect(puts(calls)).toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: 'Settings — web' })).toBeTruthy();
   });
 
   // Invariant: a hand-edited invalid port on a worktree (which has no port field) never blocks saving its login.
@@ -146,6 +153,15 @@ describe('Settings dialog', () => {
     const running = app({ id: 'web', status: 'running', port: 41051 });
     const { dialog } = await openSettings([running]);
     expect(within(dialog).getByText(portNote(running)!)).toBeTruthy();
+  });
+
+  // Invariant: while starting, the dialog shows the starting variant of the note, not "running".
+  it('a starting app\'s dialog shows the starting note', async () => {
+    const starting = app({ id: 'web', status: 'starting', port: 41051 });
+    const { dialog } = await openSettings([starting]);
+    const text = portNote(starting)!;
+    expect(text).toContain('starting on :41051');
+    expect(within(dialog).getByText(text)).toBeTruthy();
   });
 
   it('a stopped app\'s dialog shows the port field and no next-start note', async () => {
