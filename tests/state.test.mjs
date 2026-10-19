@@ -83,3 +83,28 @@ test('corrupt state file is moved aside, not fatal', async (t) => {
     return entries.some((n) => n.endsWith('.corrupt'));
   });
 });
+
+// Invariant: saves land in call order, one at a time — a save started while an
+// earlier one is still publishing neither breaks it (they share one tmp path)
+// nor loses to it: the file ends up holding the newer snapshot.
+test('save() serialises: a second save during the first one\'s rename lands after it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const file = path.join(storeRoot(), 'state.json');
+  const realRename = fs.rename;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  fs.rename = async (from, to) => {
+    if (armed && to === file) { armed = false; reached(); await gate; }
+    return realRename.call(fs, from, to);
+  };
+  t.after(() => { release(); fs.rename = realRename; });
+  const first = state.save({ apps: { a: { id: 'a', snapshot: 1 } } });
+  await parked;
+  const second = state.save({ apps: { a: { id: 'a', snapshot: 2 } } });
+  await new Promise((r) => setImmediate(r));
+  release();
+  await Promise.all([first, second]);
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).apps.a.snapshot, 2);
+});

@@ -40,6 +40,20 @@ test('available() reports false for a binary that never answers, within its time
   t.after(() => { delete process.env.FAKE_CLOUDFLARED_MODE; });
   const t0 = Date.now();
   assert.equal(await tunnel.available({ timeoutMs: 300 }), false);
-  assert.ok(Date.now() - t0 < tunnel.PROBE_TIMEOUT_MS, 'answered within the bound, not left hanging');
-  assert.ok(tunnel.PROBE_TIMEOUT_MS > 0 && Number.isFinite(tunnel.PROBE_TIMEOUT_MS));
+  assert.ok(Date.now() - t0 < 2000, 'answered within the 300ms bound it was given (plus spawn slack)');
+});
+
+// Invariant: with no argument — how list() and share() call it — the probe is
+// still bounded, by PROBE_TIMEOUT_MS, so a wedged CLI can neither hang the
+// listing nor hold an app's share slot.
+test('available() with no argument is bounded by PROBE_TIMEOUT_MS', async (t) => {
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  process.env.FAKE_CLOUDFLARED_MODE = 'hang';
+  t.after(() => { delete process.env.FAKE_CLOUDFLARED_MODE; });
+  assert.ok(Number.isFinite(tunnel.PROBE_TIMEOUT_MS) && tunnel.PROBE_TIMEOUT_MS > 0 && tunnel.PROBE_TIMEOUT_MS <= 10_000);
+  const t0 = Date.now();
+  assert.equal(await tunnel.available(), false);
+  const took = Date.now() - t0;
+  assert.ok(took >= tunnel.PROBE_TIMEOUT_MS - 50, `gave up only at the bound (${took}ms)`);
+  assert.ok(took < tunnel.PROBE_TIMEOUT_MS + 3000, `answered within PROBE_TIMEOUT_MS plus slack (${took}ms)`);
 });

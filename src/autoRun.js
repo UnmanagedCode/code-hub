@@ -67,8 +67,12 @@ export async function run({ id, gen, settled, isCurrent, readConfig, share }) {
     await share(cfg);
     finish(id, gen, null);
   } catch (e) {
+    // Cancelled by a deliberate Unshare (the share error says so): not a
+    // failure, nothing to report.
+    if (e.unshared) return finish(id, gen, null);
     // Shared by someone else while this one failed (a manual share landing as
-    // it hit the 409 for a share already in flight, say): the app ended up shared, nothing to report.
+    // it hit the 409 for a share already in flight, say): the app ended up
+    // shared, nothing to report.
     let stillCurrent = true;
     try { stillCurrent = isCurrent(); } catch { /* report the original failure */ }
     if (!stillCurrent) return finish(id, gen, null);

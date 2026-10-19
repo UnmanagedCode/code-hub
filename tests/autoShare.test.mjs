@@ -535,3 +535,99 @@ test('Unshare during an in-flight share cancels it: no share afterwards, no chil
   assert.equal((await getApp(base)).tunnel, null);
   assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false })).status, 200); // nothing left holding the slot
 });
+
+// --- Round 3 ---
+
+// Invariant: a deliberate Unshare while an auto-share is still starting is not
+// an auto-share failure — the card ends unshared with nothing to report, and
+// the cancelled share's child dies.
+test('Unshare during an in-flight auto-share leaves no failure on the card', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tunnel' } });
+  await j(base, 'POST', '/api/apps/app/start');
+  await waitFor(async () => (await cf.pids()).length === 1);
+  const [child] = await cf.pids();
+  assert.equal((await j(base, 'DELETE', '/api/apps/app/share')).status, 200);
+  await cf.open();
+  await settled(base);
+  await waitFor(() => !pidAlive(child));
+  const app = await getApp(base);
+  assert.ok(['ready', 'running'].includes(app.status));
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(app.autoShareError, null);
+});
+
+// Invariant: a re-run init() discards every old record's share with it — a
+// share still inside its post-commit persist (not on disk yet, so invisible to
+// init's sweep) has its tunnel child killed, and the listing shows no share.
+test('init() during a share\'s post-commit persist kills that share\'s child', async (t) => {
+  const { root, base } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await cf.open();
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const stateFile = path.join(storeRoot(), 'state.json');
+  const realRename = fs.rename;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  fs.rename = async (from, to) => {
+    if (armed && to === stateFile) { armed = false; reached(); await gate; }
+    return realRename.call(fs, from, to);
+  };
+  t.after(() => { release(); fs.rename = realRename; });
+  const sharing = j(base, 'POST', '/api/apps/app/share', { mode: 'tunnel' });
+  await parked; // committed in memory, its persist held
+  const [child] = await cf.pids();
+  assert.equal(pidAlive(child), true);
+  const reinit = appManager.init();
+  await waitFor(() => !pidAlive(child));
+  release();
+  await reinit;
+  await sharing;
+  assert.equal((await getApp(base)).tunnel, null);
+});
+
+// Invariant: teardown is record-scoped — called with a stopped (replaced)
+// record it leaves the share committed for the record that replaced it alone;
+// called with that record, it closes it.
+test('teardownShare with a replaced record leaves the current record\'s share live', async (t) => {
+  await boot(t);
+  const old = await appManager.start('app');
+  await appManager.awaitSettled('app');
+  await appManager.stop('app');
+  const current = await appManager.start('app');
+  await appManager.awaitSettled('app');
+  const shared = await appManager.share('app', { mode: 'lan', tls: false });
+  appManager._teardownShare('app', old);
+  assert.equal(await status401(shared.proxyPort), 401);
+  assert.equal((await appManager.list()).apps.find((a) => a.id === 'app').tunnel?.proxyPort, shared.proxyPort);
+  appManager._teardownShare('app', current);
+  await assert.rejects(fetch(`http://127.0.0.1:${shared.proxyPort}/`));
+});
+
+// Invariant: a share queued behind an abandoning one re-reads the app's
+// record once it may go — stopped and restarted during the wait, it shares the
+// process running now, not the one it was queued for.
+test('a queued share re-resolves the record after waiting, and shares the newest process', async (t) => {
+  const { root } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await appManager.start('app');
+  await appManager.awaitSettled('app');
+  const stale = appManager.share('app', { mode: 'tunnel' }).then(() => 200, (e) => e.statusCode);
+  await waitFor(async () => (await cf.pids()).length === 1);
+  await appManager.restart('app');
+  const queued = appManager.share('app', { mode: 'lan', tls: false }); // waits behind `stale`, holding this record
+  await appManager.stop('app');
+  const newest = await appManager.start('app');
+  await cf.open();
+  assert.equal(await stale, 409);
+  const res = await queued;
+  assert.equal(res.kind, 'lan');
+  const app = (await appManager.list()).apps.find((a) => a.id === 'app');
+  assert.equal(app.tunnel?.proxyPort, res.proxyPort);
+  assert.equal(app.port, newest.port);
+  assert.equal(await status401(res.proxyPort), 401);
+});

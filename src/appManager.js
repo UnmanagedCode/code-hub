@@ -61,15 +61,23 @@ export async function init() {
   // timeout. No-op when standalone; every later refresh is fired lazily by
   // discovery and never awaited.
   await conductorProjects.refresh();
-  store = await state.load();
-  // Every record is a fresh object now, so no in-process share state can
-  // belong to one: close it all (teardownShare is record-scoped and would
-  // skip a proxy committed for a record object that no longer exists). Empty
-  // on a real boot; only a re-run init() in one process finds anything.
+  // Every record is about to be replaced by a fresh object, so no in-process
+  // share state may outlive this point: kill the share children of the
+  // records being discarded (one still inside its post-commit persist isn't
+  // on disk yet, so the sweep below would never see it) — which also releases
+  // a committed funnel slot — and close every proxy (teardownShare is
+  // record-scoped and would skip one committed for a record that no longer
+  // exists). A share still in flight is left to abandon itself: its record no
+  // longer exists, so it can't commit, and it keeps its `sharing` entry and
+  // any pending slot claim until it has closed what it started, so a later
+  // share of the app waits for it instead of racing it. Nothing of this
+  // exists on a real boot; only a re-run init() in one process finds any.
+  for (const [id, rec] of Object.entries(store.apps)) if (rec.tunnel) killShareChild(id, rec.tunnel);
   for (const proxy of proxies.values()) proxy.close();
   proxies.clear();
   defaultPasswordShares.clear();
   qrCache.clear();
+  store = await state.load();
   // reconcile drops records whose app pid is dead — which, for an app that
   // died in the same window code-hub did, would delete the only record of a
   // still-running share child. It hands those back instead of stranding them
@@ -582,9 +590,11 @@ const sharing = new Map();
 
 function abandoned(id, op) {
   const e = new Error(op.cancelled
-    ? `'${id}''s share was cancelled by an unshare while it was starting`
+    ? `the share of '${id}' was cancelled by an unshare while it was starting`
     : `'${id}' was stopped or replaced while its share was starting — share it again`);
   e.statusCode = 409;
+  // A deliberate Unshare is not a failure: autoRun records nothing for it.
+  if (op.cancelled) e.unshared = true;
   return e;
 }
 
@@ -933,6 +943,9 @@ export async function clearAppSettings(id) {
   await appSettings.clear(id);
   return { id, ...appSettings.describe(undefined) };
 }
+
+// Test seam: teardownShare itself, for its record-scoping.
+export { teardownShare as _teardownShare };
 
 // Long-poll for a client: resolves when `id`'s start transition (readiness,
 // plus its auto-share) has finished, or at autoRun's cap.

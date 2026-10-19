@@ -148,3 +148,14 @@ test('a share rejecting after the start stopped being current records no failure
   });
   assert.deepEqual(autoRun.view('raced'), { autoShareStatus: null, autoShareError: null, autoStartError: null });
 });
+
+// Invariant: a share cancelled by a deliberate Unshare (its error flagged
+// `unshared`) records no failure, even while the start is still current.
+test('a share rejected as cancelled by an unshare records no failure', async () => {
+  const gen = autoRun.begin('unshared', { autoShare: true });
+  await autoRun.run({
+    id: 'unshared', gen, settled: Promise.resolve('ready'), isCurrent: () => true, readConfig: async () => CFG,
+    share: async () => { throw Object.assign(new Error("the share of 'unshared' was cancelled by an unshare while it was starting"), { statusCode: 409, unshared: true }); },
+  });
+  assert.deepEqual(autoRun.view('unshared'), { autoShareStatus: null, autoShareError: null, autoStartError: null });
+});
