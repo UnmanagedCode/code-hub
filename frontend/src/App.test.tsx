@@ -593,6 +593,26 @@ describe('transitions and automation', () => {
     expect(alert.textContent).toContain("'other' already has a tailscale share");
   });
 
+  // Invariant: the always-on card surfaces its auto-share outcome like any card: pending as a status with Share
+  // disabled, failed as an alert with the reason.
+  it('always-on: auto-share pending and failed show on the card', async () => {
+    const user = userEvent.setup();
+    const conductor = (over: Partial<AppT>) => running({ id: 'code-conductor', alwaysOn: true, ...over });
+    const { routes } = stubFetch({
+      'GET api/apps': listing([conductor({ autoShareStatus: 'pending' })]),
+      'GET api/apps/code-conductor/settled': { id: 'code-conductor', settled: false },
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'code-conductor' });
+    expect(within(card).getByRole('status').textContent).toBe('Sharing automatically…');
+    expect((within(card).getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled).toBe(true);
+    routes['GET api/apps'] = listing([conductor({ autoShareStatus: 'failed', autoShareError: 'cloudflared is not installed' })]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    const alert = await within(card).findByRole('alert');
+    expect(alert.textContent).toContain('Auto-share failed');
+    expect(alert.textContent).toContain('cloudflared is not installed');
+  });
+
   // Invariant: the card's Share control is disabled while the app is starting or its auto-share is running, and
   // enabled again once neither holds.
   it('Share is disabled on a starting card and on one with an auto-share pending', async () => {

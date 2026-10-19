@@ -51,13 +51,38 @@ describe('Settings dialog', () => {
     expect(within(dialog).queryByRole('checkbox', { name: 'Share automatically when started' })).toBeNull();
   });
 
-  // Invariant: the always-on host conductor's card has Settings too, with the login and no automation toggles.
-  it('the always-on card opens Settings with the login fields only', async () => {
-    const { dialog } = await openSettings([app({ id: 'code-conductor', status: 'running', alwaysOn: true })], 'code-conductor');
+  // Invariant: the always-on dialog renders what automationFor decides: the login, auto-start present but disabled
+  // and unchecked — even with a hand-written autoStart:true stored — with its reason attached, and auto-share enabled.
+  it('the always-on card\'s Settings has the login, a disabled unchecked auto-start with its reason, and auto-share', async () => {
+    const { dialog } = await openSettings(
+      [app({ id: 'code-conductor', status: 'running', alwaysOn: true, settings: settings({ autoStart: true }) })],
+      'code-conductor',
+    );
     expect(within(dialog).getByLabelText('user')).toBeTruthy();
     expect(within(dialog).getByLabelText('pass')).toBeTruthy();
-    expect(within(dialog).queryByRole('checkbox', { name: 'Start automatically when code-hub starts' })).toBeNull();
-    expect(within(dialog).queryByRole('checkbox', { name: 'Share automatically when started' })).toBeNull();
+    const autoStart = within(dialog).getByRole('checkbox', { name: 'Start automatically when code-hub starts' }) as HTMLButtonElement;
+    expect(autoStart.disabled).toBe(true);
+    expect(autoStart.getAttribute('aria-checked')).toBe('false');
+    const reasonId = autoStart.getAttribute('aria-describedby');
+    expect(reasonId).toBeTruthy();
+    expect(document.getElementById(reasonId!)?.textContent?.trim()).toBeTruthy();
+    const autoShare = within(dialog).getByRole('checkbox', { name: 'Share automatically when code-hub starts' }) as HTMLButtonElement;
+    expect(autoShare.disabled).toBe(false);
+  });
+
+  // Invariant: saving the always-on dialog sends what the server accepts: the auto-share, never autoStart.
+  it('always-on: tick auto-share, keep LAN, Save → one PUT {autoShare} with no autoStart, a reload, closed', async () => {
+    const { user, dialog, calls } = await openSettings(
+      [app({ id: 'code-conductor', status: 'running', alwaysOn: true, settings: settings({ autoStart: true }) })],
+      'code-conductor',
+      { 'PUT api/apps/code-conductor/settings': { id: 'code-conductor' } },
+    );
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Share automatically when code-hub starts' }));
+    const before = gets(calls);
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(puts(calls)).toStrictEqual([{ method: 'PUT', url: 'api/apps/code-conductor/settings', body: { autoShare: { mode: 'lan', auth: true, tls: true } } }]);
+    expect(gets(calls)).toBe(before + 1);
   });
 
   // Invariant: Save sends exactly the helper's patch in one PUT, then reloads the listing and closes.

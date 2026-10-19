@@ -8,14 +8,15 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useHub } from '@/hub';
 import { cardLabel } from '@/lib/appView';
-import { automationAllowed, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
+import { automationFor, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
 import { PASSWORD_MASK, shareModes } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
 /**
  * An app's stored settings, reachable from its card in every state: the default share login, and — for a main
- * checkout code-hub can start — auto-start at boot and auto-share on start. The draft is local: it is seeded when
- * the dialog opens, and the modal dialog keeps the listing's rare refreshes from reaching it.
+ * checkout — the automation toggles `automationFor` offers (auto-start at boot, auto-share on start; the always-on
+ * conductor's auto-start shows disabled with its reason). The draft is local: it is seeded when the dialog opens,
+ * and the modal dialog keeps the listing's rare refreshes from reaching it.
  */
 export function SettingsDialog({ app }: { app: App }) {
   const hub = useHub();
@@ -46,12 +47,27 @@ export function SettingsDialog({ app }: { app: App }) {
       setSaving(false);
     }
   };
-  const check = (key: 'forgetPassword' | 'autoStart' | 'autoShare' | 'auth' | 'tls', label: string) => (
-    <div className="flex items-center gap-2">
-      <Checkbox id={`${ids}-${key}`} checked={draft[key]} onCheckedChange={(v) => set({ [key]: v === true })} />
-      <Label htmlFor={`${ids}-${key}`} className="font-normal">{label}</Label>
+  // A disabled checkbox renders unchecked, whatever the draft holds; `description` is attached to it for assistive tech.
+  const check = (
+    key: 'forgetPassword' | 'autoStart' | 'autoShare' | 'auth' | 'tls',
+    label: string,
+    { disabled = false, description = null }: { disabled?: boolean; description?: string | null } = {},
+  ) => (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <Checkbox
+          id={`${ids}-${key}`}
+          checked={!disabled && draft[key]}
+          disabled={disabled}
+          aria-describedby={description ? `${ids}-${key}-desc` : undefined}
+          onCheckedChange={(v) => set({ [key]: v === true })}
+        />
+        <Label htmlFor={`${ids}-${key}`} className="font-normal">{label}</Label>
+      </div>
+      {description && <p id={`${ids}-${key}-desc`} className="ml-6 text-xs text-muted-foreground">{description}</p>}
     </div>
   );
+  const automation = automationFor(app);
   const modes = shareModes(!!hub.data?.cloudflaredAvailable, !!hub.data?.tailscaleAvailable);
   const chosen = modes.find((m) => m.mode === draft.mode);
 
@@ -93,12 +109,15 @@ export function SettingsDialog({ app }: { app: App }) {
               {app.settings.hasPassword && check('forgetPassword', 'Forget stored password')}
               <p className="text-xs text-muted-foreground">Applies to new shares; a live share keeps its login.</p>
             </fieldset>
-            {automationAllowed(app) && (
+            {(automation.autoStart || automation.autoShare) && (
               <fieldset className="flex flex-col gap-2">
                 <legend className="mb-1 text-sm font-medium">Automation</legend>
-                {check('autoStart', 'Start automatically when code-hub starts')}
-                {check('autoShare', 'Share automatically when started')}
-                {draft.autoShare && (
+                {automation.autoStart && check('autoStart', 'Start automatically when code-hub starts', {
+                  disabled: !!automation.autoStart.disabledReason,
+                  description: automation.autoStart.disabledReason,
+                })}
+                {automation.autoShare && check('autoShare', automation.autoShare.label)}
+                {automation.autoShare && draft.autoShare && (
                   <div className="ml-6 flex flex-col gap-2">
                     <div role="radiogroup" aria-label="Auto-share via" className="flex flex-wrap gap-3">
                       {modes.map((m) => (

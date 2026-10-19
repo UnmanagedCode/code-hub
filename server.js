@@ -42,8 +42,9 @@ export async function start({ port = Number(process.env.PORT) || 7000, host = pr
   const addr = server.address();
   // eslint-disable-next-line no-console
   console.log(`code-hub listening on http://${host}:${addr.port}`);
-  // In the background, once listening: a slow or failing app start must
-  // neither delay nor block the hub's own boot.
+  // In the background, once listening: a slow or failing share or app start
+  // must neither delay nor block the hub's own boot, nor each other.
+  appManager.autoShareAlwaysOn().catch((e) => console.error('[code-hub] always-on auto-share failed:', e));
   appManager.autoStartAll().catch((e) => console.error('[code-hub] auto-start failed:', e));
   return server;
 }
