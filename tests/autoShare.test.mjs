@@ -631,3 +631,37 @@ test('a queued share re-resolves the record after waiting, and shares the newest
   assert.equal(app.port, newest.port);
   assert.equal(await status401(res.proxyPort), 401);
 });
+
+// Invariant: once a re-run init() has swept the old records' shares, a share
+// that was still in flight cannot commit — not even while init() is still
+// loading the fresh records — so no live share is left that the listing
+// doesn't show: it answers 409 and its tunnel child dies.
+test('a share reaching its commit while a re-run init() is loading state does not commit', async (t) => {
+  const { root } = await boot(t);
+  const cf = gatedCloudflared(t, root);
+  await appManager.start('app');
+  await appManager.awaitSettled('app');
+  const sharing = appManager.share('app', { mode: 'tunnel' }).then(() => 200, (e) => e.statusCode);
+  await waitFor(async () => (await cf.pids()).length === 1); // in flight, its URL held back
+  const [child] = await cf.pids();
+
+  const stateFile = path.join(storeRoot(), 'state.json');
+  const realRead = fs.readFile;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  fs.readFile = async (p, ...rest) => {
+    if (armed && p === stateFile) { armed = false; reached(); await gate; }
+    return realRead.call(fs, p, ...rest);
+  };
+  t.after(() => { release(); fs.readFile = realRead; });
+
+  const reinit = appManager.init();
+  await parked; // swept, and now inside state.load()
+  await cf.open(); // the share reaches its commit point while the load is held
+  assert.equal(await sharing, 409);
+  await waitFor(() => !pidAlive(child));
+  release();
+  await reinit;
+  assert.equal((await appManager.list()).apps.find((a) => a.id === 'app').tunnel, null);
+});

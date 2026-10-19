@@ -72,7 +72,14 @@ export async function init() {
   // any pending slot claim until it has closed what it started, so a later
   // share of the app waits for it instead of racing it. Nothing of this
   // exists on a real boot; only a re-run init() in one process finds any.
-  for (const [id, rec] of Object.entries(store.apps)) if (rec.tunnel) killShareChild(id, rec.tunnel);
+  //
+  // The store is emptied FIRST, before any await: an in-flight share checks
+  // `store.apps[id] === rec` right before committing, so for as long as the
+  // old store were still in place (the load below awaits) it could commit a
+  // live, unlisted share after the sweep had already run.
+  const discarded = store;
+  store = { apps: {} };
+  for (const [id, rec] of Object.entries(discarded.apps)) if (rec.tunnel) killShareChild(id, rec.tunnel);
   for (const proxy of proxies.values()) proxy.close();
   proxies.clear();
   defaultPasswordShares.clear();
