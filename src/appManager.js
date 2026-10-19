@@ -471,8 +471,9 @@ export async function start(id) {
   // drops a record: tear the share down first.
   if (existing?.tunnel) teardownShare(id, existing);
   const app = await findDiscovered(id);
-  // Read strictly: an unreadable store can't say whether the app has a fixed
-  // port, and starting anyway could silently move it.
+  // An I/O failure reading the store propagates and refuses the start: without
+  // it the app's fixed port is unknown, and starting anyway could silently move
+  // it. (A corrupt file is not a failure — readAll() degrades it to empty.)
   const settings = await appSettings.get(id);
   // The app's Settings port beats its manifest's; a worktree never has one (its
   // manifest port is stripped in discovery, and a hand-written settings port is ignored).

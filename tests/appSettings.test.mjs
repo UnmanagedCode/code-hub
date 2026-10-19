@@ -192,6 +192,16 @@ test('prototype-named ids (__proto__, constructor) are stored and read as ordina
   assert.deepEqual(Object.keys(await appSettings.readAll()), []);
 });
 
+// Invariant: the empty-body refusal names all five settable keys.
+test('an empty body is refused with the full list of keys', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await assert.rejects(
+    appSettings.update('app', {}),
+    (e) => e.statusCode === 400 && e.message === 'provide at least one of username, password, autoStart, autoShare, port',
+  );
+});
+
 // Invariant: an entry holding only a login (the shape the file had before the
 // toggles existed) reads as both toggles off.
 test('an entry with only username/password describes and gets as autoStart off, autoShare null', async (t) => {

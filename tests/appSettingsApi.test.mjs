@@ -330,7 +330,7 @@ test('a worktree id refuses autoStart/autoShare with a 400 naming the rule, but 
   for (const body of [{ autoStart: true }, { autoShare: { mode: 'lan' } }, { username: 'x', autoStart: true }, { port: 4100 }, { username: 'x', port: 4100 }]) {
     const res = await j(base, 'PUT', '/api/apps/app%3Afeat/settings', body);
     assert.equal(res.status, 400, JSON.stringify(body));
-    assert.match(res.body.error, /only to a project's main checkout — 'app:feat' is a worktree/);
+    assert.equal(res.body.error, "auto-start, auto-share and a fixed port apply only to a project's main checkout — 'app:feat' is a worktree");
   }
   assert.equal(await fs.readFile(appSettings.appSettingsFile(), 'utf8'), before);
   assert.equal((await j(base, 'PUT', '/api/apps/app%3Afeat/settings', { autoStart: false, autoShare: null, port: null })).status, 200);

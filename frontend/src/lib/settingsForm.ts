@@ -73,6 +73,11 @@ export function settingsDraftFor(app: Pick<App, 'settings'>): SettingsDraft {
   };
 }
 
+/** The port error the dialog shows and Save honours; null when the app can't carry a port, so a stale stored one never blocks Save. */
+export function portErrorFor(draft: Pick<SettingsDraft, 'port'>, app: Pick<App, 'isWorktree' | 'alwaysOn'>): string | null {
+  return mainCheckoutSettingsAllowed(app) ? portError(draft.port) : null;
+}
+
 /** Why the typed port can't be saved, or null when it can; blank is valid (it clears the setting). */
 export function portError(text: string): string | null {
   const t = text.trim();
@@ -93,7 +98,8 @@ export function portPlaceholder(app: Pick<App, 'manifestPort' | 'source'>): stri
 /** Said while the app is up: a changed port takes effect on the next start. */
 export function portNote(app: Pick<App, 'status' | 'port'>): string | null {
   if (app.status !== 'starting' && app.status !== 'ready' && app.status !== 'running') return null;
-  return `Applies on the next start or restart${app.port === undefined ? '.' : ` — running on :${app.port} now.`}`;
+  if (app.port === undefined) return 'Applies on the next start or restart.';
+  return `Applies on the next start or restart — ${app.status === 'starting' ? 'starting' : 'running'} on :${app.port} now.`;
 }
 
 const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>

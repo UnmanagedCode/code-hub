@@ -111,8 +111,8 @@ describe('Settings dialog', () => {
     expect(puts(calls)[0].body).toStrictEqual({ port: null });
   });
 
-  // Invariant: an out-of-range port can't be saved, by button or by Enter.
-  it('an invalid port blocks Save', async () => {
+  // Invariant: an out-of-range port disables the submit button, which is also what stops Enter-submit.
+  it('an invalid port disables Save, and Enter in the field sends nothing', async () => {
     const { user, dialog, calls } = await openSettings([app({ id: 'web' })]);
     const field = within(dialog).getByLabelText('Fixed port');
     await user.type(field, '80');
@@ -120,6 +120,25 @@ describe('Settings dialog', () => {
     expect((within(dialog).getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
     await user.type(field, '{Enter}');
     expect(puts(calls)).toHaveLength(0);
+  });
+
+  // Invariant: a hand-edited invalid port on a worktree (which has no port field) never blocks saving its login.
+  it('a worktree with an invalid stored port can still Save a username change', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({
+      'GET api/apps': listing([app({ id: 'web' }), app({ id: 'web:k', project: 'web', name: 'web', isWorktree: true, branch: 'feat', settings: settings({ port: 80 }) })]),
+      'PUT api/apps/web%3Ak/settings': { id: 'web:k' },
+    });
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: '1 worktree' }));
+    await user.click(within(screen.getByRole('article', { name: 'web — feat' })).getByRole('button', { name: 'Settings' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Settings — web — feat' });
+    await user.type(within(dialog).getByLabelText('user'), 'alice');
+    const save = within(dialog).getByRole('button', { name: 'Save' }) as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+    await user.click(save);
+    await waitFor(() => expect(puts(calls)).toHaveLength(1));
+    expect(puts(calls)[0].body).toStrictEqual({ username: 'alice' });
   });
 
   // Invariant: a running app's dialog says a changed port applies on the next start; a stopped one's doesn't.

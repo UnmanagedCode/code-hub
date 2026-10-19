@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useHub } from '@/hub';
 import { cardLabel } from '@/lib/appView';
-import { automationFor, mainCheckoutSettingsAllowed, portError, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
+import { automationFor, mainCheckoutSettingsAllowed, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
 import { PASSWORD_MASK, shareModes } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
@@ -34,10 +34,9 @@ export function SettingsDialog({ app }: { app: App }) {
     }
     setOpen(next);
   };
-  const portErr = portError(draft.port);
+  const portErr = portErrorFor(draft, app);
   const note = portNote(app);
   const save = async () => {
-    if (portErr) return;
     const body = settingsPatch(draft, app);
     if (!body) return setOpen(false);
     setSaving(true);

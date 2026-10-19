@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { automationFor, mainCheckoutSettingsAllowed, portError, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
+import { automationFor, mainCheckoutSettingsAllowed, portError, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
 import type { AppSettings } from './types';
 import { app } from '@/test/fixtures';
 
@@ -107,11 +107,13 @@ test('portPlaceholder shows what blank falls back to', () => {
   expect(portPlaceholder({ manifestPort: null, source: 'manifest' })).toBe('free port');
 });
 
-// Invariant: the next-start note is shown only while the app is up, and names its current port.
+// Invariant: the next-start note is shown only while the app is up; it names the current port, says "starting"
+// (not "running") until ready, and never renders an undefined port.
 test('portNote is present only while the app is up', () => {
-  for (const status of ['starting', 'ready', 'running'] as const) {
-    expect(portNote({ status, port: 41051 })).toContain(':41051');
-  }
+  expect(portNote({ status: 'running', port: 41051 })).toBe('Applies on the next start or restart — running on :41051 now.');
+  expect(portNote({ status: 'ready', port: 41051 })).toBe('Applies on the next start or restart — running on :41051 now.');
+  expect(portNote({ status: 'starting', port: 41051 })).toBe('Applies on the next start or restart — starting on :41051 now.');
+  expect(portNote({ status: 'running', port: undefined })).toBe('Applies on the next start or restart.');
   for (const status of ['stopped', 'crashed'] as const) expect(portNote({ status, port: undefined })).toBeNull();
 });
 
@@ -129,4 +131,11 @@ test('settingsPatch: a changed, valid port on a main checkout', () => {
     const w = withSettings({}, over);
     expect(settingsPatch(draftOf(w, { port: '4100' }), w)).toBeNull();
   }
+});
+
+// Invariant: a stored invalid port only raises an error for an app that can carry a port.
+test('portErrorFor is null for a worktree or always-on app, whatever the draft holds', () => {
+  expect(portErrorFor({ port: '80' }, app())).not.toBeNull();
+  expect(portErrorFor({ port: '80' }, app({ isWorktree: true, id: 'web:k' }))).toBeNull();
+  expect(portErrorFor({ port: '80' }, app({ alwaysOn: true }))).toBeNull();
 });

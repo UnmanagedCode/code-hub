@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, writeRegistrations, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 // The app's Settings `port` as the fixed port: Settings beats the manifest, a
 // blank falls back, and every fixed-port rule (busy refusal, no fallback, LAN
@@ -184,4 +186,57 @@ test('a Settings port busy at boot fails the auto-start on the card', async (t) 
   const app = await getApp(base);
   assert.equal(app.status, 'stopped');
   assert.match(app.autoStartError, /will not fall back/);
+});
+
+// Invariant: the availability pre-check applies to a Settings port too — one held
+// only on another local address (which the app, binding loopback, could still
+// start beside) is refused, so the check can't be gated on the manifest's port.
+test('a Settings port held only on another local address is refused', async (t) => {
+  const lanIp = localIPv4s({ lanFallback: true })[0];
+  const host = (await altLoopbackBindable()) ? ALT_LOOPBACK : lanIp;
+  if (!host) return t.skip('no alternate local address on this host');
+  const b = await freePort();
+  const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
+  await setPort(base, b);
+  const blocker = net.createServer();
+  await new Promise((r) => blocker.listen(b, host, r));
+  t.after(() => new Promise((r) => blocker.close(r)));
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 409, JSON.stringify(res.body));
+  assert.match(res.body.error, /already in use/);
+  assert.equal((await getApp(base)).status, 'stopped');
+});
+
+// Invariant: a Settings-port child that hits EADDRINUSE after a clean pre-check is
+// refused and never retried onto another port, so the runner's `fixed` flag
+// can't be derived from the manifest's port.
+test('a Settings-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', async (t) => {
+  const b = await freePort();
+  const root0 = await mkRoot();
+  const marker = path.join(root0, 'flaky-marker');
+  t.after(() => rmRoot(root0));
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('flaky', marker) }]]);
+  await setPort(base, b);
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 409, JSON.stringify(res.body));
+  assert.match(res.body.error, /already in use/);
+  const app = await getApp(base);
+  assert.equal(app.status, 'stopped');
+  assert.equal(app.port, undefined);
+});
+
+// Invariant: a registry-sourced app exposes its registration's port as
+// `manifestPort`, with `source: 'registry'`.
+test('a registration port is exposed as manifestPort with source registry', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkProject(root, 'reg', { start: fakeAppCmd() });
+  await fs.rm(path.join(root, 'reg', '.hub.json'));
+  await writeRegistrations(root, { reg: { start: fakeAppCmd(), port: 4400 } });
+  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  await appManager.init();
+  const app = (await appManager.list()).apps.find((a) => a.id === 'reg');
+  assert.equal(app.source, 'registry');
+  assert.equal(app.manifestPort, 4400);
 });
