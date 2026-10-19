@@ -215,7 +215,7 @@ test('credPatchBody: never emits saveAsDefault', () => {
 
 test('resolveTlsReshareNote: the three wordings, keyed on a stored default password', () => {
   expect(resolveTlsReshareNote(false, { hasPassword: true })).toBe('Changing TLS re-shares the app — new link & QR.');
-  expect(resolveTlsReshareNote(true, app({ settings: { username: null, hasPassword: true, autoStart: false, autoShare: null } }).settings)).toBe("Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).");
+  expect(resolveTlsReshareNote(true, app({ settings: { username: null, hasPassword: true, autoStart: false, autoShare: null, port: null } }).settings)).toBe("Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).");
   expect(resolveTlsReshareNote(true, null)).toBe('Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).');
   // Keyed on a stored default PASSWORD: a username-only default still gets a random password on re-share.
   expect(resolveTlsReshareNote(true, { hasPassword: false })).toBe(resolveTlsReshareNote(true, null));

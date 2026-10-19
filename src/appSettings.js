@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { storeRoot } from './projects.js';
+import { storeRoot, isValidFixedPort, MIN_FIXED_PORT, MAX_FIXED_PORT } from './projects.js';
 import { validateShareOptions } from './shareOptions.js';
 
 // Per-app settings: the default login a NEW share of an app starts with (see
@@ -10,10 +10,13 @@ import { validateShareOptions } from './shareOptions.js';
 // in a project tree. Shape, keyed by exact app id (a worktree does NOT inherit
 // its parent project's entry):
 //   { "<id>": { "username"?: string, "password"?: string,
-//               "autoStart"?: true, "autoShare"?: { mode, auth, tls? } } }
+//               "autoStart"?: true, "autoShare"?: { mode, auth, tls? },
+//               "port"?: number } }
 // Each field is independent; `autoStart` is stored only when true, and an
-// entry with none of the four keys is deleted, never kept. Whether the two
-// toggles may be set for an id (main checkouts only) is appManager's call.
+// entry with none of the five keys is deleted, never kept. `port` is the app's
+// fixed port, overriding the manifest's (see appManager.start). Whether the
+// toggles and the port may be set for an id (main checkouts only) is
+// appManager's call.
 //
 // The password is plaintext at rest, so the file is always (re)written 0600 —
 // state.json and registrations.json go out with the process umask, which is
@@ -109,6 +112,7 @@ export async function get(id) {
     password: entry?.password ?? null,
     autoStart: entry?.autoStart === true,
     autoShare: entry?.autoShare ?? null,
+    port: entry?.port ?? null,
   };
 }
 
@@ -120,6 +124,7 @@ export function describe(entry) {
     hasPassword: typeof entry?.password === 'string',
     autoStart: entry?.autoStart === true,
     autoShare: entry?.autoShare ?? null,
+    port: entry?.port ?? null,
   };
 }
 
@@ -127,16 +132,16 @@ function badRequest(msg) {
   const e = new Error(msg); e.statusCode = 400; return e;
 }
 
-const KEYS = ['username', 'password', 'autoStart', 'autoShare'];
+const KEYS = ['username', 'password', 'autoStart', 'autoShare', 'port'];
 
 // Per field: key absent → keep. username/password: null → clear, non-empty
 // string → set (trimmed). autoStart: a boolean (false clears). autoShare: null
 // → clear, else share options (validateShareOptions, mode required) stored
-// normalised. Anything else → 400. Validates the whole body before touching
+// normalised. port: null → clear, an integer in the fixed-port range → set. Anything else → 400. Validates the whole body before touching
 // the file.
 function parseChanges(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body) || !KEYS.some((k) => k in body)) {
-    throw badRequest('provide at least one of username, password, autoStart, autoShare');
+    throw badRequest('provide at least one of username, password, autoStart, autoShare, port');
   }
   const changes = {};
   for (const key of ['username', 'password']) {
@@ -155,6 +160,12 @@ function parseChanges(body) {
     if (v === null) changes.autoShare = null;
     else if (typeof v === 'object' && !Array.isArray(v)) changes.autoShare = validateShareOptions(v);
     else throw badRequest("'autoShare' must be { mode, auth?, tls? }, or null to clear");
+  }
+  if ('port' in body) {
+    const v = body.port;
+    if (v === null) changes.port = null;
+    else if (isValidFixedPort(v)) changes.port = v;
+    else throw badRequest(`'port' must be an integer between ${MIN_FIXED_PORT} and ${MAX_FIXED_PORT}, or null to clear`);
   }
   return changes;
 }

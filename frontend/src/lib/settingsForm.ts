@@ -25,6 +25,15 @@ export function automationFor(app: Pick<App, 'isWorktree' | 'alwaysOn'>): Automa
   return { autoStart: { disabledReason: null }, autoShare: { label: 'Share automatically when started' } };
 }
 
+/** The fixed port is offered only for a project's main checkout that code-hub can start (not a worktree, not the always-on conductor). */
+export function mainCheckoutSettingsAllowed(app: Pick<App, 'isWorktree' | 'alwaysOn'>): boolean {
+  return !app.isWorktree && !app.alwaysOn;
+}
+
+// The server's rule is `isValidFixedPort` in `src/projects.js`, which re-checks every save.
+export const MIN_FIXED_PORT = 1024;
+export const MAX_FIXED_PORT = 65535;
+
 export interface SettingsDraft {
   username: string;
   /** Typed to replace the stored password; blank keeps it. */
@@ -36,6 +45,8 @@ export interface SettingsDraft {
   /** LAN only, like `tls`. */
   auth: boolean;
   tls: boolean;
+  /** The fixed port as typed; blank clears it. */
+  port: string;
 }
 
 export interface SettingsPatch {
@@ -43,6 +54,7 @@ export interface SettingsPatch {
   password?: string | null;
   autoStart?: boolean;
   autoShare?: AutoShare | null;
+  port?: number | null;
 }
 
 // The password field always starts blank: the stored one never enters the DOM.
@@ -57,7 +69,37 @@ export function settingsDraftFor(app: Pick<App, 'settings'>): SettingsDraft {
     mode: s.autoShare?.mode ?? 'lan',
     auth: s.autoShare?.auth ?? true,
     tls: s.autoShare?.tls ?? true,
+    port: s.port === null ? '' : String(s.port),
   };
+}
+
+/** The port error the dialog shows and Save honours; null when the app can't carry a port, so a stale stored one never blocks Save. */
+export function portErrorFor(draft: Pick<SettingsDraft, 'port'>, app: Pick<App, 'isWorktree' | 'alwaysOn'>): string | null {
+  return mainCheckoutSettingsAllowed(app) ? portError(draft.port) : null;
+}
+
+/** Why the typed port can't be saved, or null when it can; blank is valid (it clears the setting). */
+export function portError(text: string): string | null {
+  const t = text.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  if (!/^\d+$/.test(t) || n < MIN_FIXED_PORT || n > MAX_FIXED_PORT) {
+    return `Port must be a whole number from ${MIN_FIXED_PORT} to ${MAX_FIXED_PORT}`;
+  }
+  return null;
+}
+
+/** What a blank port falls back to: the manifest's port and the file it came from, else a free port. */
+export function portPlaceholder(app: Pick<App, 'manifestPort' | 'source'>): string {
+  if (app.manifestPort === null) return 'free port';
+  return `${app.manifestPort} (from ${app.source === 'registry' ? 'registrations.json' : '.hub.json'})`;
+}
+
+/** Said while the app is up: a changed port takes effect on the next start. */
+export function portNote(app: Pick<App, 'status' | 'port'>): string | null {
+  if (app.status !== 'starting' && app.status !== 'ready' && app.status !== 'running') return null;
+  if (app.port === undefined) return 'Applies on the next start or restart.';
+  return `Applies on the next start or restart — ${app.status === 'starting' ? 'starting' : 'running'} on :${app.port} now.`;
 }
 
 const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>
@@ -65,7 +107,7 @@ const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>
 
 /**
  * The PUT body for what the draft changed, or null when nothing did. Both login fields are sent trimmed, as the server
- * stores them. A blanked username clears it; a typed password replaces the stored one, else "forget" clears it. Each toggle is sent only where `automationFor` offers it enabled.
+ * stores them. A blanked username clears it; a typed password replaces the stored one, else "forget" clears it. Each toggle is sent only where `automationFor` offers it enabled; the port only where `mainCheckoutSettingsAllowed`, and an invalid port is left out.
  */
 export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 'isWorktree' | 'alwaysOn'>): SettingsPatch | null {
   const s = app.settings;
@@ -75,6 +117,11 @@ export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 
   const password = draft.password.trim();
   if (password) body.password = password;
   else if (draft.forgetPassword && s.hasPassword) body.password = null;
+  if (mainCheckoutSettingsAllowed(app) && portError(draft.port) === null) {
+    const t = draft.port.trim();
+    const want = t === '' ? null : Number(t);
+    if (want !== (s.port ?? null)) body.port = want;
+  }
   const v = automationFor(app);
   if (v.autoStart && !v.autoStart.disabledReason && draft.autoStart !== s.autoStart) body.autoStart = draft.autoStart;
   if (v.autoShare) {

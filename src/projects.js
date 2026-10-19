@@ -15,6 +15,14 @@ const DEFAULT_PROJECTS_ROOT = path.resolve(
 );
 
 export const MANIFEST_FILENAME = '.hub.json';
+
+// The range of an app's fixed port, whether it comes from a manifest or from
+// the app's Settings (appSettings.js).
+export const MIN_FIXED_PORT = 1024;
+export const MAX_FIXED_PORT = 65535;
+export function isValidFixedPort(v) {
+  return Number.isInteger(v) && v >= MIN_FIXED_PORT && v <= MAX_FIXED_PORT;
+}
 export const STORE_DIRNAME = '.code-hub';
 export const REGISTRY_FILENAME = 'registrations.json';
 
@@ -234,8 +242,8 @@ export function validateManifestObject(obj, file = MANIFEST_FILENAME) {
     if (problem) throw new Error(`${file}: "readyWhen" ${problem}`);
   }
   if (obj.port != null) {
-    if (!Number.isInteger(obj.port) || obj.port < 1024 || obj.port > 65535) {
-      throw new Error(`${file}: "port" must be an integer between 1024 and 65535 (got ${JSON.stringify(obj.port)})`);
+    if (!isValidFixedPort(obj.port)) {
+      throw new Error(`${file}: "port" must be an integer between ${MIN_FIXED_PORT} and ${MAX_FIXED_PORT} (got ${JSON.stringify(obj.port)})`);
     }
   }
   let routes = null;

@@ -8,7 +8,7 @@ import { mkRoot, rmRoot, mkProject } from './helpers.mjs';
 
 const file = () => path.join(storeRoot(), 'app-settings.json');
 const legacyFile = () => path.join(storeRoot(), 'share-defaults.json');
-const OFF = { autoStart: false, autoShare: null };
+const OFF = { autoStart: false, autoShare: null, port: null };
 
 test('update/get round-trips through the file (survives a restart)', async (t) => {
   const root = await mkRoot();
@@ -192,6 +192,16 @@ test('prototype-named ids (__proto__, constructor) are stored and read as ordina
   assert.deepEqual(Object.keys(await appSettings.readAll()), []);
 });
 
+// Invariant: the empty-body refusal names all five settable keys.
+test('an empty body is refused with the full list of keys', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await assert.rejects(
+    appSettings.update('app', {}),
+    (e) => e.statusCode === 400 && e.message === 'provide at least one of username, password, autoStart, autoShare, port',
+  );
+});
+
 // Invariant: an entry holding only a login (the shape the file had before the
 // toggles existed) reads as both toggles off.
 test('an entry with only username/password describes and gets as autoStart off, autoShare null', async (t) => {
@@ -208,7 +218,7 @@ test('an entry with only username/password describes and gets as autoStart off, 
 test('autoStart: true is stored, false removes the key, and an entry emptied of every field is deleted', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  assert.deepEqual(await appSettings.update('app', { autoStart: true }), { username: null, hasPassword: false, autoStart: true, autoShare: null });
+  assert.deepEqual(await appSettings.update('app', { autoStart: true }), { username: null, hasPassword: false, autoStart: true, autoShare: null, port: null });
   assert.deepEqual(JSON.parse(await fs.readFile(file(), 'utf8')), { app: { autoStart: true } });
   await appSettings.update('app', { username: 'alice', autoShare: { mode: 'tunnel' } });
   await appSettings.update('app', { autoStart: false });
@@ -293,4 +303,46 @@ test('migrateLegacyFile: with neither file present creates nothing', async (t) =
   await appSettings.migrateLegacyFile();
   await assert.rejects(fs.access(file()));
   await assert.rejects(fs.access(legacyFile()));
+});
+
+// Invariant: a port is stored in the file, reported by get/describe, and
+// clearing a port-only entry deletes it.
+test('port round-trips through the file; clearing a port-only entry deletes it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  assert.deepEqual(await appSettings.update('app', { port: 4100 }), { username: null, hasPassword: false, ...OFF, port: 4100 });
+  assert.deepEqual(JSON.parse(await fs.readFile(file(), 'utf8')), { app: { port: 4100 } });
+  assert.equal((await appSettings.get('app')).port, 4100);
+  assert.deepEqual(await appSettings.update('app', { port: null }), { username: null, hasPassword: false, ...OFF });
+  assert.deepEqual({ ...(await appSettings.readAll()) }, {});
+});
+
+// Invariant: an entry holding only a port counts as non-empty, so clearing
+// another key keeps it, and only clearing its last key deletes the entry.
+test('an entry holding only a port is kept; clearing its last key deletes it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await appSettings.update('app', { username: 'alice' });
+  await appSettings.update('app', { port: 4100 });
+  await appSettings.update('app', { username: null });
+  assert.deepEqual({ ...(await appSettings.readAll()) }, { app: { port: 4100 } });
+  await appSettings.update('app', { port: null });
+  assert.deepEqual({ ...(await appSettings.readAll()) }, {});
+});
+
+// Invariant: an invalid port is refused with a 400 naming the rule, before any
+// write.
+test('invalid ports are refused before any write', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await appSettings.update('app', { username: 'alice' });
+  const before = await fs.readFile(file(), 'utf8');
+  for (const port of [1023, 65536, 3000.5, '3000', true, {}]) {
+    await assert.rejects(
+      appSettings.update('app', { username: 'bob', port }),
+      (e) => e.statusCode === 400 && e.message === "'port' must be an integer between 1024 and 65535, or null to clear",
+      JSON.stringify(port),
+    );
+  }
+  assert.equal(await fs.readFile(file(), 'utf8'), before);
 });

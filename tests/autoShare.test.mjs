@@ -268,22 +268,44 @@ test('Stop after a failed auto-share leaves autoShareStatus, autoShareError and 
   assert.equal(stopped.autoStartError, null);
 });
 
-// Invariant: an unreadable settings file during a start is reported on the
-// card, never swallowed into a silent, unshared start.
-test('an unreadable app-settings.json during a start shows an auto-share failure on the card', async (t) => {
+// Invariant: a start whose settings can't be read is refused, since the app's
+// fixed port can't be known — nothing is spawned and no record is written.
+test('an unreadable settings file refuses the start, since its port can\'t be known', async (t) => {
   quiet(t);
   const { base } = await boot(t);
   const file = appSettings.appSettingsFile();
   await fs.mkdir(file, { recursive: true }); // a directory where the file belongs: EISDIR, even as root
   t.after(() => fs.rm(file, { recursive: true, force: true }));
+  const res = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(res.status, 500);
+  assert.match(res.body.error, /EISDIR|directory/);
+  await fs.rm(file, { recursive: true }); // the listing reads the file too
+  assert.equal((await getApp(base)).status, 'stopped');
+});
+
+// Invariant: a settings file that becomes unreadable between the start and
+// readiness is reported on the card, never swallowed into a silent, unshared
+// start.
+test('a settings file that becomes unreadable before readiness is reported on the card', async (t) => {
+  quiet(t);
+  const { root, base, ids } = await boot(t, []);
+  const app = await gatedApp(t, root, ids);
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'lan', tls: false } });
   assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  const file = appSettings.appSettingsFile();
+  const saved = await fs.readFile(file, 'utf8');
+  await fs.rm(file);
+  await fs.mkdir(file, { recursive: true });
+  t.after(() => fs.rm(file, { recursive: true, force: true }));
+  await app.open();
   await settled(base);
   await fs.rm(file, { recursive: true }); // the listing reads the file too
-  const app = await getApp(base);
-  assert.ok(['ready', 'running'].includes(app.status));
-  assert.equal(app.tunnel, null);
-  assert.equal(app.autoShareStatus, 'failed');
-  assert.match(app.autoShareError, /EISDIR|directory/);
+  await fs.writeFile(file, saved);
+  const listed = await getApp(base);
+  assert.ok(['ready', 'running'].includes(listed.status));
+  assert.equal(listed.tunnel, null);
+  assert.equal(listed.autoShareStatus, 'failed');
+  assert.match(listed.autoShareError, /EISDIR|directory/);
 });
 
 // Invariant: one share operation per app at a time — a share overlapping an

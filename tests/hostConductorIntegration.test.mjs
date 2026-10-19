@@ -561,7 +561,7 @@ test('embedded: PUT autoStart:true on the host code-conductor is a 400; autoShar
 
   const shared = await put({ autoShare: { mode: 'lan' } });
   assert.equal(shared.status, 200);
-  const stored = { autoStart: false, autoShare: { mode: 'lan', auth: true, tls: true } };
+  const stored = { autoStart: false, autoShare: { mode: 'lan', auth: true, tls: true }, port: null };
   assert.deepEqual((await j(base, 'GET', '/api/apps/code-conductor/settings')).body, { id: 'code-conductor', username: null, hasPassword: false, ...stored });
 
   const both = await put({ autoStart: true, autoShare: { mode: 'tunnel' } });
@@ -569,6 +569,11 @@ test('embedded: PUT autoStart:true on the host code-conductor is a 400; autoShar
   assert.match(both.body.error, /host code-conductor/);
   assert.deepEqual((await j(base, 'GET', '/api/apps/code-conductor/settings')).body, { id: 'code-conductor', username: null, hasPassword: false, ...stored });
 
+  // A fixed port is refused like auto-start: code-hub never starts the always-on app.
+  const port = await put({ port: 4100 });
+  assert.equal(port.status, 400);
+  assert.equal(port.body.error, "auto-start and a fixed port don't apply to 'code-conductor' — it is the host code-conductor, which is always on (auto-share does apply)");
+  assert.equal((await put({ port: null })).status, 200);
   assert.equal((await put({ autoStart: false })).status, 200);
   const ok = await put({ username: 'alice' });
   assert.equal(ok.status, 200);
