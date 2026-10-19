@@ -153,3 +153,20 @@ test('a pinned port that is free starts normally', async (t) => {
   runner.stop({ id: 'pinned-ok', pgid: rec.pgid });
   await waitFor(() => !pidAlive(rec.pgid));
 });
+
+// Invariant: the readiness outcome is observable as a promise on start()'s
+// result — 'ready' once the app answers, 'crashed' for one that exits first.
+test('start() returns a settled promise: ready for a healthy app, crashed for one that exits', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd() });
+  const ok = { id: 'settle-ok', path: dir, manifest: { start: fakeAppCmd(), healthPath: null, readyWhen: null } };
+  const rec = await runner.start(ok, await allocatePort());
+  t.after(() => runner.stop({ id: 'settle-ok', pgid: rec.pgid }));
+  assert.equal(await rec.settled, 'ready');
+  assert.equal(runner.runtime('settle-ok').status, 'ready');
+
+  const bad = { id: 'settle-crash', path: dir, manifest: { start: fakeAppCmd('crash'), healthPath: null, readyWhen: null } };
+  const crashed = await runner.start(bad, await allocatePort());
+  assert.equal(await crashed.settled, 'crashed');
+});

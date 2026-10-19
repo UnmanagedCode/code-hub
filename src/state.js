@@ -30,12 +30,21 @@ export async function load() {
   }
 }
 
-export async function save(state) {
-  const dir = storeRoot();
-  await fs.mkdir(dir, { recursive: true });
-  const tmp = path.join(dir, `.${process.pid}.tmp`);
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-  await fs.rename(tmp, stateFile());
+// Saves run one at a time: they share one tmp path, so two overlapping (a
+// start persisting while its auto-share persists) could rename each other's
+// file away, or publish an older snapshot last. Each serialises `state` when
+// its turn comes, so the last save to land holds the latest state.
+let queue = Promise.resolve();
+export function save(state) {
+  const run = queue.then(async () => {
+    const dir = storeRoot();
+    await fs.mkdir(dir, { recursive: true });
+    const tmp = path.join(dir, `.${process.pid}.tmp`);
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2));
+    await fs.rename(tmp, stateFile());
+  });
+  queue = run.catch(() => {});
+  return run;
 }
 
 // True if the process is still alive (signal 0 probes without killing).

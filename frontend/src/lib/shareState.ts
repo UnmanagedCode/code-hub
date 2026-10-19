@@ -2,7 +2,7 @@
 // and the auth-off merge are unit-testable without rendering. No dependencies,
 // no DOM access.
 
-import type { App, CredDraft, ShareDefaults, ShareKind, SharePatch, ShareState, Tunnel } from './types';
+import type { App, AppSettings, CredDraft, ShareKind, SharePatch, ShareState, Tunnel } from './types';
 
 // The panel draws from two sources: `s` = the UI's share state for the app (the
 // one-time share() response, in-memory only — wiped on a full UI refresh) and
@@ -119,8 +119,7 @@ export function resolveCredNote(shared: Partial<Tunnel>): string {
 
 // Masking an app's DEFAULT share password. `passwordIsDefault` (from the server)
 // marks a live share whose password is the app's stored default (seeded from
-// it, or saved as it by a ticked "Also save as this app's default login");
-// generated and other share-time-edited passwords stay plaintext. The mask is
+// it); generated and share-time-edited passwords stay plaintext. The mask is
 // a fixed width so it doesn't reveal the length. The real value stays in
 // `shared.password` for Copy, but is never put into an <input> — the edit
 // drafts below start blank instead, and blank means keep.
@@ -143,19 +142,17 @@ export function pruneDrafts(drafts: Record<string, unknown>, apps: Pick<App, 'id
 }
 
 // The Edit form's initial draft for a live share. `kind` 'lan' also carries the
-// auth/TLS toggles, which only a LAN share has. "Also save as this app's
-// default login" starts unticked.
+// auth/TLS toggles, which only a LAN share has.
 export function credDraftFor(shared: Partial<Tunnel>, kind: ShareKind): CredDraft {
   const creds = {
     username: shared.username ?? '',
     password: shared.passwordIsDefault ? '' : (shared.password ?? ''),
-    saveAsDefault: false,
   };
   return kind === 'lan' ? { auth: shared.auth !== false, tls: shared.tls !== false, ...creds } : creds;
 }
 
-// Whether the Edit form shows the user/pass fields and the save-as-default
-// checkbox: always for an always-gated share, for LAN only while auth is on.
+// Whether the Edit form shows the user/pass fields: always for an
+// always-gated share, for LAN only while auth is on.
 export function credFieldsShown(editing: Pick<CredDraft, 'auth'>, kind: ShareKind): boolean {
   return kind !== 'lan' || !!editing.auth;
 }
@@ -168,14 +165,12 @@ export function credPasswordPlaceholder(editing: Pick<CredDraft, 'password'>, sh
 export interface CredPatchBody {
   username?: string;
   password?: string;
-  saveAsDefault?: true;
 }
 
 // A credentials PATCH body from an Edit draft, or null when there's nothing to
 // send. Blank fields mean "keep"; `onlyChanged` also drops a field equal to
 // the live value (an in-place edit), whereas a fresh re-share sends every
-// typed field. A ticked save-as-default always sends a body (the flag alone
-// pins the share's current login as the default).
+// typed field.
 export function credPatchBody(editing: CredDraft, shared: Partial<Tunnel>, { onlyChanged }: { onlyChanged: boolean }): CredPatchBody | null {
   const body: CredPatchBody = {};
   for (const key of ['username', 'password'] as const) {
@@ -184,17 +179,16 @@ export function credPatchBody(editing: CredDraft, shared: Partial<Tunnel>, { onl
     if (onlyChanged && v === (shared[key] ?? '')) continue;
     body[key] = v;
   }
-  if (editing.saveAsDefault) body.saveAsDefault = true;
   return Object.keys(body).length ? body : null;
 }
 
 // The Edit form's note when a LAN share's TLS toggle is about to change: that
 // re-shares, and a re-share starts from the app's default login if it has one.
-// `defaults` is app.shareDefaults; keyed on a stored default PASSWORD, since
-// with only a default username the password still resets to a random one.
-export function resolveTlsReshareNote(auth: boolean | undefined, defaults: ShareDefaults | null | undefined): string {
+// `settings` is app.settings; keyed on a stored default PASSWORD, since with
+// only a default username the password still resets to a random one.
+export function resolveTlsReshareNote(auth: boolean | undefined, settings: Pick<AppSettings, 'hasPassword'> | null | undefined): string {
   if (!auth) return 'Changing TLS re-shares the app — new link & QR.';
-  if (defaults?.hasPassword) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
+  if (settings?.hasPassword) return "Changing TLS re-shares the app — new link & QR, and the login resets to this app's default (type below to override).";
   return 'Changing TLS re-shares the app — new link & QR, and the password resets (set one below to keep it).';
 }
 
@@ -224,6 +218,10 @@ export type SharePanelView =
   | { view: 'choosing' }
   | { view: 'loading' }
   | { view: 'error'; error: string }
+  /** An auto-share is running for this app's latest start. */
+  | { view: 'autoPending' }
+  /** The auto-share after its latest start failed, and no share has replaced it. */
+  | { view: 'autoFailed'; error: string }
   | { view: 'none' }
   | {
       view: 'active';
@@ -243,13 +241,18 @@ export type SharePanelView =
 
 // What the share panel shows, in precedence order: the mode picker, a share in
 // flight, a failed share (over a live app.tunnel too, so the failure is seen),
-// nothing, or the live share. `editing` is whether the app's Edit form is open.
-export function sharePanelView(s: ShareState | undefined, app: Pick<App, 'tunnel' | 'port'>, editing: boolean): SharePanelView {
+// the live share, an auto-share in flight, a failed auto-share, or nothing.
+// `editing` is whether the app's Edit form is open.
+export function sharePanelView(s: ShareState | undefined, app: Pick<App, 'tunnel' | 'port' | 'autoShareStatus' | 'autoShareError'>, editing: boolean): SharePanelView {
   if (s && typeof s === 'object' && 'choosing' in s) return { view: 'choosing' };
   if (s === 'loading') return { view: 'loading' };
   const shared = app.tunnel || (s && typeof s === 'object' && 'url' in s && s.url ? s : null);
   if (s && typeof s === 'object' && 'error' in s && s.error) return { view: 'error', error: s.error };
-  if (!shared) return { view: 'none' };
+  if (!shared) {
+    if (app.autoShareStatus === 'pending') return { view: 'autoPending' };
+    if (app.autoShareStatus === 'failed') return { view: 'autoFailed', error: app.autoShareError ?? 'auto-share failed' };
+    return { view: 'none' };
+  }
   const kind = shared.kind || 'tunnel';
   const hasCreds = shared.auth !== false && !!shared.username && !!shared.password;
   return {

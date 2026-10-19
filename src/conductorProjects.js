@@ -92,7 +92,7 @@ export async function refresh() {
     } catch {
       // Conductor down, restarting on another port, timed out, non-JSON body:
       // every one of these keeps the last good answer. Silent by design — the
-      // conductor is optional context, and a warning on a 2s poll loop would
+      // conductor is optional context, and a warning on every listing would
       // be noise, not a signal.
     } finally {
       lastAttemptAt = now();

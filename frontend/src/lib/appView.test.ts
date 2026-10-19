@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { controlsFor, groupApps, listView, metaItems, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
+import { autoStartNotice, controlsFor, groupApps, listView, metaItems, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
 import { app } from '@/test/fixtures';
 
 const ids = (list: { id: string }[]) => list.map((a) => a.id);
+
+// Invariant: a failed boot auto-start is announced on the card with its reason; otherwise nothing is.
+it('autoStartNotice: the failure text, or null', () => {
+  expect(autoStartNotice(app({ autoStartError: 'port 3000 is busy' }))).toBe('Auto-start failed: port 3000 is busy');
+  expect(autoStartNotice(app())).toBe(null);
+});
 
 describe('sortApps', () => {
   const a = app({ id: 'a', name: 'Zed', status: 'stopped', lastCommitAt: '2026-01-01T00:00:00Z' });
@@ -64,9 +70,19 @@ describe('controlsFor', () => {
     expect(controlsFor(app({ status: 'stopped', manifestError: 'bad json' }), false).start).toStrictEqual({ disabled: true });
     expect(controlsFor(app({ status: 'stopped', sourceMissing: true }), false).start).toStrictEqual({ disabled: true });
   });
+  // Invariant: Share waits out a start and an auto-share in flight (one share per app at a time), while Stop and
+  // Restart stay available.
+  it('starting or auto-share pending: Share disabled, Stop and Restart enabled', () => {
+    for (const over of [{ status: 'starting' as const }, { status: 'running' as const, autoShareStatus: 'pending' as const }]) {
+      expect(controlsFor(app(over), false)).toStrictEqual({
+        start: null, stop: { disabled: false }, restart: { disabled: false }, share: { label: 'Share', disabled: true },
+      });
+    }
+    expect(controlsFor(app({ status: 'running', autoShareStatus: 'failed' }), false).share).toStrictEqual({ label: 'Share', disabled: false });
+  });
   // Invariant: a running app offers Stop, Restart and Share; Restart is off with the source gone; busy disables all.
   it('running: Stop, Restart, Share', () => {
-    for (const status of ['starting', 'ready', 'running'] as const) {
+    for (const status of ['ready', 'running'] as const) {
       expect(controlsFor(app({ status }), false)).toStrictEqual({
         start: null, stop: { disabled: false }, restart: { disabled: false }, share: { label: 'Share', disabled: false },
       });

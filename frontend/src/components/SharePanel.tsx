@@ -64,6 +64,21 @@ export function SharePanel({ app }: { app: App }) {
       </p>
     );
   }
+  if (v.view === 'autoPending') {
+    return (
+      <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+        <LoaderCircleIcon className="size-4 animate-spin" aria-hidden />
+        Sharing automatically…
+      </p>
+    );
+  }
+  if (v.view === 'autoFailed') {
+    return (
+      <Alert variant="destructive">
+        <AlertDescription>Auto-share failed: {v.error}</AlertDescription>
+      </Alert>
+    );
+  }
   if (v.view === 'error') {
     return (
       <Alert variant="destructive">

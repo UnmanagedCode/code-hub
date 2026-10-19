@@ -174,3 +174,30 @@ test('looksLikeFunnel tells a funnel child from an unrelated process', async (t)
   assert.equal(tailscale.looksLikeFunnel(process.pid), false, 'this test runner is not a funnel');
   assert.equal(tailscale.looksLikeFunnel(null), false);
 });
+
+// Invariant: a wedged `tailscale status` answers "not available" within the
+// probe's bound instead of hanging the caller (a share would hold its app's one
+// share slot for as long as this takes).
+test('available() reports false for a status call that never answers, within its timeout', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  process.env.FAKE_TAILSCALE_MODE = 'hang';
+  t.after(() => { delete process.env.FAKE_TAILSCALE_MODE; });
+  const t0 = Date.now();
+  assert.equal(await tailscale.available({ timeoutMs: 300 }), false);
+  assert.ok(Date.now() - t0 < 2000, 'answered within the 300ms bound it was given (plus spawn slack)');
+});
+
+// Invariant: with no argument — how list() and share() call it — the probe is
+// still bounded, by PROBE_TIMEOUT_MS, so a wedged CLI can neither hang the
+// listing nor hold an app's share slot.
+test('available() with no argument is bounded by PROBE_TIMEOUT_MS', async (t) => {
+  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+  process.env.FAKE_TAILSCALE_MODE = 'hang';
+  t.after(() => { delete process.env.FAKE_TAILSCALE_MODE; });
+  assert.ok(Number.isFinite(tailscale.PROBE_TIMEOUT_MS) && tailscale.PROBE_TIMEOUT_MS > 0 && tailscale.PROBE_TIMEOUT_MS <= 10_000);
+  const t0 = Date.now();
+  assert.equal(await tailscale.available(), false);
+  const took = Date.now() - t0;
+  assert.ok(took >= tailscale.PROBE_TIMEOUT_MS - 50, `gave up only at the bound (${took}ms)`);
+  assert.ok(took < tailscale.PROBE_TIMEOUT_MS + 3000, `answered within PROBE_TIMEOUT_MS plus slack (${took}ms)`);
+});

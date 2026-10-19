@@ -668,7 +668,7 @@ test('a worktree whose key carries the reserved qualifier is refused, and warns 
 test('a refused worktree that was never going to serve anything is skipped silently', async (t) => {
   // Warn scoping, mirroring the root pass: no own manifest source and no
   // parent to inherit from means nothing was lost, so nothing is logged on
-  // every 2s discovery poll.
+  // every discovery.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkWorktree(root, 'orphan', 'we:ird', null); // no parent, no manifest
@@ -764,7 +764,7 @@ test('a qualified id never resolves to a root directory of that exact name', asy
 
 test('an unservable root dir carrying the reserved qualifier is skipped silently', async (t) => {
   // The warning exists to explain a vanished app; a dir that was never
-  // servable must not log on every 2s discovery poll.
+  // servable must not log on every discovery.
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   await mkProject(root, 'alpha', { start: 'x' });
@@ -1028,7 +1028,7 @@ test('a root directory of the same name wins, and the suppressed overlay row war
 
 test('a conductor path that agrees with the root directory does not warn', async (t) => {
   // Scoping, same as the `:` refusals: loud only when the suppression cost
-  // something. Agreement costs nothing, and a warning on every 2s poll would
+  // something. Agreement costs nothing, and a warning on every listing would
   // be noise.
   const root = await mkRoot();
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); });
@@ -1146,7 +1146,7 @@ test('a shadowed conductor path with no manifest source does NOT warn', async (t
   // The suppression is announced only when it cost a card. If the conductor's
   // tree has no `.hub.json` and no registration, no row would have been
   // emitted for it even with the root directory out of the way, so there is
-  // nothing to report — and a warning here would fire on every 2s poll.
+  // nothing to report — and a warning here would fire on every listing.
   const root = await mkRoot();
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-outside-'));
   t.after(async () => { resetConductorOverlay(); await rmRoot(root); await rmRoot(outside); });

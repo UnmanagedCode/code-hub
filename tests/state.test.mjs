@@ -83,3 +83,46 @@ test('corrupt state file is moved aside, not fatal', async (t) => {
     return entries.some((n) => n.endsWith('.corrupt'));
   });
 });
+
+// Invariant: saves land in call order, one at a time — a save started while an
+// earlier one is still publishing neither breaks it (they share one tmp path)
+// nor loses to it: both resolve, first then second, and the file ends up
+// holding the newer snapshot.
+//
+// The overlap is forced, not timed. The first save is parked at its rename. A
+// save that doesn't wait its turn touches the filesystem the moment it is
+// called (its mkdir), and is then let run all the way to its rename before the
+// first is released — so it writes the shared tmp file over the first one's
+// and renames it away, and the first save's rename fails (ENOENT). A save that
+// waits its turn touches nothing yet, so the first is released at once.
+test('save() serialises: a save started during another\'s rename lands after it, both resolving in order', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const file = path.join(storeRoot(), 'state.json');
+  const realRename = fs.rename;
+  const realMkdir = fs.mkdir;
+  let mkdirs = 0;
+  let release, parked, secondRenamed;
+  const gate = new Promise((r) => { release = r; });
+  const firstParked = new Promise((r) => { parked = r; });
+  const secondAtRename = new Promise((r) => { secondRenamed = r; });
+  let renames = 0;
+  fs.mkdir = async (...args) => { mkdirs += 1; return realMkdir.apply(fs, args); };
+  fs.rename = async (from, to) => {
+    if (to === file && ++renames === 1) { parked(); await gate; }
+    else if (to === file) secondRenamed();
+    return realRename.call(fs, from, to);
+  };
+  t.after(() => { release(); fs.rename = realRename; fs.mkdir = realMkdir; });
+
+  const order = [];
+  const first = state.save({ apps: { a: { id: 'a', snapshot: 1 } } }).then(() => order.push('first'));
+  await firstParked;
+  const before = mkdirs;
+  const second = state.save({ apps: { a: { id: 'a', snapshot: 2 } } }).then(() => order.push('second'));
+  if (mkdirs > before) await secondAtRename; // it didn't wait: let it overlap the first all the way
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ['first', 'second']);
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).apps.a.snapshot, 2);
+});

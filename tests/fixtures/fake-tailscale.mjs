@@ -21,6 +21,11 @@
 //   ignore-sigterm  funnel never exits on SIGTERM, so only a SIGKILL reaps it
 //   slow-start  funnel takes ~400ms to announce itself, so a test can act on
 //               the app while a share is still in flight
+//   hang        `status` never answers (a wedged daemon/CLI)
+//
+// FAKE_TAILSCALE_GATE: a funnel holds its announcement back until this file
+//   exists (polled), so a test can act while a tailscale share is
+//   deterministically still coming up — with no timing involved.
 //
 // FAKE_TAILSCALE_ARGV_LOG: append one timestamped JSON line per invocation, and
 //   another when a funnel exits — so a test can assert WHICH port was funnelled
@@ -28,7 +33,7 @@
 // FAKE_TAILSCALE_CHILD_PID_FILE: the funnel spawns a child of its own (in the
 //   same process group) and writes its pid here — that child only dies if the
 //   whole GROUP is signalled, which is what pins stopFunnel's `kill(-pid)`.
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const args = process.argv.slice(2);
@@ -50,6 +55,7 @@ if (args[0] === 'status') {
   // The real binary prints human-readable text without --json; parsing that as
   // JSON throws, which would 501 every share on every host.
   if (!args.includes('--json')) die('status without --json would print human text, not JSON');
+  if (mode === 'hang') { setInterval(() => {}, 1 << 30); await new Promise(() => {}); }
   const payload = mode === 'logged-out'
     ? { BackendState: 'NeedsLogin', Self: { DNSName: DNS_NAME } }
     : mode === 'no-magicdns'
@@ -98,7 +104,10 @@ if (args[0] === 'funnel') {
     process.stdout.write(`|-- proxy ${target}\n\n`);
     process.stdout.write('Press Ctrl+C to exit.\n');
   };
-  if (mode === 'slow-start') setTimeout(announce, 400);
+  const gate = process.env.FAKE_TAILSCALE_GATE;
+  if (gate) {
+    const poll = setInterval(() => { if (existsSync(gate)) { clearInterval(poll); announce(); } }, 20);
+  } else if (mode === 'slow-start') setTimeout(announce, 400);
   else announce();
   setInterval(() => {}, 1 << 30); // block
 } else {

@@ -7,11 +7,16 @@ function bin() {
 
 const URL_RE = /https:\/\/(?!api\.)[\w-]+\.trycloudflare\.com/;
 const START_TIMEOUT_MS = 30000;
+// Bound on the `--version` probe: a share holds its app's one share slot while
+// it waits on this, so a wedged binary must cost a "not installed", not a
+// share slot held forever.
+export const PROBE_TIMEOUT_MS = 5000;
 
-// Whether the cloudflared binary is runnable. Cached per call — cheap enough.
-export function available() {
+// Whether the cloudflared binary is runnable within `timeoutMs` (a probe that
+// overruns is killed and counts as not runnable). Not cached — cheap enough.
+export function available({ timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    execFile(bin(), ['--version'], (err) => resolve(!err));
+    execFile(bin(), ['--version'], { timeout: timeoutMs, killSignal: 'SIGKILL' }, (err) => resolve(!err));
   });
 }
 

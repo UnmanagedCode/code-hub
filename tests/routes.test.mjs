@@ -857,7 +857,7 @@ test('list() kills the funnel before dropping the record of an app that died unn
   const fpid = await funnelPidOf('demo');
   assert.ok(pidAlive(fpid));
 
-  // The app dies on its own. The next poll notices and drops the record.
+  // The app dies on its own. The next listing notices and drops the record.
   process.kill(-appChild.pid, 'SIGKILL');
   await waitFor(() => !pidAlive(appChild.pid));
   const after = (await j(base, 'GET', '/api/apps')).body.apps.find((a) => a.id === 'demo');
@@ -951,7 +951,7 @@ test('a funnel that dies on its own is reaped, and frees the slot for another ap
 });
 
 // share() must reap a dead holder ITSELF, not rely on a poll having happened
-// first — the UI can post a share between polls, and a 409 citing a funnel
+// first — the UI can post a share between listings, and a 409 citing a funnel
 // that no longer exists would wedge the feature until a restart. Deliberately
 // no GET /api/apps anywhere in this test.
 test('a dead holder does not block the next share even with no poll in between', async (t) => {

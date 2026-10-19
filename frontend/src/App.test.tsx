@@ -1,16 +1,17 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
-import { POLL_MS } from '@/lib/useApps';
 import type { App as AppT, Tunnel } from '@/lib/types';
 import { app, json, listing, stubFetch } from '@/test/fixtures';
 
-// The poll is driven by hand; testing-library's own waits keep real timeouts.
-beforeEach(() => { vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }); });
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); Reflect.deleteProperty(document, 'visibilityState'); });
 
-const tick = () => act(async () => { vi.advanceTimersByTime(POLL_MS); });
+// A tab-return refresh, as the browser signals it.
+const tabReturn = () => act(async () => {
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+  document.dispatchEvent(new Event('visibilitychange'));
+});
 const gets = (calls: { method: string; url: string }[]) => calls.filter((c) => c.method === 'GET' && c.url === 'api/apps').length;
 const writes = (calls: { method: string; url: string; body: unknown }[]) => calls.filter((c) => c.method !== 'GET');
 
@@ -52,20 +53,32 @@ describe('list states', () => {
     expect(await screen.findByText('No apps found. Add a .hub.json to a sibling project.')).toBeTruthy();
   });
 
-  // Invariant: a poll failure after a successful load keeps the cards and says they are stale.
-  it('a poll failure after load keeps the list and shows the stale alert', async () => {
+  // Invariant: a failed refresh after a successful load keeps the cards and says they are stale.
+  it('a failed manual Refresh after load keeps the list and shows the stale alert', async () => {
+    const user = userEvent.setup();
     const { routes, calls } = stubFetch({ 'GET api/apps': listing([app({ id: 'web' })]) });
     render(<App />);
     await screen.findByRole('article', { name: 'web' });
     routes['GET api/apps'] = () => json({ error: 'down' }, 502);
     const before = gets(calls);
-    await tick();
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(gets(calls)).toBe(before + 1));
     expect((await screen.findByRole('alert')).textContent).toMatch(/^Can't reach code-hub — showing data from /);
     expect(screen.getByRole('article', { name: 'web' })).toBeTruthy();
     routes['GET api/apps'] = listing([app({ id: 'web' })]);
-    await tick();
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+
+  // Invariant: nothing on the page reloads the listing on a timer.
+  it('after the first load, minutes pass with no further GET api/apps', async () => {
+    vi.useFakeTimers();
+    const { calls } = stubFetch({ 'GET api/apps': listing([running()]) });
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole('article', { name: 'web' })).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10 * 60_000); });
+    expect(gets(calls)).toBe(1);
   });
 
   // Invariant: the header reports which share backends are available.
@@ -111,7 +124,7 @@ describe('layout', () => {
       expect(list.classList.contains(c), c).toBe(true);
     }
     routes['GET api/apps'] = () => json({ error: 'down' }, 502);
-    await tick();
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Refresh' }));
     expect((await screen.findByRole('alert')).classList.contains('col-span-full')).toBe(true);
   });
 });
@@ -210,8 +223,8 @@ describe('actions', () => {
 });
 
 describe('edit form', () => {
-  // Invariant: a poll does not disturb an open Edit form: the typed value and the focus survive it.
-  it('typing in the Edit form keeps its value and focus across a poll', async () => {
+  // Invariant: a refresh does not disturb an open Edit form: the typed value and the focus survive it.
+  it('typing in the Edit form keeps its value and focus across a tab-return refresh', async () => {
     const user = userEvent.setup();
     const { calls } = stubFetch({ 'GET api/apps': listing([running({ tunnel: TUNNEL })]) });
     render(<App />);
@@ -221,7 +234,7 @@ describe('edit form', () => {
     await user.clear(userInput);
     await user.type(userInput, 'alice');
     const before = gets(calls);
-    await tick();
+    await tabReturn();
     await waitFor(() => expect(gets(calls)).toBe(before + 1));
     const after = within(card).getByLabelText('user') as HTMLInputElement;
     expect(after).toBe(userInput);
@@ -471,20 +484,16 @@ describe('edit form details', () => {
     }
   });
 
-  // Invariant: ticking "Also save as this app's default login" sends saveAsDefault on the credentials PATCH.
-  it('ticking save-as-default sends saveAsDefault: true', async () => {
+  // Invariant: the live share's Edit form no longer offers saving its login as the default (Settings owns it).
+  it('the Edit form has no save-as-default checkbox', async () => {
     const user = userEvent.setup();
-    const { calls } = stubFetch({
-      'GET api/apps': listing([running({ tunnel: TUNNEL })]),
-      'PATCH api/apps/web/share/credentials': { id: 'web', username: 'hub', password: 'pw', passwordIsDefault: true },
-    });
+    stubFetch({ 'GET api/apps': listing([running({ tunnel: LAN })]) });
     render(<App />);
     const card = await screen.findByRole('article', { name: 'web' });
     await user.click(within(card).getByRole('button', { name: 'Edit' }));
-    await user.click(within(card).getByRole('checkbox', { name: "Also save as this app's default login" }));
-    await user.click(within(card).getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(writes(calls)).toHaveLength(1));
-    expect(writes(calls)).toStrictEqual([{ method: 'PATCH', url: 'api/apps/web/share/credentials', body: { saveAsDefault: true } }]);
+    const form = within(card).getByRole('form', { name: 'Edit share login' });
+    expect(within(form).getAllByRole('checkbox').map((c) => c.getAttribute('aria-label') ?? form.querySelector(`label[for="${c.id}"]`)?.textContent)).toStrictEqual(['Authentication', 'TLS (HTTPS)']);
+    expect(within(form).queryByText(/default login/)).toBeNull();
   });
 
   // Invariant: a draft whose app left the listing is dropped, so it does not reopen when the app comes back.
@@ -497,7 +506,7 @@ describe('edit form details', () => {
     const poll = async (apps: AppT[]) => {
       routes['GET api/apps'] = listing(apps);
       const before = gets(calls);
-      await tick();
+      await tabReturn();
       await waitFor(() => expect(gets(calls)).toBe(before + 1));
       await act(async () => {});
     };
@@ -539,5 +548,76 @@ describe('list details', () => {
     expect(within(select).getAllByRole('option').map((o) => [o.textContent, (o as HTMLOptionElement).value])).toStrictEqual([
       ['Last edited', 'edited'], ['Name', 'name'], ['Status', 'status'],
     ]);
+  });
+});
+
+describe('transitions and automation', () => {
+  // Invariant: a Start's transition reaches the page with no poll: the starting listing opens one settle wait,
+  // and the listing loaded after it shows the app running.
+  it('Start: starting → one GET settled → the next listing shows running', async () => {
+    const user = userEvent.setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const { routes, calls } = stubFetch({
+      'GET api/apps': listing([app({ id: 'web' })]),
+      'POST api/apps/web/start': { id: 'web' },
+      'GET api/apps/web/settled': async () => { await gate; return json({ id: 'web', settled: true }); },
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    routes['GET api/apps'] = listing([app({ id: 'web', status: 'starting' })]);
+    await user.click(within(card).getByRole('button', { name: 'Start' }));
+    await within(card).findByText('starting');
+    const settles = () => calls.filter((c) => c.url === 'api/apps/web/settled').length;
+    await waitFor(() => expect(settles()).toBe(1));
+    routes['GET api/apps'] = listing([running()]);
+    release();
+    expect(await within(card).findByText('running')).toBeTruthy();
+    expect(settles()).toBe(1);
+  });
+
+  // Invariant: the card shows an auto-share in flight as a status, and its failure as an alert with the reason.
+  it('auto-share pending shows "Sharing automatically…", failed shows the error', async () => {
+    const user = userEvent.setup();
+    const { routes } = stubFetch({
+      'GET api/apps': listing([running({ autoShareStatus: 'pending' })]),
+      'GET api/apps/web/settled': { id: 'web', settled: false },
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    expect(within(card).getByRole('status').textContent).toBe('Sharing automatically…');
+    routes['GET api/apps'] = listing([running({ autoShareStatus: 'failed', autoShareError: "'other' already has a tailscale share" })]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    const alert = await within(card).findByRole('alert');
+    expect(alert.textContent).toContain('Auto-share failed');
+    expect(alert.textContent).toContain("'other' already has a tailscale share");
+  });
+
+  // Invariant: the card's Share control is disabled while the app is starting or its auto-share is running, and
+  // enabled again once neither holds.
+  it('Share is disabled on a starting card and on one with an auto-share pending', async () => {
+    const user = userEvent.setup();
+    const { routes } = stubFetch({
+      'GET api/apps': listing([app({ id: 'web', status: 'starting' }), app({ id: 'api', status: 'running', autoShareStatus: 'pending' })]),
+    });
+    render(<App />);
+    for (const name of ['web', 'api']) {
+      const card = await screen.findByRole('article', { name });
+      expect((within(card).getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled, name).toBe(true);
+    }
+    routes['GET api/apps'] = listing([running(), app({ id: 'api', status: 'running' })]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    for (const name of ['web', 'api']) {
+      const card = screen.getByRole('article', { name });
+      await waitFor(() => expect((within(card).getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled, name).toBe(false));
+    }
+  });
+
+  // Invariant: a failed boot auto-start is visible on the card.
+  it('autoStartError shows as an alert on the card', async () => {
+    stubFetch({ 'GET api/apps': listing([app({ id: 'web', autoStartError: 'port 3000 is already in use' })]) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    expect(within(card).getByRole('alert').textContent).toContain('port 3000 is already in use');
   });
 });

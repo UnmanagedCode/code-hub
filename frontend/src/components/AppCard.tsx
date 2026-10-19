@@ -10,7 +10,7 @@ import { RouteList } from '@/components/RouteList';
 import { SharePanel } from '@/components/SharePanel';
 import { useHub } from '@/hub';
 import { accentClass } from '@/lib/accent';
-import { metaItems, statusTone, statusWord, type MetaItem, type StatusTone } from '@/lib/appView';
+import { autoStartNotice, cardLabel, metaItems, statusTone, statusWord, type MetaItem, type StatusTone } from '@/lib/appView';
 import { cn } from '@/lib/utils';
 import type { App } from '@/lib/types';
 
@@ -76,14 +76,13 @@ function Worktrees({ project, worktrees }: { project: string; worktrees: App[] }
   );
 }
 
-// A worktree usually inherits its project's name, so its card is told apart by branch (else id).
-const cardLabel = (app: App) => (app.isWorktree ? `${app.name} — ${app.branch || app.id}` : app.name);
 
 export function AppCard({ app, worktrees = [], subcard = false }: { app: App; worktrees?: App[]; subcard?: boolean }) {
   const hub = useHub();
   const tone = statusTone(app.status);
   const meta = metaItems(app, Date.now());
   const actionError = hub.actionError[app.id];
+  const startNotice = autoStartNotice(app);
   return (
     <CardShell id={app.id} subcard={subcard} label={cardLabel(app)}>
       <div className="flex items-center gap-2">
@@ -99,6 +98,11 @@ export function AppCard({ app, worktrees = [], subcard = false }: { app: App; wo
       )}
       {app.error && (
         <pre className="max-h-32 overflow-auto font-mono text-xs whitespace-pre-wrap text-destructive">{app.error}</pre>
+      )}
+      {startNotice && (
+        <Alert variant="destructive">
+          <AlertDescription>{startNotice}</AlertDescription>
+        </Alert>
       )}
       {actionError && (
         <Alert variant="destructive" className="pr-10">
