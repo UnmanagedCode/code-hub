@@ -6,6 +6,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WORKTREES_DIRNAME } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
+import * as appSettings from '../src/appSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -148,4 +149,23 @@ export async function waitFor(pred, { timeout = 8000, interval = 50 } = {}) {
 
 export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+// Hold the next read of app-settings.json — the first await of a share — until
+// released, and record every server that starts listening from then on.
+export function holdShareAtSettingsRead(t) {
+  const file = appSettings.appSettingsFile();
+  const realRead = fs.readFile;
+  const realListen = net.Server.prototype.listen;
+  let release, reached, armed = true;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  const servers = [];
+  fs.readFile = async (p, ...rest) => {
+    if (armed && p === file) { armed = false; reached(); await gate; }
+    return realRead.call(fs, p, ...rest);
+  };
+  net.Server.prototype.listen = function (...args) { servers.push(this); return realListen.apply(this, args); };
+  t.after(() => { release(); fs.readFile = realRead; net.Server.prototype.listen = realListen; });
+  return { parked, release, listening: () => servers.filter((srv) => srv.listening) };
 }

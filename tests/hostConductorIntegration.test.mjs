@@ -10,7 +10,7 @@ import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import { unregisterInMemory } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ccProject } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, gitCommit, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ccProject, holdShareAtSettingsRead } from './helpers.mjs';
 
 // `projects` are served at `/api/projects` exactly as the conductor serves
 // them (a bare array of ProjectInfo), so the overlay exercises its real
@@ -678,6 +678,82 @@ test('embedded: an always-on auto-share failure is reported like a normal app\'s
   // fresh process); a successful share clears it, so later tests boot clean.
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
   await appManager.share('code-conductor', { mode: 'lan', tls: false });
+});
+
+// Invariant: autoShareAlwaysOn() re-checks the record after its settings read
+// — a fresh init() landing during that read supersedes it, so the call begins
+// nothing: no share, no proxy, nothing pending.
+test('embedded: an init() during the always-on settings read makes autoShareAlwaysOn() begin nothing', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  const hold = holdShareAtSettingsRead(t);
+  const call = appManager.autoShareAlwaysOn();
+  await hold.parked;
+  await appManager.init();
+  hold.release();
+  assert.equal(await call, false);
+  assert.deepEqual(await appManager.awaitSettled('code-conductor'), { id: 'code-conductor', settled: true });
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, null);
+  assert.deepEqual(hold.listening(), []);
+});
+
+// Invariant: autoShareAlwaysOn() re-checks for a share after its settings
+// read — a manual share completing during that read wins, and the call begins
+// nothing: the manual share stays the only one, nothing pending.
+test('embedded: a manual share during the always-on settings read makes autoShareAlwaysOn() begin nothing', async (t) => {
+  await embeddedConductor(t);
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  const hold = holdShareAtSettingsRead(t);
+  const call = appManager.autoShareAlwaysOn();
+  await hold.parked;
+  await appManager.share('code-conductor', { mode: 'lan', tls: false });
+  const manual = (await getApp('code-conductor')).tunnel;
+  hold.release();
+  assert.equal(await call, false);
+  await appManager.awaitSettled('code-conductor');
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel?.proxyPort, manual.proxyPort);
+  assert.equal(app.tunnel?.auth, true); // the manual share's options, not the ticked config's
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(hold.listening().length, 1);
+});
+
+// Invariant: an unreadable settings file at boot is reported on the
+// conductor's card as an auto-share failure — never swallowed into a silent,
+// unshared boot — the same as a start() of a normal app.
+test('embedded: an unreadable app-settings.json at boot shows an always-on auto-share failure', async (t) => {
+  await embeddedConductor(t);
+  const real = console.error;
+  console.error = () => {};
+  t.after(() => { console.error = real; });
+  await appManager.init();
+  const file = appSettings.appSettingsFile();
+  await fs.mkdir(file, { recursive: true }); // a directory where the file belongs: EISDIR, even as root
+  t.after(() => fs.rm(file, { recursive: true, force: true }));
+  assert.equal(await appManager.autoShareAlwaysOn(), true);
+  assert.deepEqual(await appManager.awaitSettled('code-conductor'), { id: 'code-conductor', settled: true });
+  await fs.rm(file, { recursive: true }); // the listing reads the file too
+  const app = await getApp('code-conductor');
+  assert.equal(app.tunnel, null);
+  assert.equal(app.autoShareStatus, 'failed');
+  assert.match(app.autoShareError, /EISDIR|directory/);
+  // autoRun's outcome outlives a re-run init(); a successful share clears it.
+  await appManager.share('code-conductor', { mode: 'lan', tls: false });
+});
+
+// Invariant: embedded with no synthesized conductor record (an unparseable
+// CONDUCTOR_URL), autoShareAlwaysOn() begins nothing and doesn't throw.
+test('embedded with no conductor record: autoShareAlwaysOn() returns false', async (t) => {
+  await embeddedConductor(t);
+  process.env.CONDUCTOR_URL = 'not a url';
+  await appSettings.update('code-conductor', { autoShare: LAN_PLAIN });
+  await appManager.init();
+  assert.equal(await appManager.autoShareAlwaysOn(), false);
+  assert.deepEqual(await appManager.awaitSettled('code-conductor'), { id: 'code-conductor', settled: true });
 });
 
 // Invariant: an unticked always-on conductor is left unshared, and no

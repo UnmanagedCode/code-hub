@@ -4,13 +4,12 @@ import { promises as fs } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import path from 'node:path';
-import net from 'node:net';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import * as autoRun from '../src/autoRun.js';
 import { storeRoot } from '../src/projects.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, tailscaleEvents, funnelEvents } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, tailscaleEvents, funnelEvents, holdShareAtSettingsRead } from './helpers.mjs';
 
 // End-to-end auto-share over HTTP: a fake app, fake cloudflared and fake
 // tailscale (env-injected), and the GET …/settled long-poll as the only wait.
@@ -398,25 +397,6 @@ function gatedTailscale(t, root) {
     delete process.env.FAKE_TAILSCALE_ARGV_LOG;
   });
   return { open: () => fs.writeFile(gate, ''), funnels: async (event) => funnelEvents(await tailscaleEvents(log), event) };
-}
-
-// Hold the next read of app-settings.json — the first await of a share — until
-// released, and record every server that starts listening from then on.
-function holdShareAtSettingsRead(t) {
-  const file = appSettings.appSettingsFile();
-  const realRead = fs.readFile;
-  const realListen = net.Server.prototype.listen;
-  let release, reached, armed = true;
-  const gate = new Promise((r) => { release = r; });
-  const parked = new Promise((r) => { reached = r; });
-  const servers = [];
-  fs.readFile = async (p, ...rest) => {
-    if (armed && p === file) { armed = false; reached(); await gate; }
-    return realRead.call(fs, p, ...rest);
-  };
-  net.Server.prototype.listen = function (...args) { servers.push(this); return realListen.apply(this, args); };
-  t.after(() => { release(); fs.readFile = realRead; net.Server.prototype.listen = realListen; });
-  return { parked, release, listening: () => servers.filter((srv) => srv.listening) };
 }
 
 const status401 = async (port) => (await fetch(`http://127.0.0.1:${port}/`)).status;

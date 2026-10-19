@@ -52,9 +52,12 @@ describe('Settings dialog', () => {
   });
 
   // Invariant: the always-on dialog renders what automationFor decides: the login, auto-start present but disabled
-  // and unchecked with its reason attached, and auto-share enabled.
-  it('the always-on card\'s Settings has the login, a disabled auto-start with its reason, and auto-share', async () => {
-    const { dialog } = await openSettings([app({ id: 'code-conductor', status: 'running', alwaysOn: true })], 'code-conductor');
+  // and unchecked — even with a hand-written autoStart:true stored — with its reason attached, and auto-share enabled.
+  it('the always-on card\'s Settings has the login, a disabled unchecked auto-start with its reason, and auto-share', async () => {
+    const { dialog } = await openSettings(
+      [app({ id: 'code-conductor', status: 'running', alwaysOn: true, settings: settings({ autoStart: true }) })],
+      'code-conductor',
+    );
     expect(within(dialog).getByLabelText('user')).toBeTruthy();
     expect(within(dialog).getByLabelText('pass')).toBeTruthy();
     const autoStart = within(dialog).getByRole('checkbox', { name: 'Start automatically when code-hub starts' }) as HTMLButtonElement;
