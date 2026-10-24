@@ -1,6 +1,8 @@
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { childEnv } from './childEnv.js';
 
 // Allocate a free TCP port by binding to 0 and reading the assigned port,
 // then closing. There is a small TOCTOU window between close and the child
@@ -154,7 +156,7 @@ function fallbackLanIPv4s() {
   let ips = [];
   for (const [cmd, args] of [['ip', ['-4', 'addr']], ['ifconfig', ['-a']]]) {
     try {
-      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: childEnv() });
       ips = parseLanIPv4s(out);
       if (ips.length) break;
     } catch { /* binary missing / not permitted — try the next one */ }
@@ -182,6 +184,29 @@ export function localIPv4s({ lanFallback = false } = {}) {
     for (const ip of fallbackLanIPv4s()) ips.add(ip);
   }
   return [...ips];
+}
+
+// Whether code-hub runs inside a container: Docker's `/.dockerenv` or
+// Podman's `/run/.containerenv`. A heuristic (see bridgeOnlyLan).
+const realContainerProbe = () => existsSync('/.dockerenv') || existsSync('/run/.containerenv');
+let containerProbe = realContainerProbe;
+export function runningInContainer() { return containerProbe(); }
+
+// Test seam: replace the container check (`null` restores the real one).
+export function _setContainerProbe(fn) { containerProbe = fn ?? realContainerProbe; }
+
+// A heuristic: true when a LAN share's addresses look like a container's bridge
+// addresses only — in a container, and every one of `ips` inside 172.16.0.0/12
+// (Docker's default bridge pools) — so they are almost certainly unreachable
+// from the host's LAN. It misses other pools and can misfire on a host-network
+// container; see "Limitations" in docs/host-relay.md. An empty list claims
+// nothing.
+export function bridgeOnlyLan(ips, inContainer) {
+  if (!inContainer || !ips.length) return false;
+  return ips.every((ip) => {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 172 && b >= 16 && b <= 31;
+  });
 }
 
 // Every URL that serves an app bound to `port`: the `localhost` loopback name

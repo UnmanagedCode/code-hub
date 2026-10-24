@@ -64,11 +64,34 @@ test('reconcile reports the tunnels of dropped records whose child is still aliv
     alreadyDead: { id: 'alreadyDead', pid: 2 ** 30, tunnel: { kind: 'tailscale', pid: 2 ** 30, url: 'https://d.ts.net' } },
     noShare: { id: 'noShare', pid: 2 ** 30, tunnel: null },
   } };
-  const { strandedTunnels } = await state.reconcile(s);
+  const { strandedShares } = await state.reconcile(s);
 
   assert.deepEqual(Object.keys(s.apps), [], 'all three dead apps are dropped');
-  assert.deepEqual(strandedTunnels.map((x) => x.id), ['stranded']);
-  assert.equal(strandedTunnels[0].tunnel.pid, liveFunnel.pid, 'the pid survives the delete, in the caller\'s hands');
+  assert.deepEqual(strandedShares.map((x) => x.id), ['stranded']);
+  assert.equal(strandedShares[0].tunnel.pid, liveFunnel.pid, 'the pid survives the delete, in the caller\'s hands');
+});
+
+// Invariant: a LAN share's relay forward id is handed back whenever reconcile
+// drops its record (dead app) or clears its tunnel (a LAN tunnel has no pid) —
+// the record is the only place that id lives, so nothing could release it later.
+test('reconcile hands back every share holding a relay forward id it drops or clears', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const live = spawnLived();
+  t.after(() => { try { process.kill(-live.pid, 'SIGKILL'); } catch {} });
+  const lan = (forwardId) => ({ kind: 'lan', pid: null, url: 'https://h', relay: forwardId ? { state: 'up', forwardId } : null });
+
+  const s = { apps: {
+    deadApp: { id: 'deadApp', pid: 2 ** 30, tunnel: lan('F1') },
+    liveApp: { id: 'liveApp', pid: live.pid, tunnel: lan('F2') },
+    plainLan: { id: 'plainLan', pid: live.pid, tunnel: lan(null) },
+  } };
+  const { strandedShares } = await state.reconcile(s);
+
+  assert.deepEqual(strandedShares.map((x) => [x.id, x.tunnel.relay.forwardId]).sort(), [['deadApp', 'F1'], ['liveApp', 'F2']]);
+  assert.equal(s.apps.deadApp, undefined);
+  assert.equal(s.apps.liveApp.tunnel, null);
+  assert.equal(s.apps.plainLan.tunnel, null);
 });
 
 test('corrupt state file is moved aside, not fatal', async (t) => {

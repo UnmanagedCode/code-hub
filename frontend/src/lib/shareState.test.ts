@@ -2,9 +2,9 @@ import { expect, test } from 'vitest';
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
   PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody, credFieldsShown,
-  resolveTlsReshareNote, sharePanelView, shareModes, tlsChanging, qrImageSrc,
+  resolveTlsReshareNote, sharePanelView, shareModes, tlsChanging, qrImageSrc, resolveLanReachNotice, qrUseful,
 } from './shareState';
-import type { App, ShareState, Tunnel } from './types';
+import type { App, RelayInfo, ShareState, Tunnel } from './types';
 import { app } from '@/test/fixtures';
 
 // These cover the client behaviors the server tests can't: how the share panel
@@ -343,3 +343,65 @@ test('qrImageSrc: an SVG becomes a data: URL; anything else is null', () => {
   expect(qrImageSrc(null)).toBe(null);
   expect(qrImageSrc(42)).toBe(null);
 });
+
+// --- LAN reach from a container: the host relay and the container-internal flag ---
+
+const relay = (over: Partial<RelayInfo> = {}): RelayInfo => ({ state: 'up', error: null, port: 7100, requestedPort: null, portFallback: false, ...over });
+const lanShare = (over: Partial<Tunnel> = {}): Tunnel => ({ kind: 'lan', url: 'https://192.168.1.20:7100', auth: true, qrSvg: '<svg>qr</svg>', ...over });
+
+// Invariant: each relay state maps to its notice level and says what the user needs — host exposure with the
+// port fallback when it happened, a retrying outage, the failure reason (plus the container sentence when the
+// addresses are container-internal), the container warning with no relay, and nothing otherwise.
+test('resolveLanReachNotice: one row per relay state', () => {
+  const up = resolveLanReachNotice(lanShare({ relay: relay() }));
+  expect(up?.level).toBe('note');
+  expect(up?.text).toMatch(/host's LAN through the code-hub relay/);
+  expect(up?.text).not.toMatch(/busy/);
+  const fallback = resolveLanReachNotice(lanShare({ relay: relay({ requestedPort: 8080, port: 41000, portFallback: true }) }));
+  expect(fallback?.level).toBe('note');
+  expect(fallback?.text).toMatch(/Port 8080 was busy on the host, so it is on port 41000/);
+
+  const down = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'gone' }) }));
+  expect(down?.level).toBe('warn');
+  expect(down?.text).toMatch(/host relay is unreachable; code-hub keeps retrying/);
+
+  const failed = resolveLanReachNotice(lanShare({ relay: relay({ state: 'failed', error: 'connect ECONNREFUSED' }) }));
+  expect(failed?.level).toBe('warn');
+  expect(failed?.text).toMatch(/Host exposure failed: connect ECONNREFUSED/);
+  expect(failed?.text).not.toMatch(/internal to code-hub's container/);
+  const failedInContainer = resolveLanReachNotice(lanShare({ relay: relay({ state: 'failed', error: 'x' }), containerInternal: true }));
+  expect(failedInContainer?.text).toMatch(/Host exposure failed: x.*internal to code-hub's container/);
+
+  const bare = resolveLanReachNotice(lanShare({ relay: null, containerInternal: true }));
+  expect(bare?.level).toBe('warn');
+  expect(bare?.text).toMatch(/internal to code-hub's container.*host relay.*cloudflared or tailscale/);
+
+  expect(resolveLanReachNotice(lanShare({ relay: null, containerInternal: false }))).toBe(null);
+  expect(resolveLanReachNotice({ kind: 'tunnel', url: 'https://x', relay: relay({ state: 'failed', error: 'x' }), containerInternal: true })).toBe(null);
+  expect(resolveLanReachNotice(null)).toBe(null);
+});
+
+// Invariant: the QR is useless only while the addresses are container-internal and the relay isn't carrying them.
+test('qrUseful: false only for a container-internal share without a relay that is up', () => {
+  expect(qrUseful(lanShare({ containerInternal: true, relay: null }))).toBe(false);
+  expect(qrUseful(lanShare({ containerInternal: true, relay: relay({ state: 'down' }) }))).toBe(false);
+  expect(qrUseful(lanShare({ containerInternal: true, relay: relay({ state: 'failed', error: 'x' }) }))).toBe(false);
+  expect(qrUseful(lanShare({ containerInternal: true, relay: relay() }))).toBe(true);
+  expect(qrUseful(lanShare({ containerInternal: false, relay: null }))).toBe(true);
+  expect(qrUseful(lanShare())).toBe(true);
+});
+
+// Invariant: the panel drops the QR (but keeps the Open link) when it isn't useful, and carries the reach notice.
+test('sharePanelView: nulls qrSvg for a container-internal share and carries the reach notice', () => {
+  const internal = sharePanelView(undefined, appWith(lanShare({ containerInternal: true, relay: null })), false);
+  expect(internal.view).toBe('active');
+  if (internal.view !== 'active') return;
+  expect(internal.qrSvg).toBe(null);
+  expect(internal.openUrl).toBe('https://192.168.1.20:7100');
+  expect(internal.reachNotice?.level).toBe('warn');
+  const relayed = sharePanelView(undefined, appWith(lanShare({ containerInternal: false, relay: relay() })), false);
+  if (relayed.view !== 'active') throw new Error('not active');
+  expect(relayed.qrSvg).toBe('<svg>qr</svg>');
+  expect(relayed.reachNotice?.level).toBe('note');
+});
+

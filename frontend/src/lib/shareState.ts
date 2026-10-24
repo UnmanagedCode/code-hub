@@ -98,6 +98,38 @@ export function resolveFixedPortNotice(app: Pick<App, 'port'> | null | undefined
   };
 }
 
+export interface ReachNotice {
+  level: 'warn' | 'note';
+  text: string;
+}
+
+const CONTAINER_INTERNAL = "These addresses are internal to code-hub's container, so other devices on your LAN can't reach them — run the code-hub host relay, or share via cloudflared or tailscale.";
+
+// Resolve how a LAN share is reachable from the host's LAN when code-hub runs
+// in a container, or null when there's nothing to say (no relay configured and
+// not a bridge-only container, or not a LAN share). `level` is 'warn' whenever
+// the shown addresses may not reach the LAN.
+export function resolveLanReachNotice(shared: Partial<Tunnel> | null | undefined): ReachNotice | null {
+  if (!shared || shared.kind !== 'lan') return null;
+  const relay = shared.relay;
+  const container = shared.containerInternal ? ` ${CONTAINER_INTERNAL}` : '';
+  if (relay?.state === 'up') {
+    const fallback = relay.portFallback ? ` Port ${relay.requestedPort} was busy on the host, so it is on port ${relay.port} there.` : '';
+    return { level: 'note', text: `Exposed on the host's LAN through the code-hub relay.${fallback}` };
+  }
+  if (relay?.state === 'down') return { level: 'warn', text: `⚠ The host relay is unreachable; code-hub keeps retrying.${container}` };
+  if (relay?.state === 'failed') return { level: 'warn', text: `⚠ Host exposure failed: ${relay.error}.${container}` };
+  if (shared.containerInternal) return { level: 'warn', text: `⚠ ${CONTAINER_INTERNAL}` };
+  return null;
+}
+
+// Whether a QR helps: not while the share's addresses are container-internal
+// and the relay isn't carrying it — a phone scanning it would reach nothing.
+// Open and Copy stay, for a browser on the same machine.
+export function qrUseful(shared: Partial<Tunnel> | null | undefined): boolean {
+  return !(shared?.containerInternal && shared.relay?.state !== 'up');
+}
+
 // Resolve the share panel's mode/credentials note — the one line under the URL
 // saying how this share is reachable.
 //
@@ -231,6 +263,7 @@ export type SharePanelView =
       qrSvg: string | null;
       credNote: string;
       fixedPortNotice: FixedPortNotice | null;
+      reachNotice: ReachNotice | null;
       /** The share's further URLs (the other LAN addresses), past the one shown. */
       extraUrls: string[];
       /** Whether the creds area shows: the Edit form while editing, else the user/pass rows. */
@@ -260,9 +293,10 @@ export function sharePanelView(s: ShareState | undefined, app: Pick<App, 'tunnel
     shared,
     kind,
     openUrl: resolveOpenUrl(s, shared) as string,
-    qrSvg: resolveQrSvg(s, shared),
+    qrSvg: qrUseful(shared) ? resolveQrSvg(s, shared) : null,
     credNote: resolveCredNote(shared),
     fixedPortNotice: resolveFixedPortNotice(app, shared),
+    reachNotice: resolveLanReachNotice(shared),
     extraUrls: shared.urls && shared.urls.length > 1 ? shared.urls.slice(1) : [],
     showCreds: editing || hasCreds,
     canEdit: kind === 'lan' || hasCreds,

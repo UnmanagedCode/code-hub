@@ -3,6 +3,7 @@ import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
 import { createReadyMatcher } from './readyWhen.js';
+import { childEnv, UNSET_RELAY_ENV } from './childEnv.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
@@ -40,9 +41,11 @@ function settle(c, status, error = null) {
 // Spawn the manifest's blocking start command in its OWN process group
 // (detached ⇒ child is group leader ⇒ pgid === pid), with PORT injected.
 function spawnChild(app, port) {
-  const proc = spawn('bash', ['-lc', app.manifest.start], {
+  // The relay variables are stripped from the env (childEnv) and unset again
+  // after the login shell's profiles ran (UNSET_RELAY_ENV).
+  const proc = spawn('bash', ['-lc', UNSET_RELAY_ENV + app.manifest.start], {
     cwd: app.path,
-    env: { ...process.env, PORT: String(port) },
+    env: childEnv({ PORT: String(port) }),
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

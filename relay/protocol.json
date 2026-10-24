@@ -1,0 +1,17 @@
+{
+  "protocolVersion": 1,
+  "upgradeToken": "code-hub-relay/1",
+  "paths": {
+    "health": "/v1/health",
+    "forwards": "/v1/forwards",
+    "forward": "/v1/forwards/{id}",
+    "renew": "/v1/forwards/{id}/renew",
+    "accept": "/v1/forwards/{id}/accept"
+  },
+  "createKeys": ["port"],
+  "port": { "min": 1024, "max": 65535 },
+  "minSecretLength": 32,
+  "maxLeaseMs": 86400000,
+  "maxAddresses": 16,
+  "errorCodes": { "portInUse": "port_in_use", "noLanAddress": "no_lan_address" }
+}
