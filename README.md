@@ -100,6 +100,19 @@ When embedded, code-hub also asks the conductor where each project's tree actual
 
 When embedded, code-hub surfaces the host `code-conductor` checkout as an **always-on** app without needing a `.hub.json` of its own. It locates the checkout from the `CONDUCTOR_PROJECT_DIR` env var the conductor injects — so it shows up even when the conductor's own checkout lives **outside** the scanned `PROJECTS_ROOT` (a conductor with a custom root). Older conductors that don't inject `CONDUCTOR_PROJECT_DIR` fall back to discovering a `code-conductor/` dir under the root via an **internal, process-lifetime-only registration** (never persisted, not exposed via `register_app`). Running code-hub standalone (no `CONDUCTOR_*` env vars), `code-conductor` doesn't show up at all unless separately given a `.hub.json` or a machine-local registration.
 
+## Host relay (code-hub in Docker)
+
+In a **bridge-networked container**, a LAN share's URL is the container's bridge address, which no other device can reach. The **host relay** (`relay/relay.py` + `relay/protocol.json`, Python ≥3.9, standard library only) runs on the Docker host and exposes the share on the host's real LAN address; with `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` set in code-hub's environment, a LAN share shows the host URL instead. TLS and the auth gate stay end to end inside code-hub, and a relay problem never fails the share — it falls back to the container's own addresses and says why. Without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
+
+```sh
+python3 relay/relay.py                           # Docker Desktop (Windows: py -3 relay\relay.py)
+python3 relay/relay.py --listen 172.17.0.1:7077  # native Linux Docker
+# then, for code-hub: CODEHUB_RELAY_URL=http://host.docker.internal:7077
+#                     CODEHUB_RELAY_SECRET=<contents of ~/.code-hub-relay/secret>
+```
+
+Setup per platform, `--advertise`, secret provisioning, all flags, a systemd unit, the security model and limitations: `docs/host-relay.md`.
+
 ## Testing
 
 ```sh
@@ -107,6 +120,10 @@ npm test                   # rebuilds the UI (npm run prepare) so tests/dist.tes
                            #   the current source, then the node:test suite (no network,
                            #   uses fakes), the frontend typecheck (tsc -p frontend) and Vitest
 npm run test:web           # just the Vitest suite
+CODEHUB_PYTHON=python3.9 npm test # the interpreter the host-relay tests spawn
+                                  #   (default python3; win32: py -3; needs ≥3.9)
+CODEHUB_SKIP_PYTHON=1 npm test    # skip the host-relay tests explicitly; without
+                                  #   this, a missing or too-old Python FAILS them
 RUN_REAL_CLOUDFLARED=1 npm test   # also runs the real-cloudflared smoke test
 RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke tests — these
                                   #   open a REAL public Funnel on this node for a
@@ -122,6 +139,7 @@ RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke tests —
 - `docs/features.md` — UI and user-facing features
 - `docs/protocol.md` — `.hub.json` schema + HTTP API
 - `docs/architecture.md` — modules, process/state lifecycle, test patterns
+- `docs/host-relay.md` — the host relay for code-hub in a bridge-networked container: setup, flags, security model, limits
 
 ## License
 

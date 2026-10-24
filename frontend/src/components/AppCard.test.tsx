@@ -5,7 +5,7 @@ import { AppCard } from './AppCard';
 import { FEEDBACK_MS } from './CopyButton';
 import { HubProvider } from '@/hub';
 import { PASSWORD_MASK } from '@/lib/shareState';
-import type { App } from '@/lib/types';
+import type { App, RelayInfo, Tunnel } from '@/lib/types';
 import { app, listing, stubFetch } from '@/test/fixtures';
 
 const EVIL_HTML = '<img src=x onerror="alert(1)">';
@@ -244,6 +244,34 @@ describe('call sites', () => {
     expect(pass.value).toBe('');
     expect(pass.placeholder).toBe(`${PASSWORD_MASK} (default — type to replace)`);
     expect(screen.queryByDisplayValue('secret-default')).toBeNull();
+  });
+
+  const lan = (over: Partial<Tunnel> = {}) => app({
+    id: 'web', status: 'running',
+    tunnel: { kind: 'lan', url: 'https://172.17.0.5:7100', auth: false, qrSvg: QR, ...over },
+  });
+  const relayInfo = (over: Partial<RelayInfo> = {}): RelayInfo => ({ state: 'up', error: null, port: 7200, requestedPort: null, portFallback: false, ...over });
+
+  // Invariant: a container-internal share warns and offers no QR to scan, while Open stays.
+  it('a container-internal LAN share: a warning, and no QR', () => {
+    renderCard(lan({ containerInternal: true, relay: null }));
+    expect(screen.getByRole('alert').textContent).toMatch(/internal to code-hub's container/);
+    expect(screen.queryByRole('button', { name: 'Enlarge QR code' })).toBeNull();
+    expect(screen.getByRole('link', { name: /open/i })).toBeTruthy();
+  });
+
+  // Invariant: a relay-backed share shows the relay note (not an alert) and keeps its QR.
+  it('a relay-backed LAN share: the relay note, and the QR', () => {
+    renderCard(lan({ url: 'https://192.168.1.20:7200', containerInternal: false, relay: relayInfo() }));
+    expect(screen.getByText(/host's LAN through the code-hub relay/)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Enlarge QR code' })).toBeTruthy();
+  });
+
+  // Invariant: a failed relay is an alert naming the error.
+  it('a failed relay: an alert with the error', () => {
+    renderCard(lan({ containerInternal: true, relay: relayInfo({ state: 'failed', error: 'connect ECONNREFUSED 10.0.0.1:7077' }) }));
+    expect(screen.getByRole('alert').textContent).toMatch(/Host exposure failed: connect ECONNREFUSED 10\.0\.0\.1:7077/);
   });
 
   // Invariant: the "edited X ago" label carries the commit's absolute date as its title.

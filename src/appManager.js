@@ -9,7 +9,8 @@ import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
 import * as tailscale from './tailscale.js';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s } from './net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s, runningInContainer, bridgeOnlyLan } from './net.js';
+import * as hostRelay from './hostRelay.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
@@ -87,11 +88,12 @@ export async function init() {
   store = await state.load();
   // reconcile drops records whose app pid is dead — which, for an app that
   // died in the same window code-hub did, would delete the only record of a
-  // still-running share child. It hands those back instead of stranding them
-  // (see state.reconcile) and they are killed here, BEFORE the sweep below,
-  // because their records no longer exist to be swept.
-  const { strandedTunnels } = await state.reconcile(store);
-  for (const { id, tunnel: t } of strandedTunnels) killShareChild(id, t, { verify: true });
+  // still-running share child — and clears every LAN tunnel, which would drop
+  // the only record of its host-relay forward. It hands those back instead of
+  // stranding them (see state.reconcile) and they are released here, BEFORE
+  // the sweep below, because their records no longer hold them to be swept.
+  const { strandedShares } = await state.reconcile(store);
+  for (const { id, tunnel: t } of strandedShares) killShareChild(id, t, { verify: true });
   // A persisted share from before a restart points at an auth proxy that no
   // longer exists (in-process, gone with the old code-hub). Tear the orphaned
   // child down so it can't serve a broken URL — the share simply needs
@@ -194,9 +196,12 @@ let funnelSlot = null;
 // one app and unsharing A then sharing B.
 let expiringFunnelPid = null;
 
-// SIGTERM the child publishing a share, dispatching on its kind. Split out of
-// teardownShare so init() can also kill a child whose record reconcile already
-// dropped — at that point there is no record left to tear down, only a pid.
+// SIGTERM the child publishing a share, dispatching on its kind — or, for a
+// LAN share, release its host-relay forward (a LAN share has no child). Split
+// out of teardownShare so init() can also kill a child whose record reconcile
+// already dropped — at that point there is no record left to tear down, only a
+// pid or a forward id. Releasing a forward never blocks: at boot it is a
+// fire-and-forget DELETE, with the relay's lease as the backstop.
 //
 // `verify` guards the ONLY case where the pid did not come from a child we
 // spawned in this process: pids read back from state.json can have been
@@ -205,6 +210,10 @@ let expiringFunnelPid = null;
 // machine. See tailscale.looksLikeFunnel.
 function killShareChild(id, t, { verify = false } = {}) {
   if (!t) return;
+  if (t.kind === 'lan') {
+    if (t.relay?.forwardId) hostRelay.release(t.relay.forwardId);
+    return;
+  }
   if (t.kind === 'tailscale') {
     if (verify && !tailscale.looksLikeFunnel(t.pid)) {
       console.error(`[appManager] ${id}: persisted funnel pid ${t.pid} is not a tailscale funnel (recycled?) — not signalling it`);
@@ -289,6 +298,14 @@ function withToken(url, token) {
   return `${url}${sep}__hubauth=${encodeURIComponent(token)}`;
 }
 
+// A LAN share's relay state as the API shows it: everything but the forward
+// id, which only code-hub itself needs (to release the forward).
+function publicRelay(relay) {
+  if (!relay) return null;
+  const { forwardId: _omit, ...rest } = relay;
+  return rest;
+}
+
 // In-memory QR cache keyed by app id. The QR's only inputs are
 // { url, authUrl } (gated → the token URL via `withToken`; ungated/no-auth →
 // the plain `url`), so an entry is reused until one of them changes —
@@ -365,6 +382,8 @@ export async function list() {
           proxyPort: rec.tunnel.proxyPort ?? null,
           fixedPortFallback: rec.tunnel.fixedPortFallback === true,
           fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
+          relay: publicRelay(rec.tunnel.relay),
+          containerInternal: rec.tunnel.containerInternal === true,
           auth, tls: rec.tunnel.tls === true,
           // `password` is the real value (the UI's Copy needs it); this flag
           // only tells the UI to mask it on screen.
@@ -681,86 +700,133 @@ async function shareRecord(id, op, { mode, auth, tls }) {
   if (mode === 'lan') {
     teardownShare(id, rec); // replace any existing share
     const useTls = tls; // validateShareOptions defaults it to on; the UI/API `tls` flag overrides
-    // Self-signed cert covering the LAN IPs + loopback, generated per share and
-    // held in memory only (via the proxy) — nothing on disk. Browsers show a
-    // one-time "not private" warning (self-signed); documented as a limitation.
+    const scheme = useTls ? 'https' : 'http';
     const lanIps = localIPv4s({ lanFallback: true }); // one list for the cert SAN and the bind hosts
-    let tlsOpt = null;
-    if (useTls) {
-      const { key, cert } = generateSelfSigned({ ipAddresses: [...lanIps, '127.0.0.1'], dnsNames: ['localhost'] });
-      tlsOpt = { key, cert };
+    const bridgeOnly = bridgeOnlyLan(lanIps, runningInContainer());
+    // With a host relay configured (code-hub in a bridge-networked container),
+    // the share is also exposed on the host's LAN address through a relay
+    // forward. Any relay failure is reported on the share and never fails it:
+    // the share goes on as an ordinary LAN share.
+    let forward = null;
+    let relayFailure = null;
+    let onRelayChange = () => {}; // set once the share commits
+    if (hostRelay.relayConfig()) {
+      try {
+        forward = await hostRelay.openForward({ port: rec.fixedPort ?? undefined, onChange: (c) => onRelayChange(c) });
+      } catch (e) {
+        relayFailure = { state: 'failed', error: e.message, forwardId: null, port: null, requestedPort: rec.fixedPort ?? null, portFallback: false };
+        console.error(`[appManager] ${id}: host relay unavailable — ${e.message}; sharing on the container's addresses only`);
+      }
     }
-    // Same-port LAN share: measured on Linux, a proxy CAN bind
-    // <lanIp>:<fixedPort> while the app holds 127.0.0.1:<fixedPort>, but NOT
-    // while the app holds the wildcard (SO_REUSEADDR doesn't permit
-    // overlapping listen binds). code-hub injects only PORT and can't know
-    // which host the child chose, so attempt the bind and let EADDRINUSE
-    // answer — never guess.
     let proxy = null;
     let fixedPortFallback = false;
     let fixedPortHolder = null;
-    if (rec.fixedPort && lanIps.length) {
-      try {
-        proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
-      } catch (e) {
-        if (e.code !== 'EADDRINUSE') throw e;
-        fixedPortFallback = true;
-        // EADDRINUSE alone does not say WHO holds the port, and the two possible
-        // causes mean opposite things to the user: either the app itself bound
-        // every interface (it really is answering on the LAN, ungated), or an
-        // unrelated process holds a LAN address at that port (the app is not
-        // LAN-reachable at all). Never assert the first without establishing it —
-        // telling someone their app is already exposed when it isn't invites
-        // them to conclude the gate is pointless.
-        //
-        // A wildcard hold is STRONGLY indicative of the app's own bind, not
-        // proof of it: start() proved this port free on every address before
-        // spawning, so the app was its first holder and anything arriving later
-        // could only take addresses the app left free. That premise is
-        // spawn-time, though, and this is a share-time conclusion — share()'s
-        // liveness gate only establishes that the start command's wrapper
-        // process is alive (rec.pid is the `bash -lc` wrapper, see
-        // runner.spawnChild), not that the app's own listener is still up. A
-        // reloader restarting the server frees the port machine-wide for a
-        // moment, during which something else could take the wildcard. So 'app' means "almost
-        // certainly the app", and every message built from it is phrased to
-        // match (see frontend/src/lib/shareState.ts).
-        //
-        // 'inconclusive' maps to 'unknown', which callers must treat as
-        // possible exposure rather than as an all-clear: on a host with no
-        // loopback aliases the probe can never run at all.
-        const hold = await probeWildcardHold(rec.fixedPort);
-        fixedPortHolder = hold === 'held' ? 'app' : hold === 'free' ? 'other' : 'unknown';
-        const why = fixedPortHolder === 'app'
-          ? 'held on every interface, almost certainly by the app itself — if so it is already reachable there ungated'
-          : fixedPortHolder === 'other'
-            ? 'another process holds a LAN address at that port — not the app, which is not LAN-reachable there'
-            : 'code-hub could not identify what holds it; if the app binds all interfaces it is already reachable there ungated';
-        console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
+    try {
+      // Self-signed cert covering the LAN IPs, the relay's advertised host IPs
+      // and loopback, generated per share and held in memory only (via the
+      // proxy) — nothing on disk. Browsers show a one-time "not private"
+      // warning (self-signed); documented as a limitation.
+      let tlsOpt = null;
+      if (useTls) {
+        const ipAddresses = [...new Set([...lanIps, ...(forward?.addresses ?? []), '127.0.0.1'])];
+        const { key, cert } = generateSelfSigned({ ipAddresses, dnsNames: ['localhost'] });
+        tlsOpt = { key, cert };
       }
+      // Same-port LAN share: measured on Linux, a proxy CAN bind
+      // <lanIp>:<fixedPort> while the app holds 127.0.0.1:<fixedPort>, but NOT
+      // while the app holds the wildcard (SO_REUSEADDR doesn't permit
+      // overlapping listen binds). code-hub injects only PORT and can't know
+      // which host the child chose, so attempt the bind and let EADDRINUSE
+      // answer — never guess.
+      if (rec.fixedPort && lanIps.length) {
+        try {
+          proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: lanIps, port: rec.fixedPort, auth, tls: tlsOpt });
+        } catch (e) {
+          if (e.code !== 'EADDRINUSE') throw e;
+          fixedPortFallback = true;
+          // EADDRINUSE alone does not say WHO holds the port, and the two possible
+          // causes mean opposite things to the user: either the app itself bound
+          // every interface (it really is answering on the LAN, ungated), or an
+          // unrelated process holds a LAN address at that port (the app is not
+          // LAN-reachable at all). Never assert the first without establishing it —
+          // telling someone their app is already exposed when it isn't invites
+          // them to conclude the gate is pointless.
+          //
+          // A wildcard hold is STRONGLY indicative of the app's own bind, not
+          // proof of it: start() proved this port free on every address before
+          // spawning, so the app was its first holder and anything arriving later
+          // could only take addresses the app left free. That premise is
+          // spawn-time, though, and this is a share-time conclusion — share()'s
+          // liveness gate only establishes that the start command's wrapper
+          // process is alive (rec.pid is the `bash -lc` wrapper, see
+          // runner.spawnChild), not that the app's own listener is still up. A
+          // reloader restarting the server frees the port machine-wide for a
+          // moment, during which something else could take the wildcard. So 'app' means "almost
+          // certainly the app", and every message built from it is phrased to
+          // match (see frontend/src/lib/shareState.ts).
+          //
+          // 'inconclusive' maps to 'unknown', which callers must treat as
+          // possible exposure rather than as an all-clear: on a host with no
+          // loopback aliases the probe can never run at all.
+          const hold = await probeWildcardHold(rec.fixedPort);
+          fixedPortHolder = hold === 'held' ? 'app' : hold === 'free' ? 'other' : 'unknown';
+          const why = fixedPortHolder === 'app'
+            ? 'held on every interface, almost certainly by the app itself — if so it is already reachable there ungated'
+            : fixedPortHolder === 'other'
+              ? 'another process holds a LAN address at that port — not the app, which is not LAN-reachable there'
+              : 'code-hub could not identify what holds it; if the app binds all interfaces it is already reachable there ungated';
+          console.error(`[appManager] ${id}: fixed port ${rec.fixedPort} is not bindable on the LAN interfaces — ${why}; gated share falling back to a free port`);
+        }
+      }
+      if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
+      if (!committable()) { proxy.close(); throw abandoned(id, op); }
+    } catch (e) {
+      // Covers the abandon path too: a forward opened for a share that never
+      // commits must not outlive it.
+      forward?.close();
+      throw e;
     }
-    if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
-    if (!committable()) { proxy.close(); throw abandoned(id, op); }
     proxies.set(id, proxy);
     proxyOwner.set(proxy, rec);
     markDefault();
-    const scheme = useTls ? 'https' : 'http';
     // Drop the loopback entry — it's not reachable from another device, and in
     // the fixed-port case that's load-bearing rather than cosmetic: the proxy
     // isn't bound on loopback at all there, so `<scheme>://localhost:<fixedPort>`
     // would reach the app DIRECTLY, ungated.
     const loopbackPrefix = `${scheme}://localhost:`;
-    const urls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
-    const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
-    rec.tunnel = { kind: 'lan', url, urls, pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
+    const containerUrls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
+    // Where the share is reachable right now: the host's addresses while the
+    // relay forward is up, else the container's own (today's LAN share).
+    const reach = () => {
+      const relay = forward
+        ? { state: forward.state, error: forward.error, forwardId: forward.id, port: forward.port, requestedPort: forward.requestedPort, portFallback: forward.portFallback }
+        : relayFailure;
+      const urls = relay?.state === 'up' ? forward.addresses.map((ip) => `${scheme}://${ip}:${forward.port}`) : containerUrls;
+      const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
+      return { url, urls, relay, containerInternal: relay?.state !== 'up' && bridgeOnly };
+    };
+    rec.tunnel = { kind: 'lan', ...reach(), pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
+    if (forward) {
+      // A relay state change (down, re-created) re-points the share's URLs —
+      // only while this record still holds this forward. The QR follows the
+      // URL through cachedQrSvg's key.
+      onRelayChange = ({ prevId }) => {
+        if (store.apps[id] !== rec || rec.tunnel?.relay?.forwardId !== prevId) return;
+        Object.assign(rec.tunnel, reach());
+        persist().catch((e) => console.error(`[appManager] ${id}: persisting a relay change failed — ${e.message}`));
+      };
+      forward.attach({ host: proxy.hosts[0] === '0.0.0.0' ? '127.0.0.1' : proxy.hosts[0], port: proxy.port });
+    }
     await persist();
+    const { url, urls, relay, containerInternal } = rec.tunnel;
+    const common = { kind: 'lan', url, urls, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, relay: publicRelay(relay), containerInternal };
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
-      return { kind: 'lan', url, urls, auth: false, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
+      return { ...common, auth: false, qrSvg: await cachedQrSvg(id, { url, authUrl: null }) };
     }
     const authUrl = withToken(url, proxy.token);
-    return { kind: 'lan', url, urls, auth: true, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+    return { ...common, auth: true, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
   }
 
   if (mode === 'tailscale') {

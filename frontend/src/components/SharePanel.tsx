@@ -103,6 +103,13 @@ export function SharePanel({ app }: { app: App }) {
       ) : (
         <p className="text-xs text-muted-foreground">{v.fixedPortNotice.text}</p>
       ))}
+      {v.reachNotice && (v.reachNotice.level === 'warn' ? (
+        <Alert variant="warning">
+          <AlertDescription>{v.reachNotice.text}</AlertDescription>
+        </Alert>
+      ) : (
+        <p className="text-xs text-muted-foreground">{v.reachNotice.text}</p>
+      ))}
       {v.extraUrls.length > 0 && (
         <div className="flex flex-wrap gap-x-3 gap-y-0.5">
           {v.extraUrls.map((u) => (

@@ -11,6 +11,15 @@ export interface Route {
   urls: string[];
 }
 
+/** A LAN share's host-relay forward (code-hub in a container); null when no relay is configured. */
+export interface RelayInfo {
+  state: 'up' | 'down' | 'failed';
+  error: string | null;
+  port: number | null;
+  requestedPort: number | null;
+  portFallback: boolean;
+}
+
 /** A live share: `app.tunnel` from the listing, or the one-time `POST …/share` response. */
 export interface Tunnel {
   url: string;
@@ -19,6 +28,9 @@ export interface Tunnel {
   proxyPort?: number | null;
   fixedPortFallback?: boolean;
   fixedPortHolder?: 'app' | 'other' | 'unknown' | null;
+  relay?: RelayInfo | null;
+  /** The share's addresses are internal to code-hub's container (LAN only). */
+  containerInternal?: boolean;
   auth?: boolean;
   tls?: boolean;
   username?: string | null;

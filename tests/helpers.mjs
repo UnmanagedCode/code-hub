@@ -169,3 +169,133 @@ export function holdShareAtSettingsRead(t) {
   t.after(() => { release(); fs.readFile = realRead; net.Server.prototype.listen = realListen; });
   return { parked, release, listening: () => servers.filter((srv) => srv.listening) };
 }
+
+// --- host relay (relay/relay.py) ---------------------------------------------
+
+export const REPO_ROOT = path.resolve(__dirname, '..');
+
+// The Python interpreter the relay tests spawn: CODEHUB_PYTHON (a command line,
+// e.g. `py -3`), else `python3` (`py -3` on win32). Resolves
+// { ok: true, cmd, args } for one ≥3.9, else { ok: false, reason }. Cached.
+let pythonCache = null;
+export function findPython() {
+  if (pythonCache) return pythonCache;
+  const spec = process.env.CODEHUB_PYTHON || (process.platform === 'win32' ? 'py -3' : 'python3');
+  const [cmd, ...args] = spec.split(/\s+/).filter(Boolean);
+  try {
+    const out = execFileSync(cmd, [...args, '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const [major, minor] = out.split('.').map(Number);
+    pythonCache = major > 3 || (major === 3 && minor >= 9)
+      ? { ok: true, cmd, args, version: out }
+      : { ok: false, reason: `${spec} is Python ${out}` };
+  } catch (e) {
+    pythonCache = { ok: false, reason: `${spec} could not run (${e.code ?? e.message})` };
+  }
+  return pythonCache;
+}
+
+const PYTHON_MISSING = 'python3 ≥3.9 not found — install it, point CODEHUB_PYTHON at it, or set CODEHUB_SKIP_PYTHON=1 to skip';
+
+// Gate for a Python-dependent test, called first thing in its body. Fails
+// closed: with no usable interpreter the test FAILS, unless CODEHUB_SKIP_PYTHON=1
+// opts out explicitly, which skips it. Returns true when the test may proceed.
+export function requirePython(t) {
+  const py = findPython();
+  if (py.ok) return true;
+  if (process.env.CODEHUB_SKIP_PYTHON === '1') { t.skip(`${PYTHON_MISSING} (${py.reason})`); return false; }
+  throw new Error(`${PYTHON_MISSING} (${py.reason})`);
+}
+
+// Spawn the real relay on loopback. `advertise` null omits --advertise (the
+// route probe runs); `relayDir` points at a (patched) copy of relay/. Resolves
+// once its listening line is printed: { url, secret, secretFile, port, proc,
+// output(), stop() }. Rejects with the relay's stderr if it exits first.
+export async function startRelay({
+  listenPort = 0, advertise = '127.0.0.1', leaseMs = 300, secretFile, acceptWaitMs,
+  relayDir = path.join(REPO_ROOT, 'relay'), env = {}, extraArgs = [],
+} = {}) {
+  const py = findPython();
+  if (!py.ok) throw new Error(`${PYTHON_MISSING} (${py.reason})`);
+  let ownDir = null;
+  if (!secretFile) {
+    ownDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
+    secretFile = path.join(ownDir, 'secret');
+  }
+  const argv = [...py.args, path.join(relayDir, 'relay.py'), '--listen', `127.0.0.1:${listenPort}`,
+    '--secret-file', secretFile, '--lease-ms', String(leaseMs)];
+  if (advertise !== null) argv.push('--advertise', advertise);
+  if (acceptWaitMs !== undefined) argv.push('--accept-wait-ms', String(acceptWaitMs));
+  argv.push(...extraArgs);
+  const proc = spawn(py.cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+  let stdout = '', stderr = '';
+  proc.stdout.on('data', (d) => { stdout += d; });
+  proc.stderr.on('data', (d) => { stderr += d; });
+  const port = await new Promise((resolve, reject) => {
+    const onData = () => {
+      const m = /code-hub-relay listening on [\d.]+:(\d+)/.exec(stdout);
+      if (m) { proc.stdout.off('data', onData); proc.off('exit', onExit); resolve(Number(m[1])); }
+    };
+    const onExit = (code) => reject(Object.assign(new Error(`relay exited (code ${code}) before listening: ${stderr.trim()}`), { code, stderr }));
+    proc.stdout.on('data', onData);
+    proc.once('exit', onExit);
+  });
+  const secret = (await fs.readFile(secretFile, 'utf8')).trim();
+  const exited = new Promise((r) => { if (proc.exitCode !== null) r(); else proc.once('exit', r); });
+  return {
+    url: `http://127.0.0.1:${port}`, port, secret, secretFile, proc,
+    output: () => ({ stdout, stderr }),
+    exited,
+    async stop(signal = 'SIGKILL') {
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill(signal);
+      await exited;
+      if (ownDir) await fs.rm(ownDir, { recursive: true, force: true });
+    },
+  };
+}
+
+// Run a relay process to completion (for startup refusals): { code, stdout, stderr }.
+export async function runRelay(args, { env = {}, relayDir = path.join(REPO_ROOT, 'relay') } = {}) {
+  const py = findPython();
+  if (!py.ok) throw new Error(`${PYTHON_MISSING} (${py.reason})`);
+  const proc = spawn(py.cmd, [...py.args, path.join(relayDir, 'relay.py'), ...args],
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+  let stdout = '', stderr = '';
+  proc.stdout.on('data', (d) => { stdout += d; });
+  proc.stderr.on('data', (d) => { stderr += d; });
+  const code = await new Promise((r) => proc.once('exit', (c) => r(c)));
+  return { code, stdout, stderr };
+}
+
+// Point code-hub at `relay` for the rest of test `t` (CODEHUB_RELAY_URL/SECRET).
+export function withRelayEnv(t, relay) {
+  const prev = { url: process.env.CODEHUB_RELAY_URL, secret: process.env.CODEHUB_RELAY_SECRET };
+  process.env.CODEHUB_RELAY_URL = relay.url;
+  process.env.CODEHUB_RELAY_SECRET = relay.secret;
+  t.after(() => {
+    for (const [k, v] of [['CODEHUB_RELAY_URL', prev.url], ['CODEHUB_RELAY_SECRET', prev.secret]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+// A raw control call against a relay: { status, body }.
+export async function relayCall(relay, method, path_, body, { secret = relay.secret } = {}) {
+  const res = await fetch(relay.url + path_, {
+    method,
+    headers: { ...(secret ? { Authorization: `Bearer ${secret}` } : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+  return { status: res.status, body: parsed };
+}
+
+// Resolves true when a TCP connect to host:port succeeds, false when refused.
+export function canConnect(port, host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const s = net.connect(port, host);
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('error', () => resolve(false));
+  });
+}

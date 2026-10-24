@@ -60,28 +60,34 @@ export function pidAlive(pid) {
 
 // Reconcile persisted records against reality: drop apps whose pid is dead,
 // clear tunnels whose pid is dead. Saves, then returns
-// `{ state, strandedTunnels }`.
+// `{ state, strandedShares }`.
 //
-// `strandedTunnels` is `[{ id, tunnel }]` for every dropped app whose OWN
-// share child is still ALIVE. Dropping such a record silently strands that
-// child: the record was the only thing holding its pid, so after the delete
-// nothing anywhere can ever kill it — for a tailscale funnel that means a
-// public URL left serving 443 in front of a proxy that no longer exists.
-// This module can't kill them itself (it doesn't know a share's kind, and
-// must not grow a dependency on the integrations to find out), so it hands
-// them back and the caller tears them down. The invariant callers must
-// uphold: no path drops a record carrying a LIVE share pid without first
-// killing that pid.
+// `strandedShares` is `[{ id, tunnel }]` for every share this drops or clears
+// that still holds something live outside this process: a share child whose
+// pid is ALIVE, or a host-relay forward (`tunnel.relay.forwardId` — a LAN
+// share's tunnel has no pid, so it is always cleared here). The record was the
+// only thing holding that pid or forward id, so after the delete nothing
+// anywhere could ever release it — for a tailscale funnel that means a public
+// URL left serving 443 in front of a proxy that no longer exists. This module
+// can't release them itself (it doesn't know a share's kind, and must not grow
+// a dependency on the integrations to find out), so it hands them back and the
+// caller tears them down. The invariant callers must uphold: no path drops a
+// record carrying a LIVE share pid or a relay forward id without first
+// releasing it.
 export async function reconcile(state) {
-  const strandedTunnels = [];
+  const strandedShares = [];
+  const holdsLive = (t) => pidAlive(t.pid) || !!t.relay?.forwardId;
   for (const [id, rec] of Object.entries(state.apps)) {
     if (!pidAlive(rec.pid)) {
-      if (rec.tunnel && pidAlive(rec.tunnel.pid)) strandedTunnels.push({ id, tunnel: rec.tunnel });
+      if (rec.tunnel && holdsLive(rec.tunnel)) strandedShares.push({ id, tunnel: rec.tunnel });
       delete state.apps[id];
       continue;
     }
-    if (rec.tunnel && !pidAlive(rec.tunnel.pid)) rec.tunnel = null;
+    if (rec.tunnel && !pidAlive(rec.tunnel.pid)) {
+      if (rec.tunnel.relay?.forwardId) strandedShares.push({ id, tunnel: rec.tunnel });
+      rec.tunnel = null;
+    }
   }
   await save(state);
-  return { state, strandedTunnels };
+  return { state, strandedShares };
 }

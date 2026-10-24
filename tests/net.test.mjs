@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s } from '../src/net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s, bridgeOnlyLan } from '../src/net.js';
 import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
@@ -288,4 +288,20 @@ test('probeWildcardHold: the default alias is unaffected by the specific-address
   const port = await allocatePort();
   await hold(t, port, '0.0.0.0');
   assert.equal(await probeWildcardHold(port), 'held');
+});
+
+// Invariant: a share is flagged container-internal exactly when code-hub is in a
+// container and every LAN address is in 172.16.0.0/12; an empty list claims nothing.
+test('bridgeOnlyLan truth table', () => {
+  const cases = [
+    [['172.17.0.2'], true, true],
+    [['172.16.0.1', '172.31.255.254'], true, true],
+    [['172.17.0.2'], false, false],
+    [['172.17.0.2', '192.168.1.20'], true, false],
+    [['172.15.0.1'], true, false],
+    [['172.32.0.1'], true, false],
+    [['192.168.1.20'], true, false],
+    [[], true, false],
+  ];
+  for (const [ips, inContainer, want] of cases) assert.equal(bridgeOnlyLan(ips, inContainer), want, `${ips} in container: ${inContainer}`);
 });
