@@ -25,6 +25,8 @@
 //   flood       → same as default, but prints 2×READY_OVERLAP_CHARS of filler in the
 //                 same tick as the ready line, so the ready line is gone from the
 //                 overlap tail by the first poll tick.
+//   envdump     → writes its environment as JSON to $FAKE_APP_MARKER, then
+//                 behaves as default.
 //   backtrack   → prints 32 'a's and a '!' before binding, then behaves as
 //                 default. Output that makes a pattern like (a|a)+$ take
 //                 tens of seconds per unprotected check.
@@ -49,6 +51,11 @@ if (process.env.FAKE_APP_MODE === 'flaky') {
     console.error(`Error: listen EADDRINUSE: address already in use :::${process.env.PORT}`);
     process.exit(1);
   }
+}
+
+if (process.env.FAKE_APP_MODE === 'envdump') {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(process.env.FAKE_APP_MARKER, JSON.stringify(process.env));
 }
 
 if (process.env.FAKE_APP_MODE === 'gated') {

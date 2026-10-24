@@ -149,6 +149,15 @@ def resolve_addresses(advertise, listen_host, probe=default_route_ipv4):
     return [ip], None
 
 
+def canonical_ip(ip):
+    """The canonical spelling of an IPv4 address (Python 3.9.0-3.9.4 accept
+    leading zeros), or `ip` unchanged when it doesn't parse."""
+    try:
+        return str(ipaddress.IPv4Address(ip))
+    except ValueError:
+        return ip
+
+
 def _is_loopback(host):
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -156,12 +165,25 @@ def _is_loopback(host):
         return False
 
 
-def control_listen_problem(listen_host, addresses):
-    """Why the control listener could be reachable from the LAN, or None."""
+def control_listen_problem(listen_host, addresses, default_route=None):
+    """Why the control listener would be reachable from the LAN, or None.
+
+    Refuses a wildcard --listen, and a non-loopback --listen equal to an
+    advertised address or to the default-route address (`default_route`, the
+    probe's answer, None when the probe found none). A loopback --listen is
+    never LAN-reachable and is always allowed. What it can't know: a --listen
+    on some other LAN interface the relay neither advertises nor probes; there,
+    the bearer secret is the remaining gate.
+    """
     if listen_host in WILDCARD_HOSTS:
         return "--listen %r is a wildcard address, which would expose the control API on every interface" % listen_host
-    if listen_host in addresses and not _is_loopback(listen_host):
+    if _is_loopback(listen_host):
+        return None
+    listen = canonical_ip(listen_host)
+    if listen in [canonical_ip(a) for a in addresses]:
         return "--listen %s is also an advertised address, so LAN devices could reach the control API" % listen_host
+    if default_route is not None and listen == canonical_ip(default_route):
+        return "--listen %s is this host's default-route (LAN) address, so LAN devices could reach the control API" % listen_host
     return None
 
 
@@ -540,6 +562,7 @@ class Relay:
             await respond(writer, 200, {
                 "ok": True, "protocol": PROTOCOL["protocolVersion"], "addresses": addresses,
                 "leaseMs": self.lease_ms, "forwards": len(self.forwards),
+                "parked": sum(len(f.parked) for f in self.forwards.values()),
             })
             return
         if name == "forwards":
@@ -597,7 +620,14 @@ class Relay:
         fid = secrets.token_urlsafe(18)
         fwd = Forward(self, fid, bound, addresses)
         self.forwards[fid] = fwd
-        await fwd.start(socks)
+        try:
+            await fwd.start(socks)
+        except Exception as e:
+            self.drop(fid)
+            for sock in socks:
+                sock.close()
+            await respond(writer, 500, {"error": "could not serve the forward: %s" % e})
+            return
         log("forward %s open on %s port %d" % (fid, ",".join(addresses), bound))
         await respond(writer, 201, {
             "id": fid, "port": bound, "addresses": addresses,
@@ -683,10 +713,23 @@ def main(argv=None):
         dest = probe_dest()
     except ValueError as e:
         sys.exit("code-hub-relay: %s: %s" % (PROBE_DEST_ENV, e))
-    addresses, problem = resolve_addresses(args.advertise, args.listen_host, lambda: default_route_ipv4(dest))
+    # Probed even with --advertise: the listen guard refuses the default-route
+    # address too. A failed probe only means there is nothing to compare.
+    try:
+        route = default_route_ipv4(dest)
+        route_error = None
+    except OSError as e:
+        route, route_error = None, e
+
+    def probe():
+        if route_error is not None:
+            raise route_error
+        return route
+
+    addresses, problem = resolve_addresses(args.advertise, args.listen_host, probe)
     if problem:
         sys.exit("code-hub-relay: no LAN address to advertise (%s) — pass --advertise <ip>" % problem)
-    problem = control_listen_problem(args.listen_host, addresses)
+    problem = control_listen_problem(args.listen_host, addresses, route)
     if problem:
         sys.exit("code-hub-relay: " + problem)
     try:

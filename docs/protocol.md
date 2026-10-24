@@ -186,15 +186,22 @@ Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot s
 
 ## Host relay protocol (`relay/protocol.json`)
 
-The contract between code-hub (`src/hostRelay.js`) and the host relay (`relay/relay.py`). **`relay/protocol.json` is its single source**: both sides read the protocol version, upgrade token, paths, create keys, port range, minimum secret length and error codes from it, and tests fail if either side restates a path, token or error code as a literal. Operator guide: `docs/host-relay.md`.
+The contract between code-hub (`src/hostRelay.js`) and the host relay (`relay/relay.py`). **`relay/protocol.json` is its single source**, read at load by both sides:
+
+| Key | Read by |
+|---|---|
+| `protocolVersion`, `upgradeToken`, `paths`, `errorCodes`, `port` (range) | both — code-hub checks the version, builds requests and validates create answers from them |
+| `createKeys`, `minSecretLength` | the relay only (create-body validation, secret length) |
+
+Tests fail if either source file restates a path, the upgrade token or an error code inside a string literal (`tests/python/test_relay.py` for `relay.py`, `tests/relay.test.mjs` for `src/hostRelay.js`); comments and docstrings are not scanned. Operator guide: `docs/host-relay.md`.
 
 - **Transport**: HTTP/1.1 on the relay's `--listen` address (default `127.0.0.1:7077`), one request per connection, JSON bodies, `Connection: close` on every non-upgrade response.
 - **Auth**: every request, the accept upgrade included, carries `Authorization: Bearer <secret>` (the relay's secret file contents). Compared as sha256 digests in constant time; a failure is `401` with no body.
 
 | Method + path (`paths.*`) | Body | Success | Refusals |
 |---|---|---|---|
-| `GET` `health` | — | `200 { ok, protocol, addresses, leaseMs, forwards }` (`forwards` = live forward count; `addresses` = what a create would advertise now, `[]` if none) | `401` |
-| `POST` `forwards` | `{ port? }` — `port` an integer in `port.min`–`port.max`, absent = a free port. Empty body = `{}` | `201 { id, port, addresses, leaseMs, protocol }` | `400` body not a JSON object, any key outside `createKeys`, bad port, `Transfer-Encoding`; `401`; `409 { code: "port_in_use" }`; `413` head or body too large; `429` forward cap; `503 { code: "no_lan_address", error }`; `500` another bind error |
+| `GET` `health` | — | `200 { ok, protocol, addresses, leaseMs, forwards, parked }` (`forwards` = live forward count; `parked` = parked accepts across them; `addresses` = what a create would advertise now, `[]` if none) | `401` |
+| `POST` `forwards` | `{ port? }` — `port` an integer in `port.min`–`port.max`, absent = a free port. Empty body = `{}` | `201 { id, port, addresses, leaseMs, protocol }` — code-hub refuses (and deletes) one without a non-empty `id`, a `port` in range, a non-empty IPv4 `addresses` list and an integer `leaseMs`, failing the share's relay | `400` body not a JSON object, any key outside `createKeys`, bad port, `Transfer-Encoding`; `401`; `409 { code: "port_in_use" }`; `413` head or body too large; `429` forward cap; `503 { code: "no_lan_address", error }`; `500` another bind error, or the forward could not start serving (nothing is left bound) |
 | `POST` `renew` (`{id}` substituted) | — | `200 { leaseMs }` | `401`, `404` unknown or expired |
 | `DELETE` `forward` | — | `204` — the listeners close and every parked, queued and spliced connection is cut | `401`, `404` |
 | `GET` `accept` + `Upgrade: <upgradeToken>` | — | held open (parked); `101 Switching Protocols` when a LAN client is spliced onto it, then raw bytes both ways | `400` missing/wrong `Upgrade`, `401`, `404`, `429` parked cap |

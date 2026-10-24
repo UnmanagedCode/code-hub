@@ -67,7 +67,7 @@ Pass `--advertise <ip>[,<ip>…]` when:
 
 | Where | Name | Default | Meaning |
 |---|---|---|---|
-| relay CLI | `--listen <ip:port>` | `127.0.0.1:7077` | Control listener code-hub dials (`:0` = any free port). Refused when a wildcard, or a non-loopback address that is also advertised. |
+| relay CLI | `--listen <ip:port>` | `127.0.0.1:7077` | Control listener code-hub dials (`:0` = any free port). Refused when a wildcard, or a non-loopback address that is advertised or is the default-route address. |
 | relay CLI | `--advertise <ip,…>` | the default-route probe | Host LAN address(es) forwards bind and URLs carry. |
 | relay CLI | `--secret-file <path>` | `~/.code-hub-relay/secret` | Bearer secret; created on first run. |
 | relay CLI | `--lease-ms <n>` | `30000` (min `100`) | A forward's lifetime without renewal. |
@@ -103,7 +103,8 @@ WantedBy=multi-user.target
 ## Security model
 
 - **Authenticated control API**: every request carries `Authorization: Bearer <secret>`, compared in constant time; anything else is `401`.
-- **Control listener off the LAN**: `--listen` is refused on a wildcard, or on a non-loopback address that is also advertised — checked before any socket is opened.
+- **Control listener off the LAN**: `--listen` is refused when it is a wildcard, or a non-loopback address equal to an advertised address or to the host's default-route address (probed even when `--advertise` is given; a probe that finds no route adds nothing). Addresses are compared in canonical form, and the check runs before any listening socket is bound. A loopback `--listen` is always allowed — it is never reachable from the LAN. **What it can't know**: a `--listen` on another LAN-facing interface that is neither advertised nor the default route (a second NIC, say) is not refused; there the bearer secret is the remaining gate.
+- **Apps never see the relay configuration**: code-hub strips `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` from the environment of every app it starts, since the secret is a capability to listen on the host's LAN.
 - **No target in the protocol**: a forward is created with an optional `port` only; the relay has no outbound TCP connect at all (its one `connect()` is the packet-less UDP route probe). It cannot be used as an open proxy.
 - **TLS end to end**: the relay never imports `ssl`; LAN devices talk TLS straight to code-hub's per-share self-signed cert, which includes the advertised host address in its SAN.
 - **Leases**: code-hub renews each forward every `leaseMs/3`; a crashed code-hub's forwards close within `leaseMs`. Forwards live in the relay process and die with it.

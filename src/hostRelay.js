@@ -23,14 +23,19 @@ export function _setRequestTimeoutMs(ms) { requestTimeoutMs = ms; }
 
 const withId = (template, id) => template.replace('{id}', encodeURIComponent(id));
 
+// The environment variables that configure the relay. The secret is a
+// capability to listen on the host's LAN, so runner.js strips both from every
+// app it spawns.
+export const RELAY_ENV = Object.freeze({ url: 'CODEHUB_RELAY_URL', secret: 'CODEHUB_RELAY_SECRET' });
+
 // The relay to use, read from the environment on every call (like
 // PROJECTS_ROOT): null when CODEHUB_RELAY_URL is unset (the feature is off),
 // else { url, host, port, secret, error } — `error` set when the config can't
 // work, which fails the forward with that reason rather than the share.
 export function relayConfig() {
-  const url = process.env.CODEHUB_RELAY_URL;
+  const url = process.env[RELAY_ENV.url];
   if (!url) return null;
-  const secret = process.env.CODEHUB_RELAY_SECRET?.trim() ?? '';
+  const secret = process.env[RELAY_ENV.secret]?.trim() ?? '';
   let parsed;
   try { parsed = new URL(url); } catch {
     return { url, error: `CODEHUB_RELAY_URL '${url}' is not a URL` };
@@ -88,12 +93,29 @@ async function createForward(cfg, port) {
     portFallback = true;
   }
   if (res.status !== 201) throw relayError(describeFailure(cfg, res.status, res.body), { status: res.status, code: res.body?.code });
-  const { id, protocol, addresses, leaseMs } = res.body ?? {};
+  const { id, protocol, port: bound, addresses, leaseMs } = res.body ?? {};
+  const discard = () => { if (typeof id === 'string' && id) call(cfg, 'DELETE', withId(PATHS.forward, id)).catch(() => {}); };
   if (protocol !== PROTOCOL.protocolVersion) {
-    call(cfg, 'DELETE', withId(PATHS.forward, id)).catch(() => {});
+    discard();
     throw relayError(`relay speaks protocol ${protocol}, this code-hub speaks ${PROTOCOL.protocolVersion} — update the relay/ copy on the host`);
   }
-  return { id, port: res.body.port, addresses, leaseMs, portFallback };
+  const malformed = createdProblem(res.body);
+  if (malformed) {
+    discard();
+    throw relayError(`the relay's create response is malformed (${malformed})`);
+  }
+  return { id, port: bound, addresses, leaseMs, portFallback };
+}
+
+// Why a 201 create body can't be used, or null. Checked here, at the boundary,
+// so nothing downstream ever builds URLs from a half-formed forward.
+function createdProblem(body) {
+  const { id, port, addresses, leaseMs } = body ?? {};
+  if (typeof id !== 'string' || !id) return 'no forward id';
+  if (!Number.isInteger(port) || port < PROTOCOL.port.min || port > PROTOCOL.port.max) return `port ${JSON.stringify(port)}`;
+  if (!Array.isArray(addresses) || !addresses.length || !addresses.every((a) => typeof a === 'string' && net.isIPv4(a))) return 'addresses is not a non-empty list of IPv4 addresses';
+  if (!Number.isInteger(leaseMs) || leaseMs <= 0) return `leaseMs ${JSON.stringify(leaseMs)}`;
+  return null;
 }
 
 // Live handles by their current forward id, so release() can close the one
@@ -126,20 +148,31 @@ function makeHandle(cfg, fwd, { requestedPort, onChange }) {
   let ticking = false;
   const parks = new Set(); // pending accept requests
   const pipes = new Set(); // live spliced sockets
-  const timers = new Set();
+  const timers = new Set(); // lease ticks
+  const parkTimers = new Set(); // slots waiting to re-park
+  // The pool is ACCEPT_POOL slots, each a loop of park → (splice) → re-park.
+  // A drain bumps `poolGen` and forgets every slot at once, so a callback of a
+  // drained slot (a destroyed request's error, a pending re-park) is a no-op and
+  // the next fill starts exactly ACCEPT_POOL fresh ones.
+  let poolGen = 0;
+  let slots = 0;
 
-  const later = (fn, ms) => {
-    const t = setTimeout(() => { timers.delete(t); fn(); }, ms);
+  const later = (fn, ms, set = timers) => {
+    const t = setTimeout(() => { set.delete(t); fn(); }, ms);
     t.unref();
-    timers.add(t);
+    set.add(t);
   };
 
   // --- accept pool --------------------------------------------------------
-  const startSlot = () => {
-    if (closed || state !== 'up' || !target) return;
+  const runSlot = (gen) => {
+    if (gen !== poolGen) return;
+    if (closed || state !== 'up' || !target) { slots -= 1; return; }
     const startedAt = Date.now();
     const forwardId = id;
-    const again = (minDelay) => later(startSlot, Math.max(minDelay, REPARK_FLOOR_MS - (Date.now() - startedAt)));
+    const again = (minDelay) => {
+      if (gen !== poolGen) return;
+      later(() => runSlot(gen), Math.max(minDelay, REPARK_FLOOR_MS - (Date.now() - startedAt)), parkTimers);
+    };
     const req = http.request({
       host: cfg.host, port: cfg.port, method: 'GET', path: withId(PATHS.accept, forwardId), agent: false,
       headers: { Authorization: `Bearer ${cfg.secret}`, Connection: 'Upgrade', Upgrade: PROTOCOL.upgradeToken },
@@ -157,7 +190,7 @@ function makeHandle(cfg, fwd, { requestedPort, onChange }) {
     req.on('response', (res) => {
       res.resume();
       if (!settle()) return;
-      if (res.statusCode === 404 && forwardId === id) markDown(`the relay no longer knows forward ${forwardId}`);
+      if (res.statusCode === 404 && forwardId === id && gen === poolGen) markDown(`the relay no longer knows forward ${forwardId}`);
       else again(REPARK_BACKOFF_MS);
     });
     req.on('error', () => { if (settle()) again(REPARK_BACKOFF_MS); });
@@ -175,8 +208,18 @@ function makeHandle(cfg, fwd, { requestedPort, onChange }) {
     socket.on('close', done); up.on('close', done);
   };
 
-  const fillPool = () => { for (let i = 0; i < ACCEPT_POOL; i++) startSlot(); };
-  const drainPool = () => { for (const req of parks) req.destroy(); parks.clear(); };
+  const fillPool = () => {
+    if (closed || state !== 'up' || !target) return;
+    while (slots < ACCEPT_POOL) { slots += 1; runSlot(poolGen); }
+  };
+  const drainPool = () => {
+    poolGen += 1;
+    slots = 0;
+    for (const t of parkTimers) clearTimeout(t);
+    parkTimers.clear();
+    for (const req of parks) req.destroy();
+    parks.clear();
+  };
 
   // --- lease ---------------------------------------------------------------
   const emit = (prevId) => { try { onChange({ prevId }); } catch (e) { console.error(`[hostRelay] onChange failed: ${e.message}`); } };

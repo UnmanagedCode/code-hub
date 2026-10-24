@@ -4,6 +4,8 @@ import http from 'node:http';
 import net from 'node:net';
 import * as runner from '../src/runner.js';
 import { allocatePort } from '../src/net.js';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd } from './helpers.mjs';
 
 function get(port) {
@@ -169,4 +171,30 @@ test('start() returns a settled promise: ready for a healthy app, crashed for on
   const bad = { id: 'settle-crash', path: dir, manifest: { start: fakeAppCmd('crash'), healthPath: null, readyWhen: null } };
   const crashed = await runner.start(bad, await allocatePort());
   assert.equal(await crashed.settled, 'crashed');
+});
+
+// Invariant: an app never inherits the host-relay configuration — its secret is a capability to listen on the host's LAN.
+test('apps are spawned without CODEHUB_RELAY_URL or CODEHUB_RELAY_SECRET in their environment', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const prev = { url: process.env.CODEHUB_RELAY_URL, secret: process.env.CODEHUB_RELAY_SECRET };
+  process.env.CODEHUB_RELAY_URL = 'http://127.0.0.1:7077';
+  process.env.CODEHUB_RELAY_SECRET = 'relay-secret-that-must-not-leak-0123456789';
+  t.after(() => {
+    for (const [k, v] of [['CODEHUB_RELAY_URL', prev.url], ['CODEHUB_RELAY_SECRET', prev.secret]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+  const marker = path.join(root, 'env.json');
+  const cmd = fakeAppCmd('envdump', marker);
+  const dir = await mkProject(root, 'app', { start: cmd });
+  const port = await allocatePort();
+  const rec = await runner.start({ id: 'envdump', path: dir, manifest: { start: cmd, healthPath: null, readyWhen: null } }, port);
+  t.after(() => runner.stop({ id: 'envdump', pgid: rec.pgid }));
+  await waitFor(() => runner.runtime('envdump')?.status === 'ready');
+  const env = JSON.parse(await fs.readFile(marker, 'utf8'));
+  assert.equal(env.PORT, String(port), 'the app did get its environment');
+  assert.equal('CODEHUB_RELAY_URL' in env, false);
+  assert.equal('CODEHUB_RELAY_SECRET' in env, false);
+  assert.ok(!JSON.stringify(env).includes('relay-secret-that-must-not-leak'));
 });

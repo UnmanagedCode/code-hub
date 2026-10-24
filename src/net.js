@@ -194,10 +194,12 @@ export function runningInContainer() { return containerProbe(); }
 // Test seam: replace the container check (`null` restores the real one).
 export function _setContainerProbe(fn) { containerProbe = fn ?? realContainerProbe; }
 
-// True when a LAN share's addresses are a container's bridge addresses only —
-// in a container, and every one of `ips` inside 172.16.0.0/12 (Docker's default
-// bridge pools) — so no device on the host's LAN can reach them. An empty list
-// claims nothing.
+// A heuristic: true when a LAN share's addresses look like a container's bridge
+// addresses only — in a container, and every one of `ips` inside 172.16.0.0/12
+// (Docker's default bridge pools) — so they are almost certainly unreachable
+// from the host's LAN. It misses other pools and can misfire on a host-network
+// container; see "Limitations" in docs/host-relay.md. An empty list claims
+// nothing.
 export function bridgeOnlyLan(ips, inContainer) {
   if (!inContainer || !ips.length) return false;
   return ips.every((ip) => {

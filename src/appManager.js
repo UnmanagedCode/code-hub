@@ -779,43 +779,48 @@ async function shareRecord(id, op, { mode, auth, tls }) {
         }
       }
       if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
-      if (!committable()) { proxy.close(); throw abandoned(id, op); }
+      if (!committable()) throw abandoned(id, op);
+      // Drop the loopback entry — it's not reachable from another device, and in
+      // the fixed-port case that's load-bearing rather than cosmetic: the proxy
+      // isn't bound on loopback at all there, so `<scheme>://localhost:<fixedPort>`
+      // would reach the app DIRECTLY, ungated.
+      const loopbackPrefix = `${scheme}://localhost:`;
+      const containerUrls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
+      // Where the share is reachable right now: the host's addresses while the
+      // relay forward is up, else the container's own (today's LAN share).
+      const reach = () => {
+        const relay = forward
+          ? { state: forward.state, error: forward.error, forwardId: forward.id, port: forward.port, requestedPort: forward.requestedPort, portFallback: forward.portFallback }
+          : relayFailure;
+        const urls = relay?.state === 'up' ? forward.addresses.map((ip) => `${scheme}://${ip}:${forward.port}`) : containerUrls;
+        const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
+        return { url, urls, relay, containerInternal: relay?.state !== 'up' && bridgeOnly };
+      };
+      const tunnelRec = { kind: 'lan', ...reach(), pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
+      forward?.attach({ host: proxy.hosts[0] === '0.0.0.0' ? '127.0.0.1' : proxy.hosts[0], port: proxy.port });
+      // The commit: plain assignments only, so nothing can throw past this point
+      // and leave a committed share behind the catch below.
+      proxies.set(id, proxy);
+      proxyOwner.set(proxy, rec);
+      markDefault();
+      rec.tunnel = tunnelRec;
+      if (forward) {
+        // A relay state change (down, re-created) re-points the share's URLs —
+        // only while this record still holds this forward. The QR follows the
+        // URL through cachedQrSvg's key.
+        onRelayChange = ({ prevId }) => {
+          if (store.apps[id] !== rec || rec.tunnel?.relay?.forwardId !== prevId) return;
+          Object.assign(rec.tunnel, reach());
+          persist().catch((e) => console.error(`[appManager] ${id}: persisting a relay change failed — ${e.message}`));
+        };
+      }
     } catch (e) {
-      // Covers the abandon path too: a forward opened for a share that never
-      // commits must not outlive it.
+      // Any throw before the commit — the abandon path included — closes what
+      // this share started: its proxy, and a forward that would otherwise keep
+      // renewing with nothing able to release it.
+      proxy?.close();
       forward?.close();
       throw e;
-    }
-    proxies.set(id, proxy);
-    proxyOwner.set(proxy, rec);
-    markDefault();
-    // Drop the loopback entry — it's not reachable from another device, and in
-    // the fixed-port case that's load-bearing rather than cosmetic: the proxy
-    // isn't bound on loopback at all there, so `<scheme>://localhost:<fixedPort>`
-    // would reach the app DIRECTLY, ungated.
-    const loopbackPrefix = `${scheme}://localhost:`;
-    const containerUrls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
-    // Where the share is reachable right now: the host's addresses while the
-    // relay forward is up, else the container's own (today's LAN share).
-    const reach = () => {
-      const relay = forward
-        ? { state: forward.state, error: forward.error, forwardId: forward.id, port: forward.port, requestedPort: forward.requestedPort, portFallback: forward.portFallback }
-        : relayFailure;
-      const urls = relay?.state === 'up' ? forward.addresses.map((ip) => `${scheme}://${ip}:${forward.port}`) : containerUrls;
-      const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
-      return { url, urls, relay, containerInternal: relay?.state !== 'up' && bridgeOnly };
-    };
-    rec.tunnel = { kind: 'lan', ...reach(), pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
-    if (forward) {
-      // A relay state change (down, re-created) re-points the share's URLs —
-      // only while this record still holds this forward. The QR follows the
-      // URL through cachedQrSvg's key.
-      onRelayChange = ({ prevId }) => {
-        if (store.apps[id] !== rec || rec.tunnel?.relay?.forwardId !== prevId) return;
-        Object.assign(rec.tunnel, reach());
-        persist().catch((e) => console.error(`[appManager] ${id}: persisting a relay change failed — ${e.message}`));
-      };
-      forward.attach({ host: proxy.hosts[0] === '0.0.0.0' ? '127.0.0.1' : proxy.hosts[0], port: proxy.port });
     }
     await persist();
     const { url, urls, relay, containerInternal } = rec.tunnel;

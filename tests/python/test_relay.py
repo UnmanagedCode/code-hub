@@ -3,6 +3,8 @@ tests/relayPython.test.mjs, or directly: python3 -m unittest discover -s tests/p
 """
 
 import ast
+import asyncio
+import ipaddress
 import json
 import os
 import socket
@@ -11,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 RELAY_DIR = Path(__file__).resolve().parents[2] / "relay"
 sys.path.insert(0, str(RELAY_DIR))
@@ -75,8 +78,9 @@ def call_name(call):
 class IpProblem(unittest.TestCase):
     # P1 — the probe exclusions.
     def test_rejects_non_lan_addresses(self):
-        for ip in ("127.0.0.1", "169.254.1.1", "0.0.0.0", "224.0.0.1", "100.100.1.1", "172.17.0.1"):
+        for ip in ("127.0.0.1", "169.254.1.1", "0.0.0.0", "224.0.0.1", "100.100.1.1", "172.17.0.1", "240.0.0.1"):
             self.assertIsNotNone(relay.ip_problem(ip), ip)
+        self.assertEqual(relay.ip_problem("240.0.0.1"), "reserved")
         self.assertIsNotNone(relay.ip_problem("192.168.1.20", "192.168.1.20"), "the listen address")
 
     def test_accepts_lan_addresses(self):
@@ -99,6 +103,37 @@ class ControlListenProblem(unittest.TestCase):
         self.assertIsNone(relay.control_listen_problem("127.0.0.1", ["127.0.0.1"]))
         self.assertIsNone(relay.control_listen_problem("127.0.0.1", ["192.168.1.20"]))
         self.assertIsNone(relay.control_listen_problem("172.17.0.1", ["192.168.1.20"]))
+        self.assertIsNone(relay.control_listen_problem("172.17.0.1", ["192.168.1.20"], "192.168.1.20"))
+        self.assertIsNone(relay.control_listen_problem("127.0.0.1", ["127.0.0.1"], "127.0.0.1"), "loopback stays exempt")
+        self.assertIsNone(relay.control_listen_problem("172.17.0.1", ["10.0.0.5"], None), "no probe answer adds nothing")
+
+    def test_refuses_non_loopback_listen_equal_to_the_default_route(self):
+        self.assertIsNotNone(relay.control_listen_problem("192.168.1.20", ["10.0.0.5"], "192.168.1.20"))
+
+    def test_compares_canonical_spellings(self):
+        # Python 3.9.0-3.9.4 parse leading-zero octets; emulate that parser so
+        # the guard is shown to compare canonical forms, not raw strings.
+        real = ipaddress.IPv4Address
+
+        def lenient(value):
+            if isinstance(value, str):
+                value = ".".join(str(int(part)) for part in value.split("."))
+            return real(value)
+
+        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient):
+            self.assertIsNotNone(relay.control_listen_problem("192.168.001.020", ["192.168.1.20"]))
+            self.assertIsNotNone(relay.control_listen_problem("192.168.1.20", ["10.0.0.5"], "192.168.01.20"))
+
+    def test_main_refuses_the_default_route_before_binding(self):
+        # Process-level wiring, host-independent: the probe is stubbed and any
+        # listening socket would fail the test.
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(relay, "default_route_ipv4", lambda dest=None: "192.168.1.20"), \
+                mock.patch.object(relay, "bind_listener", side_effect=AssertionError("bound a socket")):
+            with self.assertRaises(SystemExit) as caught:
+                relay.main(["--listen", "192.168.1.20:0", "--advertise", "10.0.0.5",
+                            "--secret-file", str(Path(tmp) / "secret")])
+        self.assertIn("default-route", str(caught.exception.code))
 
 
 class RouteProbe(unittest.TestCase):
@@ -178,6 +213,126 @@ class StaticShape(unittest.TestCase):
         for ann in annotations:
             for n in ast.walk(ann):
                 self.assertFalse(isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr), "X | Y annotation")
+
+
+class ParseArgs(unittest.TestCase):
+    # --advertise refuses a wildcard (0.0.0.0/8) address.
+    def test_advertise_wildcard_refused(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            relay.parse_args(["--advertise", "0.0.0.0"])
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            relay.parse_args(["--advertise", "192.168.1.20,0.0.0.0"])
+
+
+class ConstantTimeBearer(unittest.TestCase):
+    # P9 — the bearer check hashes both sides with sha256, compares with
+    # hmac.compare_digest, and never compares the supplied value with ==/!=.
+    def test_bearer_ok_shape(self):
+        fn = function_named(TREE, "bearer_ok")
+        sha = [c for c in calls(fn) if isinstance(c.func, ast.Attribute) and c.func.attr == "sha256"
+               and isinstance(c.func.value, ast.Name) and c.func.value.id == "hashlib"]
+        self.assertEqual(len(sha), 2, "both sides hashed")
+        digest = [c for c in calls(fn) if isinstance(c.func, ast.Attribute) and c.func.attr == "compare_digest"
+                  and isinstance(c.func.value, ast.Name) and c.func.value.id == "hmac"]
+        self.assertEqual(len(digest), 1)
+        secret_names = {"value", "given", "expected", "secret", "header"}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops):
+                for part in [node.left] + node.comparators:
+                    names = {n.id for n in ast.walk(part) if isinstance(n, ast.Name)}
+                    self.assertFalse(names & secret_names, "compared with ==/!= at line %d" % node.lineno)
+        self.assertTrue(relay.bearer_ok("Bearer " + "s" * 40, "s" * 40))
+        self.assertFalse(relay.bearer_ok("Bearer " + "s" * 39, "s" * 40))
+
+
+class FakeWriter:
+    def __init__(self):
+        self.data = b""
+        self.closed = False
+
+    def write(self, data):
+        self.data += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def status(self):
+        return int(self.data.split(b" ", 2)[1])
+
+    def body(self):
+        return json.loads(self.data.split(b"\r\n\r\n", 1)[1])
+
+
+def make_relay(**over):
+    opts = dict(secret="s" * 40, advertise=["127.0.0.1"], listen_host="127.0.0.1", lease_ms=1000, accept_wait_ms=100)
+    opts.update(over)
+    return relay.Relay(**opts)
+
+
+class Create(unittest.TestCase):
+    # A create whose fresh probe yields no LAN address answers 503 no_lan_address.
+    def test_no_lan_address_at_create_time(self):
+        r = make_relay(advertise=None, probe=lambda: "127.0.0.1")
+        writer = FakeWriter()
+        asyncio.run(r._create(b"{}", writer))
+        self.assertEqual(writer.status(), 503)
+        self.assertEqual(writer.body()["code"], PROTOCOL["errorCodes"]["noLanAddress"])
+        self.assertIn("loopback", writer.body()["error"])
+        self.assertEqual(r.forwards, {})
+
+    # A5 — a forward that fails to start is dropped and its sockets closed.
+    def test_failed_start_rolls_back(self):
+        r = make_relay()
+        bound = []
+        real_bind_all = relay.bind_all
+
+        def recording_bind_all(addresses, port):
+            socks, port = real_bind_all(addresses, port)
+            bound.extend(socks)
+            return socks, port
+
+        async def failing_start(self, socks):
+            raise RuntimeError("boom")
+
+        writer = FakeWriter()
+        with mock.patch.object(relay, "bind_all", recording_bind_all), \
+                mock.patch.object(relay.Forward, "start", failing_start), \
+                mock.patch.object(relay, "log"):
+            asyncio.run(r._create(b"{}", writer))
+        self.assertEqual(writer.status(), 500)
+        self.assertEqual(r.forwards, {})
+        self.assertTrue(bound)
+        for sock in bound:
+            self.assertEqual(sock.fileno(), -1, "socket closed")
+
+
+class Lease(unittest.TestCase):
+    # B14 — the lease is exactly lease_ms, and a renewal cancels and reschedules it.
+    def test_renew_schedules_lease_ms(self):
+        delays, handles = [], []
+
+        class Handle:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        class Loop:
+            def call_later(self, delay, fn):
+                delays.append(delay)
+                handles.append(Handle())
+                return handles[-1]
+
+        fwd = relay.Forward(make_relay(lease_ms=1234), "fid", 5000, ["127.0.0.1"])
+        with mock.patch.object(relay.asyncio, "get_running_loop", lambda: Loop()):
+            fwd.renew()
+            fwd.renew()
+        self.assertEqual(delays, [1.234, 1.234])
+        self.assertEqual([h.cancelled for h in handles], [True, False])
 
 
 class Restatement(unittest.TestCase):

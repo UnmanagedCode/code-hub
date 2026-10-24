@@ -3,6 +3,7 @@ import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
 import { createReadyMatcher } from './readyWhen.js';
+import { RELAY_ENV } from './hostRelay.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
@@ -37,12 +38,21 @@ function settle(c, status, error = null) {
   c.resolveSettled(status);
 }
 
+// The environment an app runs with: code-hub's own, minus the host-relay
+// configuration (its secret would let any app or dependency listen on the
+// host's LAN), plus PORT.
+function appEnv(port) {
+  const env = { ...process.env, PORT: String(port) };
+  for (const name of Object.values(RELAY_ENV)) delete env[name];
+  return env;
+}
+
 // Spawn the manifest's blocking start command in its OWN process group
 // (detached ⇒ child is group leader ⇒ pgid === pid), with PORT injected.
 function spawnChild(app, port) {
   const proc = spawn('bash', ['-lc', app.manifest.start], {
     cwd: app.path,
-    env: { ...process.env, PORT: String(port) },
+    env: appEnv(port),
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

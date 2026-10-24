@@ -66,9 +66,10 @@ export function pidAlive(pid) {
 // that still holds something live outside this process: a share child whose
 // pid is ALIVE, or a host-relay forward (`tunnel.relay.forwardId` — a LAN
 // share's tunnel has no pid, so it is always cleared here). The record was the
-// only thing holding that pid or forward id, so after the delete nothing
-// anywhere could ever release it — for a tailscale funnel that means a public
-// URL left serving 443 in front of a proxy that no longer exists. This module
+// only thing holding that pid or forward id, so after the delete no code-hub
+// path could release it (a forward of a dead process is bounded only by the
+// relay's lease) — for a tailscale funnel that means a public URL left serving
+// 443 in front of a proxy that no longer exists. This module
 // can't release them itself (it doesn't know a share's kind, and must not grow
 // a dependency on the integrations to find out), so it hands them back and the
 // caller tears them down. The invariant callers must uphold: no path drops a
