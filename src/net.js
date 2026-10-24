@@ -2,6 +2,7 @@ import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { childEnv } from './childEnv.js';
 
 // Allocate a free TCP port by binding to 0 and reading the assigned port,
 // then closing. There is a small TOCTOU window between close and the child
@@ -155,7 +156,7 @@ function fallbackLanIPv4s() {
   let ips = [];
   for (const [cmd, args] of [['ip', ['-4', 'addr']], ['ifconfig', ['-a']]]) {
     try {
-      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: childEnv() });
       ips = parseLanIPv4s(out);
       if (ips.length) break;
     } catch { /* binary missing / not permitted — try the next one */ }

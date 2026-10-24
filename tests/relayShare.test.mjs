@@ -12,7 +12,7 @@ import * as appManager from '../src/appManager.js';
 import { _setContainerProbe } from '../src/net.js';
 import { storeRoot } from '../src/projects.js';
 import {
-  REPO_ROOT, requirePython, startRelay, withRelayEnv, relayCall, canConnect, waitFor, holdShareAtSettingsRead,
+  REPO_ROOT, requirePython, startRelay, withRelayEnv, relayCall, canConnect, waitFor, holdShareAtSettingsRead, holdStateWrite,
   mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ALT_LOOPBACK, altLoopbackBindable,
 } from './helpers.mjs';
 
@@ -368,3 +368,26 @@ test('S11: a re-run init() releases a live share\'s relay forward before the lea
   await appManager.init();
   await noForwards(relay);
 });
+
+// Invariant: init()'s discard of the previous in-memory records releases a LAN
+// share's relay forward — in the window where the share has committed but its
+// state.json write hasn't landed, so neither init's load nor reconcile can see
+// it. (Were the discard loop to skip LAN tunnels, nothing would release this
+// forward before its lease: the load reads the pre-share file, so reconcile
+// finds no tunnel to hand back.)
+test('S12: init() during a share\'s post-commit persist releases its relay forward', async (t) => {
+  if (!requirePython(t)) return;
+  const relay = await relayFor(t, { leaseMs: 5000 });
+  withRelayEnv(t, relay);
+  await boot(t);
+  const hold = holdStateWrite(t);
+  const sharing = appManager.share('app', { mode: 'lan', tls: false });
+  await hold.parked; // committed, attached, not yet on disk
+  assert.equal(await forwardsOn(relay), 1);
+  const initing = appManager.init();
+  await hold.stateRead; // init has discarded and loaded the pre-share state.json
+  hold.release();
+  await Promise.all([sharing, initing]);
+  await noForwards(relay); // well before the 5000ms lease
+});
+

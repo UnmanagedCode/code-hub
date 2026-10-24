@@ -100,3 +100,88 @@ test('a relay that never answers times out: openForward rejects, the share still
   assert.match(res.body.relay.error, /did not answer within 200ms/);
   assert.ok(Date.now() - started < 2000, `bounded by the timeout (${Date.now() - started}ms)`);
 });
+
+// A fake relay: `create(n)` answers the nth create with { status, text }, and
+// every request is counted. Accept upgrades are held open and counted per id.
+async function fakeRelay(t, { create, renew = () => 200 }) {
+  const seen = { creates: 0, renews: [], deletes: [], accepts: new Map() };
+  const held = new Set();
+  const srv = http.createServer((req, res) => {
+    req.resume();
+    if (req.method === 'POST' && req.url === PROTOCOL.paths.forwards) {
+      seen.creates += 1;
+      const { status, text } = create(seen.creates);
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(text);
+      return;
+    }
+    const id = decodeURIComponent(req.url.split('/')[3] ?? '');
+    if (req.method === 'POST') { seen.renews.push(id); res.writeHead(renew(id, seen)); res.end(); return; }
+    if (req.method === 'DELETE') { seen.deletes.push(id); res.writeHead(204); res.end(); return; }
+    res.writeHead(404); res.end();
+  });
+  srv.on('upgrade', (req, socket) => {
+    const id = decodeURIComponent(req.url.split('/')[3] ?? '');
+    const list = seen.accepts.get(id) ?? [];
+    list.push(socket);
+    seen.accepts.set(id, list);
+    held.add(socket);
+    socket.on('error', () => {});
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { for (const s of held) s.destroy(); srv.close(); });
+  useRelay(t, `http://127.0.0.1:${srv.address().port}`);
+  return seen;
+}
+
+const created = (over = {}) => JSON.stringify({ id: 'fwd-1', port: 40000, addresses: ['127.0.0.1'], leaseMs: 300, protocol: PROTOCOL.protocolVersion, ...over });
+
+// Invariant: every malformed create answer — one per createdProblem branch, the size and count caps included — is refused as malformed at the boundary (never as a version mismatch), and a well-formed answer of another version is refused as a mismatch.
+test('each malformed 201 is refused as malformed; a well-formed other version as a mismatch', async (t) => {
+  const many = Array.from({ length: PROTOCOL.maxAddresses + 1 }, (_, i) => `10.0.0.${i + 1}`);
+  const cases = [
+    ['not JSON', 'nope', /malformed \(not a JSON object\)/],
+    ['an array', '[]', /malformed \(not a JSON object\)/],
+    ['no protocol', created({ protocol: undefined }), /malformed \(protocol undefined\)/],
+    ['no id', created({ id: '' }), /malformed \(no forward id\)/],
+    ['a privileged port', created({ port: 80 }), /malformed \(port 80\)/],
+    ['no addresses', created({ addresses: undefined }), /malformed \(addresses is not a non-empty list of IPv4 addresses\)/],
+    ['a non-IPv4 address', created({ addresses: ['host.example'] }), /malformed \(addresses is not a non-empty list of IPv4 addresses\)/],
+    ['too many addresses', created({ addresses: many }), new RegExp(`malformed \\(${many.length} addresses, more than ${PROTOCOL.maxAddresses}\\)`)],
+    ['a zero lease', created({ leaseMs: 0 }), /malformed \(leaseMs 0\)/],
+    ['an overlong lease', created({ leaseMs: 1e10 }), /malformed \(leaseMs 10000000000\)/],
+    ['an oversized answer', created({ pad: 'x'.repeat(70 * 1024) }), /malformed \(larger than 65536 bytes\)/],
+    ['another version', created({ protocol: PROTOCOL.protocolVersion + 1 }), new RegExp(`relay speaks protocol ${PROTOCOL.protocolVersion + 1}, this code-hub speaks ${PROTOCOL.protocolVersion}`)],
+  ];
+  let current = null;
+  const seen = await fakeRelay(t, { create: () => ({ status: 201, text: current }) });
+  for (const [name, text, error] of cases) {
+    current = text;
+    await assert.rejects(hostRelay.openForward({}), error, name);
+  }
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(seen.renews, [], 'no refused forward is ever renewed');
+});
+
+// Invariant: a drained accept slot can never re-park — after down→up the pool holds exactly ACCEPT_POOL parked accepts, the drained slots' late callbacks included.
+test('a drained slot\'s late callback does not re-park after down→up', async (t) => {
+  const seen = await fakeRelay(t, {
+    create: (n) => ({ status: 201, text: created({ id: `fwd-${n}` }) }),
+    renew: (id) => (id === 'fwd-1' ? 404 : 200), // the first forward is "lost" on its first renewal
+  });
+  const target = net.createServer((s) => s.destroy());
+  await new Promise((r) => target.listen(0, '127.0.0.1', r));
+  t.after(() => target.close());
+  const handle = await hostRelay.openForward({});
+  t.after(() => handle.close());
+  handle.attach({ host: '127.0.0.1', port: target.address().port });
+  const deadline = Date.now() + 3000;
+  while (handle.id !== 'fwd-2' || handle.state !== 'up') {
+    assert.ok(Date.now() < deadline, 'the forward was re-created');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(seen.accepts.get('fwd-1')?.length, 4, 'the first pool parked');
+  // Past the drained slots' error backoff (1000ms) and every re-park floor.
+  await new Promise((r) => setTimeout(r, 1600));
+  assert.equal(seen.accepts.get('fwd-2')?.length, 4, 'exactly one fresh pool, no re-park from a drained slot');
+});

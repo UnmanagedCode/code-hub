@@ -654,20 +654,35 @@ def parse_args(argv):
         args.listen_host, args.listen_port = parse_ip_port(args.listen)
     except ValueError as e:
         parser.error("--listen: %s" % e)
+    # Every address is canonicalised ONCE, here, and only the canonical string
+    # is used from then on — by the guard and by every bind. Python 3.9.0-3.9.4
+    # read a leading-zero octet as decimal while the C library's bind reads it
+    # as octal, so checking one spelling and binding another could put the
+    # control API on an address the guard never saw.
+    if args.listen_host not in WILDCARD_HOSTS:
+        try:
+            args.listen_host = str(ipaddress.IPv4Address(args.listen_host))
+        except ValueError:
+            parser.error("--listen host must be an IPv4 address, got %r" % args.listen_host)
     if args.advertise is not None:
-        ips = [ip.strip() for ip in args.advertise.split(",") if ip.strip()]
-        for ip in ips:
+        ips = []
+        for ip in (part.strip() for part in args.advertise.split(",")):
+            if not ip:
+                continue
             try:
                 addr = ipaddress.IPv4Address(ip)
             except ValueError:
                 parser.error("--advertise: %r is not an IPv4 address" % ip)
             if addr in THIS_NETWORK:
                 parser.error("--advertise: %s is a wildcard address" % ip)
+            ips.append(str(addr))
         if not ips:
             parser.error("--advertise: no address given")
+        if len(ips) > PROTOCOL["maxAddresses"]:
+            parser.error("--advertise: at most %d addresses" % PROTOCOL["maxAddresses"])
         args.advertise = ips
-    if args.lease_ms < MIN_LEASE_MS:
-        parser.error("--lease-ms must be at least %d" % MIN_LEASE_MS)
+    if not MIN_LEASE_MS <= args.lease_ms <= PROTOCOL["maxLeaseMs"]:
+        parser.error("--lease-ms must be from %d to %d" % (MIN_LEASE_MS, PROTOCOL["maxLeaseMs"]))
     if args.accept_wait_ms < 1:
         parser.error("--accept-wait-ms must be positive")
     return args
@@ -705,10 +720,6 @@ def main(argv=None):
     problem = control_listen_problem(args.listen_host, [])
     if problem:
         sys.exit("code-hub-relay: " + problem)
-    try:
-        ipaddress.IPv4Address(args.listen_host)
-    except ValueError:
-        sys.exit("code-hub-relay: --listen host must be an IPv4 address, got %r" % args.listen_host)
     try:
         dest = probe_dest()
     except ValueError as e:

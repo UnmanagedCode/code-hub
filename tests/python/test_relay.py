@@ -25,6 +25,17 @@ TREE = ast.parse(SOURCE)
 PROTOCOL = json.loads((RELAY_DIR / "protocol.json").read_text(encoding="utf-8"))
 
 
+REAL_IPV4 = ipaddress.IPv4Address
+
+
+def lenient_ipv4(value):
+    """IPv4Address as Python 3.9.0-3.9.4 parse it: leading-zero octets read as
+    decimal (where the C library's bind reads them as octal)."""
+    if isinstance(value, str):
+        value = ".".join(str(int(part)) for part in value.split("."))
+    return REAL_IPV4(value)
+
+
 def protocol_ids(protocol):
     """Every protocol identifier a source file must read rather than restate."""
     ids = set(protocol["paths"].values()) | set(protocol["errorCodes"].values())
@@ -111,18 +122,50 @@ class ControlListenProblem(unittest.TestCase):
         self.assertIsNotNone(relay.control_listen_problem("192.168.1.20", ["10.0.0.5"], "192.168.1.20"))
 
     def test_compares_canonical_spellings(self):
-        # Python 3.9.0-3.9.4 parse leading-zero octets; emulate that parser so
-        # the guard is shown to compare canonical forms, not raw strings.
-        real = ipaddress.IPv4Address
-
-        def lenient(value):
-            if isinstance(value, str):
-                value = ".".join(str(int(part)) for part in value.split("."))
-            return real(value)
-
-        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient):
+        # Emulate the 3.9.0-3.9.4 parser, so the guard is shown to compare
+        # canonical forms, not raw strings.
+        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient_ipv4):
             self.assertIsNotNone(relay.control_listen_problem("192.168.001.020", ["192.168.1.20"]))
             self.assertIsNotNone(relay.control_listen_problem("192.168.1.20", ["10.0.0.5"], "192.168.01.20"))
+
+    # Item 1 — every address is canonicalised once in parse_args, and that
+    # canonical string is what the guard checks AND what every bind receives.
+    def test_padded_spellings_are_canonical_for_guard_and_bind(self):
+        bound = []
+
+        def record_and_stop(host, port):
+            bound.append(host)
+            raise RuntimeError("stop before serving")
+
+        def record_and_fail(host, port):
+            bound.append(host)
+            raise OSError(99, "not here")
+
+        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient_ipv4), \
+                tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(relay, "log"), \
+                mock.patch.object(relay, "default_route_ipv4", side_effect=OSError("no route")):
+            secret = ["--secret-file", str(Path(tmp) / "secret")]
+            # A padded wildcard is the wildcard, refused before any bind.
+            self.assertEqual(relay.parse_args(["--listen", "000.000.000.000:7077"]).listen_host, "0.0.0.0")
+            with mock.patch.object(relay, "bind_listener", side_effect=AssertionError("bound a socket")):
+                with self.assertRaises(SystemExit) as caught:
+                    relay.main(["--listen", "000.000.000.000:0", "--advertise", "10.0.0.5"] + secret)
+            self.assertIn("wildcard", str(caught.exception.code))
+            # A padded advertise is canonical in the args, and so in the guard.
+            args = relay.parse_args(["--listen", "127.000.000.001:0", "--advertise", "010.0.0.5"])
+            self.assertEqual((args.listen_host, args.advertise), ("127.0.0.1", ["10.0.0.5"]))
+            # The control listener binds the canonical listen address...
+            with mock.patch.object(relay, "bind_listener", record_and_stop), self.assertRaises(RuntimeError):
+                relay.main(["--listen", "127.000.000.001:0", "--advertise", "010.0.0.5"] + secret)
+            self.assertEqual(bound, ["127.0.0.1"])
+            # ...and a forward binds the canonical advertised address.
+            bound.clear()
+            writer = FakeWriter()
+            with mock.patch.object(relay, "bind_listener", record_and_fail):
+                asyncio.run(make_relay(advertise=args.advertise)._create(b"{}", writer))
+            self.assertEqual(bound, ["10.0.0.5"])
+            self.assertEqual(writer.status(), 500)
 
     def test_main_refuses_the_default_route_before_binding(self):
         # Process-level wiring, host-independent: the probe is stubbed and any
@@ -216,6 +259,18 @@ class StaticShape(unittest.TestCase):
 
 
 class ParseArgs(unittest.TestCase):
+    # Item 4 — --lease-ms is bounded by protocol.json's maxLeaseMs.
+    def test_lease_ms_bounded(self):
+        self.assertEqual(relay.parse_args(["--lease-ms", str(PROTOCOL["maxLeaseMs"])]).lease_ms, PROTOCOL["maxLeaseMs"])
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            relay.parse_args(["--lease-ms", str(PROTOCOL["maxLeaseMs"] + 1)])
+
+    # --advertise takes at most protocol.json's maxAddresses addresses.
+    def test_advertise_count_bounded(self):
+        many = ",".join("10.0.0.%d" % i for i in range(1, PROTOCOL["maxAddresses"] + 2))
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            relay.parse_args(["--advertise", many])
+
     # --advertise refuses a wildcard (0.0.0.0/8) address.
     def test_advertise_wildcard_refused(self):
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
@@ -307,6 +362,62 @@ class Create(unittest.TestCase):
         self.assertTrue(bound)
         for sock in bound:
             self.assertEqual(sock.fileno(), -1, "socket closed")
+
+
+class ForwardClose(unittest.TestCase):
+    # Item 3 — dropping a forward (DELETE or lease expiry) stops its listeners
+    # serving, closes their sockets, and aborts its parked accepts.
+    def run_drop(self, finish):
+        async def scenario():
+            r = make_relay(lease_ms=60000)
+            socks, port = relay.bind_all(["127.0.0.1"], 0)
+            fwd = relay.Forward(r, "fid", port, ["127.0.0.1"])
+            r.forwards["fid"] = fwd
+            await fwd.start(socks)
+            accepted = asyncio.get_running_loop().create_future()
+
+            async def on_conn(reader, writer):
+                accepted.set_result((reader, writer))
+
+            control = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+            peer_reader, peer_writer = await asyncio.open_connection(*control.sockets[0].getsockname()[:2])
+            reader, writer = await accepted
+            self.assertTrue(fwd.park(reader, writer))
+            self.assertTrue(all(server.is_serving() for server in fwd.servers))
+
+            await finish(r, fwd)
+
+            self.assertNotIn("fid", r.forwards)
+            self.assertTrue(fwd.servers)
+            for server in fwd.servers:
+                self.assertFalse(server.is_serving())
+            for sock in socks:
+                self.assertEqual(sock.fileno(), -1, "listener socket closed")
+            self.assertTrue(writer.transport.is_closing(), "parked accept aborted")
+            try:
+                tail = await asyncio.wait_for(peer_reader.read(), 2)
+            except ConnectionResetError:
+                tail = b""
+            self.assertEqual(tail, b"", "the parked peer sees the connection end")
+            peer_writer.close()
+            control.close()
+
+        with mock.patch.object(relay, "log"):
+            asyncio.run(scenario())
+
+    def test_delete(self):
+        async def delete(r, fwd):
+            writer = FakeWriter()
+            await r._dispatch("DELETE", relay.PATHS["forward"].replace("{id}", "fid"), {}, b"", None, writer)
+            self.assertEqual(writer.status(), 204)
+
+        self.run_drop(delete)
+
+    def test_expiry(self):
+        async def expire(r, fwd):
+            fwd._expire()
+
+        self.run_drop(expire)
 
 
 class Lease(unittest.TestCase):

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { WORKTREES_DIRNAME } from '../src/projects.js';
+import { WORKTREES_DIRNAME, storeRoot } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import * as appSettings from '../src/appSettings.js';
 
@@ -206,10 +206,29 @@ export function requirePython(t) {
   throw new Error(`${PYTHON_MISSING} (${py.reason})`);
 }
 
-// Spawn the real relay on loopback. `advertise` null omits --advertise (the
-// route probe runs); `relayDir` points at a (patched) copy of relay/. Resolves
-// once its listening line is printed: { url, secret, secretFile, port, proc,
-// output(), stop() }. Rejects with the relay's stderr if it exits first.
+// Relay processes a test may leave behind when it fails before stopping one:
+// each is unref'd once listening (so it can't keep the test file alive) and
+// SIGKILLed when the file's process exits.
+const RELAY_START_TIMEOUT_MS = 10000;
+const RELAY_RUN_TIMEOUT_MS = 10000;
+const liveRelays = new Set();
+function trackRelay(proc) {
+  if (liveRelays.size === 0 && !trackRelay.hooked) {
+    trackRelay.hooked = true;
+    process.once('exit', () => { for (const p of liveRelays) { try { p.kill('SIGKILL'); } catch { /* gone */ } } });
+  }
+  liveRelays.add(proc);
+  proc.once('exit', () => liveRelays.delete(proc));
+}
+
+// Spawn the real relay on loopback. The relay probes the default route at
+// startup in every run (its listen guard compares against the answer);
+// `advertise` null also makes that answer the advertised address, and
+// CODEHUB_RELAY_PROBE_DEST (via `env`) is the seam that forces it. `relayDir`
+// points at a (patched) copy of relay/. Resolves once its listening line is
+// printed: { url, secret, secretFile, port, proc, output(), exited, stop() }.
+// Rejects with the relay's stderr if it exits first, or kills it and rejects
+// if it neither listens nor exits within RELAY_START_TIMEOUT_MS.
 export async function startRelay({
   listenPort = 0, advertise = '127.0.0.1', leaseMs = 300, secretFile, acceptWaitMs,
   relayDir = path.join(REPO_ROOT, 'relay'), env = {}, extraArgs = [],
@@ -227,42 +246,58 @@ export async function startRelay({
   if (acceptWaitMs !== undefined) argv.push('--accept-wait-ms', String(acceptWaitMs));
   argv.push(...extraArgs);
   const proc = spawn(py.cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+  trackRelay(proc);
   let stdout = '', stderr = '';
   proc.stdout.on('data', (d) => { stdout += d; });
   proc.stderr.on('data', (d) => { stderr += d; });
+  const exitedPromise = new Promise((r) => { if (proc.exitCode !== null) r(); else proc.once('exit', r); });
   const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`relay neither listened nor exited within ${RELAY_START_TIMEOUT_MS}ms: ${stderr.trim()}`));
+    }, RELAY_START_TIMEOUT_MS);
     const onData = () => {
       const m = /code-hub-relay listening on [\d.]+:(\d+)/.exec(stdout);
-      if (m) { proc.stdout.off('data', onData); proc.off('exit', onExit); resolve(Number(m[1])); }
+      if (m) { clearTimeout(timer); proc.stdout.off('data', onData); proc.off('exit', onExit); resolve(Number(m[1])); }
     };
-    const onExit = (code) => reject(Object.assign(new Error(`relay exited (code ${code}) before listening: ${stderr.trim()}`), { code, stderr }));
+    const onExit = (code) => { clearTimeout(timer); reject(Object.assign(new Error(`relay exited (code ${code}) before listening: ${stderr.trim()}`), { code, stderr })); };
     proc.stdout.on('data', onData);
     proc.once('exit', onExit);
   });
+  // From here on the relay can't keep the test file alive; waiting on its exit refs it again.
+  proc.unref(); proc.stdout.unref(); proc.stderr.unref();
   const secret = (await fs.readFile(secretFile, 'utf8')).trim();
-  const exited = new Promise((r) => { if (proc.exitCode !== null) r(); else proc.once('exit', r); });
   return {
     url: `http://127.0.0.1:${port}`, port, secret, secretFile, proc,
     output: () => ({ stdout, stderr }),
-    exited,
+    get exited() { proc.ref(); return exitedPromise; },
     async stop(signal = 'SIGKILL') {
       if (proc.exitCode === null && proc.signalCode === null) proc.kill(signal);
-      await exited;
+      proc.ref();
+      await exitedPromise;
       if (ownDir) await fs.rm(ownDir, { recursive: true, force: true });
     },
   };
 }
 
-// Run a relay process to completion (for startup refusals): { code, stdout, stderr }.
+// Run a relay process to completion (for startup refusals): { code, stdout,
+// stderr }. One still running after RELAY_RUN_TIMEOUT_MS — it was expected to
+// refuse, and started instead — is killed and the call rejects, so a failing
+// test can't wedge the run.
 export async function runRelay(args, { env = {}, relayDir = path.join(REPO_ROOT, 'relay') } = {}) {
   const py = findPython();
   if (!py.ok) throw new Error(`${PYTHON_MISSING} (${py.reason})`);
   const proc = spawn(py.cmd, [...py.args, path.join(relayDir, 'relay.py'), ...args],
     { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+  trackRelay(proc);
   let stdout = '', stderr = '';
   proc.stdout.on('data', (d) => { stdout += d; });
   proc.stderr.on('data', (d) => { stderr += d; });
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; proc.kill('SIGKILL'); }, RELAY_RUN_TIMEOUT_MS);
   const code = await new Promise((r) => proc.once('exit', (c) => r(c)));
+  clearTimeout(timer);
+  if (timedOut) throw new Error(`relay still running after ${RELAY_RUN_TIMEOUT_MS}ms (expected it to exit); stdout: ${stdout.trim()} stderr: ${stderr.trim()}`);
   return { code, stdout, stderr };
 }
 
@@ -298,4 +333,30 @@ export function canConnect(port, host = '127.0.0.1') {
     s.once('connect', () => { s.destroy(); resolve(true); });
     s.once('error', () => resolve(false));
   });
+}
+
+// Hold the next write of state.json's tmp file — the persist() that follows a
+// share's commit — until released. `parked` resolves when the write is held;
+// `stateRead` resolves once a read of state.json (init's load) has COMPLETED
+// after that, so a test can release the write knowing the load saw the old file.
+export function holdStateWrite(t) {
+  const realWrite = fs.writeFile;
+  const realRead = fs.readFile;
+  let release, reached, readDone, armed = true, held = false;
+  const gate = new Promise((r) => { release = r; });
+  const parked = new Promise((r) => { reached = r; });
+  const stateRead = new Promise((r) => { readDone = r; });
+  fs.writeFile = async (p, ...rest) => {
+    if (armed && typeof p === 'string' && path.dirname(p) === storeRoot() && p.endsWith('.tmp')) {
+      armed = false; held = true; reached(); await gate;
+    }
+    return realWrite.call(fs, p, ...rest);
+  };
+  fs.readFile = async (p, ...rest) => {
+    const out = await realRead.call(fs, p, ...rest);
+    if (held && p === path.join(storeRoot(), 'state.json')) readDone();
+    return out;
+  };
+  t.after(() => { release(); fs.writeFile = realWrite; fs.readFile = realRead; });
+  return { parked, stateRead, release };
 }

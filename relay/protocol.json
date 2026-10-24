@@ -11,5 +11,7 @@
   "createKeys": ["port"],
   "port": { "min": 1024, "max": 65535 },
   "minSecretLength": 32,
+  "maxLeaseMs": 86400000,
+  "maxAddresses": 16,
   "errorCodes": { "portInUse": "port_in_use", "noLanAddress": "no_lan_address" }
 }

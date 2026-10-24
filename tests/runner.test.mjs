@@ -198,3 +198,26 @@ test('apps are spawned without CODEHUB_RELAY_URL or CODEHUB_RELAY_SECRET in thei
   assert.equal('CODEHUB_RELAY_SECRET' in env, false);
   assert.ok(!JSON.stringify(env).includes('relay-secret-that-must-not-leak'));
 });
+
+// Invariant: the relay variables are gone even when the user's login profile exports them again — bash -lc sources it after the environment is handed over.
+test('a login profile that re-exports CODEHUB_RELAY_SECRET does not reach the app', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const home = path.join(root, 'home');
+  await fs.mkdir(home);
+  await fs.writeFile(path.join(home, '.bash_profile'), 'export CODEHUB_RELAY_SECRET=from-the-profile\nexport CODEHUB_RELAY_URL=http://from-the-profile\nexport PROFILE_RAN=yes\n');
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => { process.env.HOME = prevHome; });
+  const marker = path.join(root, 'env.json');
+  const cmd = fakeAppCmd('envdump', marker);
+  const dir = await mkProject(root, 'app', { start: cmd });
+  const port = await allocatePort();
+  const rec = await runner.start({ id: 'profiled', path: dir, manifest: { start: cmd, healthPath: null, readyWhen: null } }, port);
+  t.after(() => runner.stop({ id: 'profiled', pgid: rec.pgid }));
+  await waitFor(() => runner.runtime('profiled')?.status === 'ready');
+  const env = JSON.parse(await fs.readFile(marker, 'utf8'));
+  assert.equal(env.PROFILE_RAN, 'yes', 'the profile did run');
+  assert.equal('CODEHUB_RELAY_SECRET' in env, false);
+  assert.equal('CODEHUB_RELAY_URL' in env, false);
+});

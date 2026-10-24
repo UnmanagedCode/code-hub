@@ -102,7 +102,7 @@ When embedded, code-hub surfaces the host `code-conductor` checkout as an **alwa
 
 ## Host relay (code-hub in Docker)
 
-In a **bridge-networked container**, a LAN share's URL is the container's bridge address, which no other device can reach. The **host relay** (`relay/relay.py` + `relay/protocol.json`, Python ≥3.9, standard library only) runs on the Docker host and exposes the share on the host's real LAN address; with `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` set in code-hub's environment, a LAN share shows the host URL instead. TLS and the auth gate stay end to end inside code-hub, and a relay problem never fails the share — it falls back to the container's own addresses and says why. Apps code-hub starts never inherit the two relay variables. Without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
+In a **bridge-networked container**, a LAN share's URL is the container's bridge address, which no other device can reach. The **host relay** (`relay/relay.py` + `relay/protocol.json`, Python ≥3.9, standard library only) runs on the Docker host and exposes the share on the host's real LAN address; with `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` set in code-hub's environment, a LAN share shows the host URL instead. TLS and the auth gate stay end to end inside code-hub, and a relay problem never fails the share — it falls back to the container's own addresses and says why. Apps (and every other child code-hub runs) never see the two relay variables, even when a login profile exports them. Without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
 
 ```sh
 python3 relay/relay.py                           # Docker Desktop (Windows: py -3 relay\relay.py)

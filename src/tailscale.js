@@ -1,6 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { pidAlive } from './state.js';
+import { childEnv } from './childEnv.js';
 
 // Binary is overridable so tests can inject a fake that prints canned status
 // JSON and a canned funnel banner.
@@ -21,7 +22,7 @@ export const PROBE_TIMEOUT_MS = 5000;
 // tailnet: available() runs on every list() call.
 function status(timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    execFile(bin(), ['status', '--json', '--peers=false'], { timeout: timeoutMs, killSignal: 'SIGKILL' }, (err, stdout) => {
+    execFile(bin(), ['status', '--json', '--peers=false'], { timeout: timeoutMs, killSignal: 'SIGKILL', env: childEnv() }, (err, stdout) => {
       if (err) return resolve(null);
       try { resolve(JSON.parse(stdout)); } catch { resolve(null); }
     });
@@ -75,6 +76,7 @@ export function startFunnel(port) {
       try {
         proc = spawn(bin(), ['funnel', '--bg=false', '--yes', `http://localhost:${port}`], {
           detached: true,
+          env: childEnv(),
           stdio: ['ignore', 'pipe', 'pipe'],
         });
       } catch (e) {

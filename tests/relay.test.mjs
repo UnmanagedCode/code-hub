@@ -179,7 +179,7 @@ test('R6: a hostRelay forward stays connectable for at least 5 lease periods', a
 });
 
 // Invariant: a crashed code-hub leaves nothing behind — its forward closes within the lease.
-test('R7: SIGKILLing the code-hub side closes its forward within the lease', async (t) => {
+test('R7: SIGKILLing the code-hub side closes its forward within the lease, plus a poll margin', async (t) => {
   if (!requirePython(t)) return;
   const relay = await relayFor(t, { leaseMs: 1000 });
   const child = spawn(process.execPath, [path.join(REPO_ROOT, 'tests', 'fixtures', 'relay-client.mjs')], {
@@ -195,7 +195,8 @@ test('R7: SIGKILLing the code-hub side closes its forward within the lease', asy
   assert.equal(await canConnect(port), true);
   assert.equal(await healthForwards(relay), 1);
   child.kill('SIGKILL');
-  await waitFor(async () => (await healthForwards(relay)) === 0, { timeout: 1000 + 1000 });
+  // Within one lease of the kill (its last renewal came before it), plus a poll margin.
+  await waitFor(async () => (await healthForwards(relay)) === 0, { timeout: 1000 + 300 });
 });
 
 // Invariant: DELETE closes immediately — the listener goes and a live spliced connection is cut on both sides.

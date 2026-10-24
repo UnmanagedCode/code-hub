@@ -16,6 +16,10 @@ const PATHS = PROTOCOL.paths;
 const ACCEPT_POOL = 4;
 const REPARK_FLOOR_MS = 250;
 const REPARK_BACKOFF_MS = 1000;
+// Control answers are small JSON objects; anything bigger is refused unread.
+const MAX_ANSWER_BYTES = 64 * 1024;
+// setTimeout's ceiling: a longer delay fires after 1ms instead.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 let requestTimeoutMs = 3000;
 
 // Test seam: the per-request timeout of control calls (create, renew, delete).
@@ -62,7 +66,12 @@ function call(cfg, method, path, body) {
       },
     }, (res) => {
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_ANSWER_BYTES) req.destroy(relayError(`the relay's answer is malformed (larger than ${MAX_ANSWER_BYTES} bytes)`));
+        else chunks.push(c);
+      });
       res.on('end', () => {
         clearTimeout(timer);
         const text = Buffer.concat(chunks).toString('utf8');
@@ -93,28 +102,34 @@ async function createForward(cfg, port) {
     portFallback = true;
   }
   if (res.status !== 201) throw relayError(describeFailure(cfg, res.status, res.body), { status: res.status, code: res.body?.code });
-  const { id, protocol, port: bound, addresses, leaseMs } = res.body ?? {};
+  const body = res.body;
+  const id = body && typeof body === 'object' ? body.id : undefined;
   const discard = () => { if (typeof id === 'string' && id) call(cfg, 'DELETE', withId(PATHS.forward, id)).catch(() => {}); };
-  if (protocol !== PROTOCOL.protocolVersion) {
-    discard();
-    throw relayError(`relay speaks protocol ${protocol}, this code-hub speaks ${PROTOCOL.protocolVersion} — update the relay/ copy on the host`);
-  }
-  const malformed = createdProblem(res.body);
+  // Malformed before mismatched: a garbled answer must be named as such, not
+  // read as a version it never stated.
+  const malformed = createdProblem(body);
   if (malformed) {
     discard();
     throw relayError(`the relay's create response is malformed (${malformed})`);
   }
-  return { id, port: bound, addresses, leaseMs, portFallback };
+  if (body.protocol !== PROTOCOL.protocolVersion) {
+    discard();
+    throw relayError(`relay speaks protocol ${body.protocol}, this code-hub speaks ${PROTOCOL.protocolVersion} — update the relay/ copy on the host`);
+  }
+  return { id, port: body.port, addresses: body.addresses, leaseMs: body.leaseMs, portFallback };
 }
 
 // Why a 201 create body can't be used, or null. Checked here, at the boundary,
-// so nothing downstream ever builds URLs from a half-formed forward.
+// so nothing downstream ever builds URLs or timers from a half-formed forward.
 function createdProblem(body) {
-  const { id, port, addresses, leaseMs } = body ?? {};
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'not a JSON object';
+  const { protocol, id, port, addresses, leaseMs } = body;
+  if (!Number.isInteger(protocol)) return `protocol ${JSON.stringify(protocol)}`;
   if (typeof id !== 'string' || !id) return 'no forward id';
   if (!Number.isInteger(port) || port < PROTOCOL.port.min || port > PROTOCOL.port.max) return `port ${JSON.stringify(port)}`;
   if (!Array.isArray(addresses) || !addresses.length || !addresses.every((a) => typeof a === 'string' && net.isIPv4(a))) return 'addresses is not a non-empty list of IPv4 addresses';
-  if (!Number.isInteger(leaseMs) || leaseMs <= 0) return `leaseMs ${JSON.stringify(leaseMs)}`;
+  if (addresses.length > PROTOCOL.maxAddresses) return `${addresses.length} addresses, more than ${PROTOCOL.maxAddresses}`;
+  if (!Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > PROTOCOL.maxLeaseMs) return `leaseMs ${JSON.stringify(leaseMs)}`;
   return null;
 }
 
@@ -260,7 +275,7 @@ function makeHandle(cfg, fwd, { requestedPort, onChange }) {
       scheduleTick();
     }
   };
-  const scheduleTick = () => { if (!closed) later(tick, Math.max(50, Math.floor(leaseMs / 3))); };
+  const scheduleTick = () => { if (!closed) later(tick, Math.min(MAX_TIMER_MS, Math.max(50, Math.floor(leaseMs / 3)))); };
 
   const handle = {
     get id() { return id; },

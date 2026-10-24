@@ -68,9 +68,9 @@ Pass `--advertise <ip>[,<ip>…]` when:
 | Where | Name | Default | Meaning |
 |---|---|---|---|
 | relay CLI | `--listen <ip:port>` | `127.0.0.1:7077` | Control listener code-hub dials (`:0` = any free port). Refused when a wildcard, or a non-loopback address that is advertised or is the default-route address. |
-| relay CLI | `--advertise <ip,…>` | the default-route probe | Host LAN address(es) forwards bind and URLs carry. |
+| relay CLI | `--advertise <ip,…>` | the default-route probe | Host LAN address(es) forwards bind and URLs carry; at most `maxAddresses` in `protocol.json`. |
 | relay CLI | `--secret-file <path>` | `~/.code-hub-relay/secret` | Bearer secret; created on first run. |
-| relay CLI | `--lease-ms <n>` | `30000` (min `100`) | A forward's lifetime without renewal. |
+| relay CLI | `--lease-ms <n>` | `30000` (`100` to `maxLeaseMs` in `protocol.json`, 24 h) | A forward's lifetime without renewal. |
 | relay CLI | `--accept-wait-ms <n>` | `10000` | How long a LAN connection waits for code-hub to pick it up. |
 | relay env (tests only) | `CODEHUB_RELAY_PROBE_DEST` | `192.0.2.1:9` | Route-probe destination (`<ipv4>:<port>`). |
 | code-hub env | `CODEHUB_RELAY_URL` | unset = feature off | e.g. `http://host.docker.internal:7077`; must be `http:`. |
@@ -103,8 +103,8 @@ WantedBy=multi-user.target
 ## Security model
 
 - **Authenticated control API**: every request carries `Authorization: Bearer <secret>`, compared in constant time; anything else is `401`.
-- **Control listener off the LAN**: `--listen` is refused when it is a wildcard, or a non-loopback address equal to an advertised address or to the host's default-route address (probed even when `--advertise` is given; a probe that finds no route adds nothing). Addresses are compared in canonical form, and the check runs before any listening socket is bound. A loopback `--listen` is always allowed — it is never reachable from the LAN. **What it can't know**: a `--listen` on another LAN-facing interface that is neither advertised nor the default route (a second NIC, say) is not refused; there the bearer secret is the remaining gate.
-- **Apps never see the relay configuration**: code-hub strips `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` from the environment of every app it starts, since the secret is a capability to listen on the host's LAN.
+- **Control listener off the LAN**: `--listen` is refused when it is a wildcard, or a non-loopback address equal to an advertised address or to the host's default-route address (probed even when `--advertise` is given; a probe that finds no route adds nothing). Every address is canonicalised once at startup, and that canonical form is both what is checked and what is bound (older Pythons read a leading-zero octet differently from the C library's bind); the check runs before any listening socket is bound. A loopback `--listen` is always allowed — it is never reachable from the LAN. **What it can't know**: a `--listen` on another LAN-facing interface that is neither advertised nor the default route (a second NIC, say) is not refused; there the bearer secret is the remaining gate.
+- **Apps never see the relay configuration**: the secret is a capability to listen on the host's LAN, so code-hub removes `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` (in any letter case) from the environment of every child it starts — apps, `git`, `ip`/`ifconfig`, cloudflared, tailscale — and an app's `bash -lc` start command unsets them again after the login shell has read the user's profiles, in case a profile exports them.
 - **No target in the protocol**: a forward is created with an optional `port` only; the relay has no outbound TCP connect at all (its one `connect()` is the packet-less UDP route probe). It cannot be used as an open proxy.
 - **TLS end to end**: the relay never imports `ssl`; LAN devices talk TLS straight to code-hub's per-share self-signed cert, which includes the advertised host address in its SAN.
 - **Leases**: code-hub renews each forward every `leaseMs/3`; a crashed code-hub's forwards close within `leaseMs`. Forwards live in the relay process and die with it.
