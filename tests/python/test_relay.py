@@ -4,6 +4,7 @@ tests/relayPython.test.mjs, or directly: python3 -m unittest discover -s tests/p
 
 import ast
 import asyncio
+import io
 import ipaddress
 import json
 import os
@@ -259,17 +260,34 @@ class StaticShape(unittest.TestCase):
 
 
 class ParseArgs(unittest.TestCase):
-    # Item 4 — --lease-ms is bounded by protocol.json's maxLeaseMs.
+    # --lease-ms is accepted from MIN_LEASE_MS to protocol.json's maxLeaseMs inclusive, refused outside.
     def test_lease_ms_bounded(self):
-        self.assertEqual(relay.parse_args(["--lease-ms", str(PROTOCOL["maxLeaseMs"])]).lease_ms, PROTOCOL["maxLeaseMs"])
-        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-            relay.parse_args(["--lease-ms", str(PROTOCOL["maxLeaseMs"] + 1)])
+        for edge in (relay.MIN_LEASE_MS, PROTOCOL["maxLeaseMs"]):
+            self.assertEqual(relay.parse_args(["--lease-ms", str(edge)]).lease_ms, edge)
+        for outside in (relay.MIN_LEASE_MS - 1, PROTOCOL["maxLeaseMs"] + 1):
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                relay.parse_args(["--lease-ms", str(outside)])
 
-    # --advertise takes at most protocol.json's maxAddresses addresses.
+    # --advertise takes exactly protocol.json's maxAddresses addresses, not one more.
     def test_advertise_count_bounded(self):
-        many = ",".join("10.0.0.%d" % i for i in range(1, PROTOCOL["maxAddresses"] + 2))
+        exact = ["10.0.0.%d" % i for i in range(1, PROTOCOL["maxAddresses"] + 1)]
+        self.assertEqual(relay.parse_args(["--advertise", ",".join(exact)]).advertise, exact)
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-            relay.parse_args(["--advertise", many])
+            relay.parse_args(["--advertise", ",".join(exact + ["10.0.1.1"])])
+
+    # A non-IPv4 --listen host exits non-zero, naming why.
+    def test_listen_must_be_ipv4(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), self.assertRaises(SystemExit) as caught:
+            relay.parse_args(["--listen", "localhost:7077"])
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertIn("--listen host must be an IPv4 address, got 'localhost'", err.getvalue())
+
+    # The probe-destination seam yields the canonical address, never the raw spelling.
+    def test_probe_dest_is_canonical(self):
+        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient_ipv4), \
+                mock.patch.dict(os.environ, {relay.PROBE_DEST_ENV: "127.000.000.001:9"}):
+            self.assertEqual(relay.probe_dest(), ("127.0.0.1", 9))
 
     # --advertise refuses a wildcard (0.0.0.0/8) address.
     def test_advertise_wildcard_refused(self):

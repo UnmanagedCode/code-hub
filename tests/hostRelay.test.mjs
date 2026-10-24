@@ -103,8 +103,8 @@ test('a relay that never answers times out: openForward rejects, the share still
 
 // A fake relay: `create(n)` answers the nth create with { status, text }, and
 // every request is counted. Accept upgrades are held open and counted per id.
-async function fakeRelay(t, { create, renew = () => 200 }) {
-  const seen = { creates: 0, renews: [], deletes: [], accepts: new Map() };
+async function fakeRelay(t, { create, renew = () => 200, acceptAnswer = null }) {
+  const seen = { creates: 0, renews: [], deletes: [], accepts: new Map(), openAccepts: 0 };
   const held = new Set();
   const srv = http.createServer((req, res) => {
     req.resume();
@@ -126,7 +126,14 @@ async function fakeRelay(t, { create, renew = () => 200 }) {
     list.push(socket);
     seen.accepts.set(id, list);
     held.add(socket);
+    seen.openAccepts += 1;
+    // The client closing shows as 'end' on this half-open upgraded socket.
+    let open = true;
+    const gone = () => { if (open) { open = false; seen.openAccepts -= 1; } };
+    socket.on('end', gone);
+    socket.on('close', gone);
     socket.on('error', () => {});
+    if (acceptAnswer) socket.write(acceptAnswer);
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   t.after(() => { for (const s of held) s.destroy(); srv.close(); });
@@ -185,3 +192,34 @@ test('a drained slot\'s late callback does not re-park after down→up', async (
   await new Promise((r) => setTimeout(r, 1600));
   assert.equal(seen.accepts.get('fwd-2')?.length, 4, 'exactly one fresh pool, no re-park from a drained slot');
 });
+
+// Invariant: a non-upgrade answer to a park ends that connection at once — a relay that sends headers and never ends the body can't make code-hub accumulate open sockets.
+test('an accept answered with headers and a never-ending body does not pile up sockets', async (t) => {
+  const seen = await fakeRelay(t, {
+    create: () => ({ status: 201, text: created({ leaseMs: 60000 }) }),
+    acceptAnswer: 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n\r\npartial',
+  });
+  const handle = await hostRelay.openForward({});
+  t.after(() => handle.close());
+  handle.attach({ host: '127.0.0.1', port: 9 });
+  // Two and a half re-park backoffs: a leak would hold about 4 sockets per second.
+  let peak = 0;
+  const until = Date.now() + 2500;
+  while (Date.now() < until) {
+    peak = Math.max(peak, seen.openAccepts);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(seen.accepts.get('fwd-1').length > 4, 'the slots did re-park');
+  assert.ok(peak <= 4, `open accept sockets stayed within the pool (peak ${peak})`);
+});
+
+// Invariant: a create answer exactly at each cap — maxLeaseMs, maxAddresses addresses — is accepted.
+test('a 201 exactly at maxLeaseMs and maxAddresses is accepted', async (t) => {
+  const addresses = Array.from({ length: PROTOCOL.maxAddresses }, (_, i) => `10.0.0.${i + 1}`);
+  await fakeRelay(t, { create: () => ({ status: 201, text: created({ leaseMs: PROTOCOL.maxLeaseMs, addresses }) }) });
+  const handle = await hostRelay.openForward({});
+  t.after(() => handle.close());
+  assert.deepEqual(handle.addresses, addresses);
+  assert.equal(handle.state, 'up');
+});
+

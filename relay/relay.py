@@ -95,8 +95,7 @@ def probe_dest():
     if not override:
         return PROBE_DEST
     host, port = parse_ip_port(override)
-    ipaddress.IPv4Address(host)
-    return host, port
+    return str(ipaddress.IPv4Address(host)), port
 
 
 def default_route_ipv4(dest=None):

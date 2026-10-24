@@ -16,7 +16,8 @@ const PATHS = PROTOCOL.paths;
 const ACCEPT_POOL = 4;
 const REPARK_FLOOR_MS = 250;
 const REPARK_BACKOFF_MS = 1000;
-// Control answers are small JSON objects; anything bigger is refused unread.
+// Control answers are small JSON objects; a bigger one fails without being
+// parsed (so a forward it might name is left to the relay's lease).
 const MAX_ANSWER_BYTES = 64 * 1024;
 // setTimeout's ceiling: a longer delay fires after 1ms instead.
 const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -28,8 +29,8 @@ export function _setRequestTimeoutMs(ms) { requestTimeoutMs = ms; }
 const withId = (template, id) => template.replace('{id}', encodeURIComponent(id));
 
 // The environment variables that configure the relay. The secret is a
-// capability to listen on the host's LAN, so runner.js strips both from every
-// app it spawns.
+// capability to listen on the host's LAN, so childEnv.js keeps both out of
+// every child code-hub starts.
 export const RELAY_ENV = Object.freeze({ url: 'CODEHUB_RELAY_URL', secret: 'CODEHUB_RELAY_SECRET' });
 
 // The relay to use, read from the environment on every call (like
@@ -203,7 +204,9 @@ function makeHandle(cfg, fwd, { requestedPort, onChange }) {
       again(0);
     });
     req.on('response', (res) => {
-      res.resume();
+      // Any non-upgrade answer ends this park: its body is never needed, and a
+      // relay that sends headers but never ends the body must not hold sockets.
+      res.destroy();
       if (!settle()) return;
       if (res.statusCode === 404 && forwardId === id && gen === poolGen) markDown(`the relay no longer knows forward ${forwardId}`);
       else again(REPARK_BACKOFF_MS);
