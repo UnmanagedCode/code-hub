@@ -255,7 +255,8 @@ def find_store(script_path, override=None):
 
 
 class RendezvousError(Exception):
-    """A rendezvous file or directory can't be used; the message says why and what to do."""
+    """A rendezvous file or directory can't be used; the message says why, and
+    for a permission failure also what to do (see file_problem)."""
 
 
 def file_problem(action, path, e, rdir):
@@ -282,8 +283,8 @@ class SecretUnavailable(Exception):
 def read_small_file(path):
     """The text of `path` if it is a regular file of at most maxRendezvousBytes.
 
-    Opened non-blocking and checked on the open descriptor, so a FIFO or a
-    device can't block the event loop and a huge file can't bloat it. Raises
+    Opened non-blocking and checked on the open descriptor, so a FIFO can't
+    block the event loop and a huge file can't bloat it. Raises
     OSError for an I/O failure, ValueError for a file that isn't usable.
     """
     fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
@@ -293,7 +294,13 @@ def read_small_file(path):
             raise ValueError("%s is not a regular file" % path)
         if info.st_size > MAX_RENDEZVOUS_BYTES:
             raise ValueError("%s is larger than %d bytes" % (path, MAX_RENDEZVOUS_BYTES))
-        data = os.read(fd, MAX_RENDEZVOUS_BYTES + 1)
+        # A read may return less than asked: read on until EOF or one byte past the bound.
+        data = b""
+        while len(data) <= MAX_RENDEZVOUS_BYTES:
+            chunk = os.read(fd, MAX_RENDEZVOUS_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
     finally:
         os.close(fd)
     if len(data) > MAX_RENDEZVOUS_BYTES:

@@ -847,18 +847,32 @@ const onMac = (e) => [e.left, e.right].some((x) => /mac|proof/i.test(x));
 // What verifyMac may compare with an equality: lengths and a typeof check.
 const allowedInVerify = (e) => [e.left, e.right].every((x) => /\.length$|^typeof$|^given$|^'string'$/.test(x)) && !(/^given$/.test(e.left) && /^given$/.test(e.right));
 
+// The calls in a function body: every `callee(` except the declaration and keywords.
+const KEYWORDS = new Set(['if', 'return', 'typeof', 'function', 'while', 'for', 'switch', 'catch']);
+const callsIn = (body) => [...body.matchAll(/([\w.$]+)\s*\(/g)].map((m) => m[1]).slice(1).filter((c) => !KEYWORDS.has(c));
+// What verifyMac may call: the encoding of both sides, and the constant-time compare.
+const ALLOWED_IN_VERIFY = new Set(['Buffer.from', 'crypto.timingSafeEqual']);
+
 // Invariant (S5): MACs are compared only in constant time — verifyMac goes
-// through crypto.timingSafeEqual and compares nothing else but lengths, and no
-// code-hub relay module compares a MAC value with an equality operator.
+// through crypto.timingSafeEqual, calls nothing else but Buffer.from (no
+// Buffer#equals, Buffer.compare or any other comparison), compares nothing
+// but lengths, and no code-hub relay module compares a MAC value with an
+// equality operator.
 test('V27: code-hub compares MACs only through timingSafeEqual', () => {
   const planted = 'export function verifyMac(expected, given) {\n  const g = given;\n  return g === expected;\n}\nconst ok = reply.mac !== mine;';
   assert.equal(fnBody(planted, 'verifyMac').includes('timingSafeEqual('), false);
   assert.ok(equalities(fnBody(planted, 'verifyMac')).some((e) => !allowedInVerify(e)), 'the scanner flags a plain compare in verifyMac');
   assert.ok(equalities(planted).some(onMac), 'the scanner flags a MAC compared outside it');
+  for (const call of ['a.equals(b)', 'Buffer.compare(a, b) === 0', 'a.toString() === b.toString()']) {
+    const body = fnBody(`export function verifyMac(expected, given) {\n  const a = Buffer.from(expected);\n  const b = Buffer.from(given);\n  return a.length === b.length && ${call};\n}`, 'verifyMac');
+    assert.ok(callsIn(body).some((c) => !ALLOWED_IN_VERIFY.has(c)), `the scanner flags ${call}`);
+  }
   const session = readFileSync(path.join(REPO_ROOT, 'src', 'relaySession.js'), 'utf8');
   const verify = fnBody(session, 'verifyMac');
   assert.ok(verify && verify.includes('crypto.timingSafeEqual('), 'verifyMac uses timingSafeEqual');
   assert.deepEqual(equalities(verify).filter((e) => !allowedInVerify(e)), []);
+  assert.deepEqual(callsIn(verify).filter((c) => !ALLOWED_IN_VERIFY.has(c)), []);
+  assert.ok(callsIn(verify).includes('crypto.timingSafeEqual'));
   for (const file of ['relaySession.js', 'hostRelay.js']) {
     assert.deepEqual(equalities(readFileSync(path.join(REPO_ROOT, 'src', file), 'utf8')).filter(onMac), [], file);
   }

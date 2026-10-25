@@ -377,7 +377,7 @@ test('resolveLanReachNotice: one row per relay state', () => {
   expect(waitingFile?.text).toMatch(/host relay can't be used \(the relay on the host speaks protocol 1\); code-hub waits for the relay's host\.json to change/);
   expect(waitingFile?.text).not.toMatch(/retrying/);
   const binding = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'waiting for the relay to bind the port', recovery: 'binding' }) }));
-  expect(binding?.text).toMatch(/hasn't bound this share's port yet/);
+  expect(binding?.text).toMatch(/hasn't confirmed this share's port yet/);
   expect(binding?.text).not.toMatch(/retrying|isn't connected/);
   const retrying = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'connect ECONNREFUSED', recovery: 'retrying' }) }));
   expect(retrying?.text).toMatch(/isn't connected \(connect ECONNREFUSED\); code-hub keeps retrying/);

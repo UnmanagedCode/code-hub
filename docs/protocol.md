@@ -130,8 +130,8 @@ Response fields: `kind` (`"tunnel"`, `"lan"` or `"tailscale"`), `url` (primary s
 
   | Situation | `relay` | `url` / `urls` |
   |---|---|---|
-  | code-hub is connecting to or retrying the relay (backoff timer armed) | `{ state: "down", error: <the last connection error, or null>, port: null, requestedPort: <proxy port>, portFallback: false, recovery: "retrying" }` | the container's own LAN URLs |
-  | the relay file can't be used (another protocol version, invalid, unreadable) — no retry until it changes | `"down"`, `error`: why, `recovery: "relay-file"` | the container's own LAN URLs |
+  | code-hub is connecting to or retrying the relay (an attempt in flight, or a backoff timer armed — a relay file that couldn't be read included) | `{ state: "down", error: <the last connection error, or null>, port: null, requestedPort: <proxy port>, portFallback: false, recovery: "retrying" }` | the container's own LAN URLs |
+  | the relay file's content can't be used (another protocol version, invalid, not a regular small file) — no retry until it changes | `"down"`, `error`: why, `recovery: "relay-file"` | the container's own LAN URLs |
   | session up, the relay has not reported on this port yet | `"down"`, `error: "waiting for the relay to bind the port"`, `recovery: "binding"` | the container's own LAN URLs |
   | session up, port bound on the host | `{ state: "up", error: null, port: <host port>, requestedPort: <proxy port>, portFallback, recovery: null }` | `<scheme>://<advertised host ip>:<relay.port>` per advertised address — the host URLs only |
   | session up, the relay could not bind it | `{ state: "failed", error: <the relay's message>, port: null, …, recovery: null }` — `no_lan_address`, a bind error, or over `maxPorts` | the container's own LAN URLs |

@@ -291,8 +291,9 @@ function funnelBlockedBy(id) {
 // every ready app but the always-on host conductor (code-hub never started
 // it). Also run when a start's readiness settles (see start()), when a child
 // exits (see runner.onExit below), so a crash drops its mirror without waiting
-// for a persist, and when a host client finds a mirrored port refusing — the
-// one signal that an ADOPTED app (no child of ours to exit) has died.
+// for a persist, and when a host client finds a mirrored port refusing. An
+// ADOPTED app (no child of ours to exit) that dies is noticed by either that
+// refusal or a listing (list() prunes its record, and the persist re-syncs).
 async function persist() {
   syncMirrors();
   await state.save(store);

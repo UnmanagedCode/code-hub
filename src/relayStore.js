@@ -21,8 +21,9 @@ let watchImpl = watch;
 export function _setHostPollMs(ms) { hostPollMs = ms ?? HOST_POLL_MS; }
 export function _setWatch(fn) { watchImpl = fn ?? watch; }
 
-// Opened non-blocking and checked on the open descriptor, so a FIFO or device
-// planted in the rendezvous dir can't block a read and a huge file can't bloat it.
+// Opened non-blocking and checked on the open descriptor before any read, so a
+// FIFO planted in the rendezvous dir can't block a read (a device is opened
+// non-blocking and refused unread) and a huge file can't bloat it.
 const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
 
 function unusable(file, why) {
@@ -43,10 +44,16 @@ async function readSmall(file) {
     const info = await handle.stat();
     if (!info.isFile()) throw unusable(file, 'is not a regular file');
     if (info.size > PROTOCOL.maxRendezvousBytes) throw unusable(file, `is larger than ${PROTOCOL.maxRendezvousBytes} bytes`);
+    // A read may return less than asked: read on until EOF or one byte past the bound.
     const buf = Buffer.alloc(PROTOCOL.maxRendezvousBytes + 1);
-    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-    if (bytesRead > PROTOCOL.maxRendezvousBytes) throw unusable(file, `is larger than ${PROTOCOL.maxRendezvousBytes} bytes`);
-    return buf.subarray(0, bytesRead).toString('utf8');
+    let total = 0;
+    while (total < buf.length) {
+      const { bytesRead } = await handle.read(buf, total, buf.length - total, total);
+      if (!bytesRead) break;
+      total += bytesRead;
+    }
+    if (total > PROTOCOL.maxRendezvousBytes) throw unusable(file, `is larger than ${PROTOCOL.maxRendezvousBytes} bytes`);
+    return buf.subarray(0, total).toString('utf8');
   } finally {
     await handle.close();
   }
@@ -60,8 +67,13 @@ function readSmallSync(file) {
     const info = fstatSync(fd);
     if (!info.isFile() || info.size > PROTOCOL.maxRendezvousBytes) return null;
     const buf = Buffer.alloc(PROTOCOL.maxRendezvousBytes + 1);
-    const n = readSync(fd, buf, 0, buf.length, 0);
-    return n > PROTOCOL.maxRendezvousBytes ? null : buf.subarray(0, n).toString('utf8');
+    let total = 0;
+    while (total < buf.length) {
+      const n = readSync(fd, buf, total, buf.length - total, total);
+      if (!n) break;
+      total += n;
+    }
+    return total > PROTOCOL.maxRendezvousBytes ? null : buf.subarray(0, total).toString('utf8');
   } catch {
     return null;
   } finally {
@@ -103,7 +115,6 @@ export async function ensureSecret() {
     const tmp = path.join(dir, `.${HUB_FILE}.${process.pid}.tmp`);
     await fs.rm(tmp, { force: true });
     await fs.writeFile(tmp, `${JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, secret })}\n`, { mode: 0o600, flag: 'wx' });
-    await fs.chmod(tmp, 0o600);
     await fs.rename(tmp, file);
     return secret;
   } catch (e) {
@@ -116,15 +127,18 @@ function readHostRaw() {
   return readSmall(hostFilePath());
 }
 
-// Where the relay listens: null when it has published nothing; `{ error }`
-// when the file can't be read or used; `{ error, incompatible: true }` when it
-// speaks another protocol version; else `{ listenHost, listenPort, pid, raw }`.
+// Where the relay listens: null when it has published nothing; `{ error,
+// readError: true }` when reading it failed (an fs error, possibly passing);
+// `{ error }` when its content can't be used (not a regular small file,
+// invalid); `{ error, incompatible: true }` when it speaks another protocol
+// version; else `{ listenHost, listenPort, pid, raw }`.
 export async function readHost() {
   let raw;
   try {
     raw = await readHostRaw();
   } catch (e) {
-    return { error: e.code === 'EUNUSABLE' ? e.message : `cannot read ${hostFilePath()}: ${e.message}` };
+    if (e.code === 'EUNUSABLE') return { error: e.message };
+    return { error: `cannot read ${hostFilePath()}: ${e.message}`, readError: true };
   }
   return raw === null ? null : parseHost(raw, hostFilePath());
 }

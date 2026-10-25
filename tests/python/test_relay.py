@@ -371,15 +371,22 @@ class Mac(unittest.TestCase):
         self.assertFalse(relay.verify_mac(hub, None))
 
     def test_verify_is_constant_time(self):
-        """verify_mac compares only through hmac.compare_digest — no ==, !=, is
-        or is not anywhere in it — and nothing in the relay compares a MAC value
-        with an equality operator; the scan flags planted violations."""
+        """verify_mac compares only through hmac.compare_digest, exactly once —
+        no comparison operator of any kind in it — and nothing in the relay
+        compares a MAC value with an equality operator; the scan flags planted
+        violations."""
         self.assertEqual(mac_compare_problems(TREE), [])
         planted = ast.parse(
             "import hmac\n"
             "def verify_mac(expected, given):\n    x = given\n    return x != expected\n"
             "def other(msg, proof):\n    return msg['mac'] == proof\n")
         self.assertEqual(len(mac_compare_problems(planted)), 3, "no compare_digest, a != in verify_mac, a MAC compared elsewhere")
+        for op in ("in", "not in", "<", "is"):
+            planted = ast.parse("import hmac\ndef verify_mac(expected, given):\n"
+                                "    return hmac.compare_digest(expected, given) and given %s expected\n" % op)
+            self.assertEqual(len(mac_compare_problems(planted)), 1, op)
+        twice = ast.parse("import hmac\ndef verify_mac(e, g):\n    return hmac.compare_digest(e, g) and hmac.compare_digest(g, e)\n")
+        self.assertEqual(len(mac_compare_problems(twice)), 1, "exactly one compare_digest")
 
 
 def mac_compare_problems(tree):
@@ -391,8 +398,8 @@ def mac_compare_problems(tree):
     if len(digest) != 1:
         problems.append("verify_mac does not call hmac.compare_digest exactly once")
     for node in ast.walk(fn):
-        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops):
-            problems.append("verify_mac compares with an equality operator at line %d" % node.lineno)
+        if isinstance(node, ast.Compare):  # any operator: ==, !=, is, in, <, ...
+            problems.append("verify_mac compares with an operator at line %d" % node.lineno)
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops)):
             continue
@@ -483,10 +490,10 @@ class Rendezvous(unittest.TestCase):
 
 
 class StartupErrors(unittest.TestCase):
-    """A1: a rendezvous file or dir the relay can't use names the path and, for
-    a permission failure, says to run the relay as the owner; only a failed
-    control bind is reported as "cannot listen"; any other OSError is reported
-    as itself."""
+    """A1: a rendezvous file the relay can't write, or a rendezvous dir it
+    can't create in the store, names the path and, for a permission failure,
+    says to run the relay as the owner; only a failed control bind is reported
+    as "cannot listen"; any other OSError is reported as itself."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -582,6 +589,41 @@ class RendezvousFiles(unittest.TestCase):
         os.symlink(str(self.dir / "nowhere"), str(tmp))  # dangling
         relay.write_host_json(self.dir, "127.0.0.1:7077", 4242)
         self.assertFalse((self.dir / "nowhere").exists())
+
+    def test_tmp_create_is_exclusive(self):
+        """The create itself is O_EXCL: a symlink planted right after the
+        removal (the race the removal alone can't close) makes the write refuse."""
+        victim = self.dir / "victim"
+        victim.write_text("untouched", encoding="utf-8")
+        tmp = self.dir / (".%s.%d.tmp" % (RDV["relayFile"], 4242))
+        tmp.write_text("stale", encoding="utf-8")
+        real_unlink = os.unlink
+
+        def unlink_then_plant(path, *a, **kw):
+            real_unlink(path, *a, **kw)
+            if str(path) == str(tmp):
+                os.symlink(str(victim), str(tmp))
+
+        with mock.patch.object(relay.os, "unlink", unlink_then_plant):
+            with self.assertRaises(relay.RendezvousError) as caught:
+                relay.write_host_json(self.dir, "127.0.0.1:7077", 4242)
+        self.assertIn("File exists", str(caught.exception))
+        self.assertEqual(victim.read_text(encoding="utf-8"), "untouched")
+        self.assertFalse((self.dir / RDV["relayFile"]).exists())
+
+    def test_short_reads_are_gathered(self):
+        """A read that returns less than asked is continued to EOF."""
+        secret = "k" * PROTOCOL["minSecretLength"]
+        (self.dir / RDV["hubFile"]).write_text(json.dumps({"protocolVersion": 2, "secret": secret}), encoding="utf-8")
+        real_read = os.read
+        with mock.patch.object(relay.os, "read", lambda fd, n: real_read(fd, min(n, 7))):
+            self.assertEqual(relay.read_secret(self.dir), secret)
+        big = self.dir / "big"
+        big.write_text("x" * (PROTOCOL["maxRendezvousBytes"] + 1), encoding="utf-8")
+        with mock.patch.object(relay.os, "fstat", lambda fd: os.stat(str(self.dir / RDV["hubFile"]))), \
+                mock.patch.object(relay.os, "read", lambda fd, n: real_read(fd, min(n, 7))), \
+                self.assertRaises(ValueError):
+            relay.read_small_file(big)  # a file that grew past its stat size is still bounded
 
 
 class FakeTransport:

@@ -15,8 +15,9 @@ import { runningInContainer, defaultGatewayIPv4 } from './net.js';
 //
 // State machine: off → (init in a container) absent ⇄ connecting → up, with
 // retrying (an error and a backoff timer) after a failed attempt or a lost
-// session, and waiting (an error, no timer) for an unusable relay file, which
-// is retried only once the file changes.
+// session — a relay file that couldn't be read included, since a read error may
+// pass — and waiting (an error, no timer) for a relay file whose content can't
+// be used, which is retried only once the file changes.
 export const SCOPES = PROTOCOL.scopes;
 const FRAMES = PROTOCOL.frames;
 const SCOPE_VALUES = new Set(Object.values(SCOPES));
@@ -156,6 +157,7 @@ async function evaluate() {
     const host = await relayStore.readHost();
     if (myGen !== gen) return;
     if (!host) { setState('absent', null); return; }
+    if (host.readError) { scheduleRetry(host.error); return; }
     if (host.error) { setState('waiting', host.error); return; } // no timer: until the file changes
     setState('connecting', error);
     let secret;

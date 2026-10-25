@@ -29,7 +29,7 @@ Without a relay, a LAN share from such a container is flagged container-internal
 | Linux / macOS | `python3 relay/relay.py` |
 | Windows | `py -3 relay\relay.py` |
 
-No flags needed (the optional ones are under Configuration), and no environment variables. Start the relay and code-hub in either order; they find each other.
+No flags are needed (the optional ones are under Configuration), and no environment variables are needed. Start the relay and code-hub in either order; they find each other.
 
 - Windows: if `python3` opens the Microsoft Store, that is the App Execution Alias stub — install Python from python.org and use `py`.
 - macOS: the first `python3` may prompt to install the Command Line Tools; accept, they provide 3.9.
@@ -42,7 +42,7 @@ The relay finds code-hub's store by walking **up from its own script's directory
 
 - `--projects-root <dir>` overrides the walk: the store is `<dir>/.code-hub`, which must exist.
 - Finding none exits non-zero: `code-hub-relay: no .code-hub found in any parent of <script dir> (searched: <dirs…>) — start code-hub once so it creates <projectsRoot>/.code-hub, or pass --projects-root <dir>`.
-- A rendezvous dir or file the relay can't create, write or read exits (at startup) or refuses connections (the secret) with `cannot <create|write|read> <path>: <cause>`; for a permission failure it adds `— run the relay as the user that owns <dir>`. Only a failed control bind is reported as `cannot listen on <listen>: <cause>`.
+- A rendezvous dir or file the relay can't create, write or read exits (at startup) or refuses connections (the secret) with `cannot <create|write|read> <path>: <cause>`; for a permission failure it adds `— run the relay as the user that owns <dir>`. A secret file that isn't usable is reported as `<path> is not a regular file` or `<path> is larger than <maxRendezvousBytes> bytes`. Only a failed control bind is reported as `cannot listen on <listen>: <cause>`.
 
 ### Rendezvous files
 
@@ -55,7 +55,7 @@ Both live in `<projectsRoot>/.code-hub/relay/` (names from `rendezvous` in `prot
 
 code-hub watches `host.json` (filesystem events plus a content poll every `HOST_POLL_MS` in `src/relayStore.js`, since Docker Desktop bind mounts often drop host-side events) and connects whenever it appears or changes.
 
-Either side reads a rendezvous file only when it is a regular file of at most `maxRendezvousBytes` (`protocol.json`), opened non-blocking — a FIFO, device or oversize file is reported as unusable and never read. Both write through a tmp file created exclusively in the same dir and renamed into place, so a symlink planted at the tmp path is removed, never written through.
+Either side reads a rendezvous file only when it is a regular file of at most `maxRendezvousBytes` (`protocol.json`), opened non-blocking, so a FIFO can't block a read; anything else is unusable and never read — code-hub replaces an unusable hub file, and reports an unusable relay file (details: `docs/protocol.md` → Rendezvous files). Both write through a tmp file created exclusively in the same dir and renamed into place, so a symlink planted at the tmp path is removed, never written through.
 
 ## Per-platform setup
 
@@ -77,7 +77,7 @@ Either side reads a rendezvous file only when it is a regular file of at most `m
 
 - **Same port where free.** Each is bound at its container port when that is free on the host, else at a free one; the share panel ("Port N was busy on the host, so it is on port M there") and the app's Start URL show the port actually used. A devcontainer port-forward (VS Code's, for one) often holds the same host port already, so a fallback for mirrors is common and expected.
 - **Loopback mirrors** appear once the app is **ready** (its readiness check passed — `readyWhen`, `healthPath` or the default TCP probe — or, for an app adopted after a code-hub restart, its process is alive), never while it is still starting: where the host's loopback is the app's own (a host-network container), a relay listener bound first would take the app's port. The always-on host code-conductor is never mirrored.
-- **A mirror closes** at once when its app is stopped or restarted, or when an app code-hub started crashes or exits. An **adopted** app (running from before a code-hub restart, so no child of code-hub's exits when it dies) that dies keeps its mirror until a host client connects to it: that client's connection to the app's port is refused, and code-hub then re-checks the app and drops the mirror.
+- **A mirror closes** at once when its app is stopped or restarted, or when an app code-hub started crashes or exits. An **adopted** app (running from before a code-hub restart, so no child of code-hub's exits when it dies) that dies keeps its mirror until whichever comes first: a host client connecting to it (that client's connection to the app's port is refused, and code-hub re-checks the app and drops the mirror), or a listing (`GET /api/apps` prunes the dead record, which drops the mirror).
 - While an app is mirrored, its **Start URL** is `http://127.0.0.1:<host port>` — the app's first URL — and each route's first URL is that base plus the route's path (`http://127.0.0.1:<host port><path>`; `/` adds nothing); otherwise `http://localhost:<port>` likewise.
 - **No periodic refresh**: a relay connecting or dropping changes share URLs and Start URLs server-side, and `GET /api/apps` reflects it within seconds; the page shows it on **Refresh** or when you return to the tab.
 
@@ -148,12 +148,12 @@ WantedBy=multi-user.target
 - **TLS end to end** for LAN shares: the relay never imports `ssl`; LAN devices talk TLS straight to code-hub's per-share self-signed cert, whose SAN includes the advertised host address (re-issued in place when the relay advertises one the share didn't know).
 - **Control listener off the LAN.** `--listen` is refused when it is a wildcard, or a non-loopback address equal to an advertised address or to the host's default-route address (probed even when `--advertise` is given). Every address is canonicalised once at startup, and that canonical form is both what is checked and what is bound; the check runs before any listening socket is bound. A loopback `--listen` is always allowed.
 - **What the secret grants**: holding a session — listening on the advertised addresses and on `127.0.0.1` at ports from `port.min` to `port.max`, and carrying whatever the holder pipes into them — never reaching into the LAN.
-- **Out of scope**: anything that can reach the control listener — a process on the host, and any container on the host's Docker networks (a native-Linux `docker0` listen is reachable from every bridge container; on Docker Desktop, every container reaches the host's loopback listener through `host.docker.internal`) — can hold every pre-auth slot and so delay code-hub's handshakes by up to `handshakeTimeoutMs` per slot: a denial of service from co-located containers or processes, not a bypass of the challenge-response.
+- **Out of scope**: anything that can reach the control listener — a process on the host; for a native-Linux `docker0` listen, containers on a bridge network (default or user-defined); on Docker Desktop, every container, through `host.docker.internal` — can hold every pre-auth slot and so delay code-hub's handshakes by up to `handshakeTimeoutMs` per slot: a denial of service from co-located containers or processes, not a bypass of the challenge-response.
 
 ## Limitations
 
 - **The relay must see the same `.code-hub`.** A named volume or remote Docker needs `--projects-root` pointing at a directory holding a copy of it — and a copied `relay.json` goes stale when code-hub regenerates it.
-- **Native Linux: run the relay as the user that owns `.code-hub/relay/`** (`0700`); otherwise it can't read the secret, and it says so on every connection.
+- **Native Linux: run the relay as the user that owns `.code-hub/relay/`** (`0700`); otherwise it exits at startup with `cannot write …/host.json: Permission denied — run the relay as the user that owns …` (see Discovery).
 - **The secret lives in the container's store**, readable by code-hub's user and anything running as it.
 - **A `docker0` `--listen` is reachable from a LAN neighbour that adds a route** to it (the weak host model); there the challenge-response is the gate.
 - **Loopback mirrors have no login**: any local process or user on the host can reach a mirrored app, like any local dev server.

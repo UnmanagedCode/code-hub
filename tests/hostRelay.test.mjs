@@ -7,7 +7,7 @@ import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
 import { _setTimings } from '../src/relaySession.js';
 import { _setContainerProbe, parseDefaultGateway } from '../src/net.js';
-import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor } from './helpers.mjs';
+import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor, relaySecret } from './helpers.mjs';
 import { startFakeRelay } from './fixtures/fake-relay.mjs';
 
 // src/hostRelay.js (with relayStore.js and relaySession.js) against FAKE relays
@@ -89,7 +89,8 @@ test('H1: an impostor relay is refused on the control and the data path', async 
 
 // Invariant (S5): code-hub validates the relay's frames strictly, keys and
 // values — a status or incoming frame with an extra key, an out-of-range port,
-// an unknown scope, an unknown error code or an out-of-range host port ends the session.
+// an unknown scope, an unknown error code, an out-of-range host port or a
+// malformed conn ends the session.
 test('H2: a malformed status or incoming frame closes the session', async (t) => {
   const root = await setup(t);
   const fake = await fakeFor(t, root, { autoStatus: false });
@@ -106,6 +107,9 @@ test('H2: a malformed status or incoming frame closes the session', async (t) =>
     { t: P.frames.status, addresses: ['not an ip'], ports: [] },
     { t: P.frames.incoming, port: 40002, scope: 'everywhere', conn: 'c'.repeat(16) },
     { t: P.frames.incoming, port: 40002, scope: SCOPES.loopback, conn: 'c'.repeat(16), target: '10.0.0.1:22' },
+    { t: P.frames.incoming, port: 80, scope: SCOPES.loopback, conn: 'c'.repeat(16) },
+    { t: P.frames.incoming, port: 40002, scope: SCOPES.loopback, conn: 'not a conn!' },
+    { t: P.frames.incoming, port: 40002, scope: SCOPES.loopback, conn: 'c'.repeat(65) },
   ];
   for (const [i, frame] of malformed.entries()) {
     await waitFor(() => fake.controls.length === i + 1 && hostRelay.status().state === 'up', { timeout: 8000 });
@@ -271,6 +275,18 @@ test('H12: rendezvous reads refuse FIFOs and oversize files; the tmp write never
   assert.equal(await fs.readFile(victim, 'utf8'), 'untouched');
   assert.equal(JSON.parse(await fs.readFile(hubFile, 'utf8')).secret, fresh);
   assert.ok(!(await fs.lstat(hubFile)).isSymbolicLink());
+
+  // The create itself is exclusive: a symlink planted right after the removal
+  // (the race the removal alone can't close) makes the write refuse.
+  const tmp = path.join(dir, `.${P.rendezvous.hubFile}.${process.pid}.tmp`);
+  const realRm = fs.rm;
+  t.mock.method(fs, 'rm', async (p, ...rest) => {
+    await realRm.call(fs, p, ...rest);
+    if (p === tmp) await fs.symlink(victim, tmp);
+  });
+  await fs.writeFile(hubFile, 'invalid');
+  await assert.rejects(relayStore.ensureSecret(), /cannot provision the host-relay secret .*EEXIST/);
+  assert.equal(await fs.readFile(victim, 'utf8'), 'untouched');
 });
 
 // Invariant (S2): a relay that accepts the connection but never says hello
@@ -308,7 +324,7 @@ test('H14: hello and welcome are validated strictly: version, nonce, shape, sess
     [{ welcomeOver: (f) => ({ ...f, session: 'not a session!' }) }, /malformed session id/, true],
   ];
   for (const [opts, error, authSent] of cases) {
-    const fake = await startFakeRelay({ root, ...opts });
+    const fake = await fakeFor(t, root, opts); // closed by t.after even when an assertion fails
     await hostRelay.init();
     await waitFor(() => error.test(hostRelay.status().error ?? ''), { timeout: 3000 });
     assert.notEqual(hostRelay.status().state, 'up');
@@ -366,6 +382,75 @@ test('H17: loopbackMirror.sync moves an app\'s mirror to its new port', async (t
   sync([{ id: 'a', port: 40102 }]);
   await sleep(100);
   assert.equal(fake.control().ports.length, settled, 'an unchanged set sends nothing');
+});
+
+// Invariant (S5): a session that is up but has no answer about a pair yet
+// reports it 'binding' — no retry is pending, the relay's status is.
+test('H18: a pair awaiting the relay\'s status reports recovery binding', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root, { autoStatus: false });
+  const { handle } = exposeFor(t, 40041, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => hostRelay.status().state === 'up' && fake.control()?.ports.length === 1);
+  assert.deepEqual({ state: handle.info().state, recovery: handle.info().recovery }, { state: 'down', recovery: 'binding' });
+  fake.send({ t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40041, scope: SCOPES.loopback, hostPort: 40041, fallback: false }] });
+  await waitFor(() => handle.info().state === 'up');
+  assert.equal(handle.info().recovery, null);
+});
+
+// Invariant (S2): a relay file that couldn't be READ (an fs error, which may
+// pass) is retried with backoff — unlike unusable content, which waits for a
+// change. Here exactly one read fails and the file never changes, so neither
+// fs events (suppressed) nor the content poll could ever trigger the attempt
+// that connects: only the retry can.
+test('H19: a one-off relay-file read error is retried; it does not wait for a change', async (t) => {
+  const root = await setup(t);
+  relayStore._setWatch(() => ({ on() {}, unref() {}, close() {} }));
+  t.after(() => relayStore._setWatch(null));
+  const fake = await fakeFor(t, root);
+  const realOpen = fs.open;
+  let failed = false;
+  t.mock.method(fs, 'open', async (p, ...rest) => {
+    if (!failed && p === fake.hostFile) {
+      failed = true;
+      throw Object.assign(new Error(`EIO: i/o error, open '${p}'`), { code: 'EIO' });
+    }
+    return realOpen.call(fs, p, ...rest);
+  });
+  const { handle } = exposeFor(t, 40042, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => /cannot read .*EIO/.test(hostRelay.status().error ?? ''));
+  assert.equal(hostRelay.status().state, 'retrying');
+  assert.equal(handle.info().recovery, 'retrying');
+  await waitFor(() => hostRelay.status().state === 'up', { timeout: 4000 });
+  assert.equal(fake.controls.length, 1);
+});
+
+// Invariant (S2): rendezvous reads gather the whole file however the reads
+// are chunked — readHost parses it, and the watcher's baseline matches the
+// poll's reading, so no change is reported for an unchanged file.
+test('H20: rendezvous reads survive short reads', async (t) => {
+  const root = await setup(t);
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const fsCjs = createRequire(import.meta.url)('node:fs');
+  const fake = await fakeFor(t, root);
+  const realOpen = fs.open;
+  t.mock.method(fs, 'open', async (...a) => {
+    const h = await realOpen.apply(fs, a);
+    return { stat: () => h.stat(), close: () => h.close(), read: (buf, off, len, pos) => h.read(buf, off, Math.min(len, 7), pos) };
+  });
+  const realReadSync = fsCjs.readSync;
+  fsCjs.readSync = (fd, buf, off, len, pos) => realReadSync(fd, buf, off, Math.min(len, 7), pos);
+  syncBuiltinESMExports();
+  t.after(() => { fsCjs.readSync = realReadSync; syncBuiltinESMExports(); });
+  const host = await relayStore.readHost();
+  assert.equal(host.listenPort, fake.port);
+  const changes = [];
+  const stop = relayStore.watchHost(() => changes.push(1));
+  t.after(stop);
+  await sleep(300); // several polls
+  assert.deepEqual(changes, []);
+  assert.equal(await relayStore.ensureSecret(), await relaySecret(root), 'the hub file read whole too, so kept');
 });
 
 // Invariant (S6): a loopback listen is dialled through the Docker Desktop host
