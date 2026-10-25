@@ -28,6 +28,7 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import struct
 import sys
 from pathlib import Path
@@ -50,6 +51,7 @@ SCOPES = PROTOCOL["scopes"]
 ERROR_CODES = PROTOCOL["errorCodes"]
 PORT_MIN, PORT_MAX = PROTOCOL["port"]["min"], PROTOCOL["port"]["max"]
 NONCE_BYTES = PROTOCOL["nonceBytes"]
+MAX_RENDEZVOUS_BYTES = PROTOCOL["maxRendezvousBytes"]
 MAX_FRAME_BYTES = PROTOCOL["maxFrameBytes"]
 MAX_PORTS = PROTOCOL["maxPorts"]
 MAX_PENDING_HANDSHAKES = PROTOCOL["maxPendingHandshakes"]
@@ -252,9 +254,24 @@ def find_store(script_path, override=None):
     return None, searched
 
 
+class RendezvousError(Exception):
+    """A rendezvous file or directory can't be used; the message says why and what to do."""
+
+
+def file_problem(action, path, e, rdir):
+    """`cannot <action> <path>: <cause>`, plus the fix when the cause is permissions."""
+    msg = "cannot %s %s: %s" % (action, path, e.strerror or e)
+    if isinstance(e, PermissionError):
+        msg += " — run the relay as the user that owns %s" % rdir
+    return msg
+
+
 def relay_dir(store):
     path = Path(store) / RENDEZVOUS["dir"]
-    os.makedirs(str(path), mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(str(path), mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise RendezvousError(file_problem("create", path, e, Path(store)))
     return path
 
 
@@ -262,16 +279,38 @@ class SecretUnavailable(Exception):
     pass
 
 
+def read_small_file(path):
+    """The text of `path` if it is a regular file of at most maxRendezvousBytes.
+
+    Opened non-blocking and checked on the open descriptor, so a FIFO or a
+    device can't block the event loop and a huge file can't bloat it. Raises
+    OSError for an I/O failure, ValueError for a file that isn't usable.
+    """
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("%s is not a regular file" % path)
+        if info.st_size > MAX_RENDEZVOUS_BYTES:
+            raise ValueError("%s is larger than %d bytes" % (path, MAX_RENDEZVOUS_BYTES))
+        data = os.read(fd, MAX_RENDEZVOUS_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_RENDEZVOUS_BYTES:
+        raise ValueError("%s is larger than %d bytes" % (path, MAX_RENDEZVOUS_BYTES))
+    return data.decode("utf-8")
+
+
 def read_secret(rdir):
     """The secret code-hub wrote, re-read on every call so a regenerated one
     applies at once. Raises SecretUnavailable naming the path and the cause."""
     path = Path(rdir) / RENDEZVOUS["hubFile"]
     try:
-        raw = path.read_text(encoding="utf-8")
-    except PermissionError as e:
-        raise SecretUnavailable("cannot read %s: %s — run the relay as the user that owns %s" % (path, e.strerror, rdir))
+        raw = read_small_file(path)
     except OSError as e:
-        raise SecretUnavailable("cannot read %s: %s" % (path, e.strerror or e))
+        raise SecretUnavailable(file_problem("read", path, e, rdir))
+    except ValueError as e:
+        raise SecretUnavailable(str(e))
     try:
         obj = json.loads(raw)
     except ValueError as e:
@@ -283,16 +322,20 @@ def read_secret(rdir):
 
 
 def write_host_json(rdir, listen, pid):
-    """Atomically publish where the relay listens (tmp file in the same dir, then rename)."""
+    """Atomically publish where the relay listens (tmp file in the same dir,
+    created exclusively, then renamed). Raises RendezvousError saying why."""
     path = Path(rdir) / RENDEZVOUS["relayFile"]
     tmp = Path(rdir) / (".%s.%d.tmp" % (RENDEZVOUS["relayFile"], pid))
     payload = json.dumps({"protocolVersion": VERSION, "listen": listen, "pid": pid}) + "\n"
-    if tmp.exists():
-        tmp.unlink()
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(payload)
-    os.replace(str(tmp), str(path))
+    try:
+        if os.path.lexists(str(tmp)):
+            os.unlink(str(tmp))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(str(tmp), str(path))
+    except OSError as e:
+        raise RendezvousError(file_problem("write", path, e, rdir))
     return path
 
 
@@ -300,7 +343,7 @@ def remove_host_json_if_ours(rdir, pid):
     """Remove host.json only while it still names `pid`: a newer relay's file stays."""
     path = Path(rdir) / RENDEZVOUS["relayFile"]
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj = json.loads(read_small_file(path))
     except (OSError, ValueError):
         return False
     if not isinstance(obj, dict) or obj.get("pid") != pid:
@@ -923,7 +966,8 @@ def parse_args(argv, default_host=default_listen_host):
                 parser.error("--advertise: %r is not an IPv4 address" % ip)
             if addr in THIS_NETWORK:
                 parser.error("--advertise: %s is a wildcard address" % ip)
-            ips.append(str(addr))
+            if str(addr) not in ips:  # a repeat would make every lan bind collide with itself
+                ips.append(str(addr))
         if not ips:
             parser.error("--advertise: no address given")
         if len(ips) > PROTOCOL["maxAddresses"]:
@@ -934,11 +978,18 @@ def parse_args(argv, default_host=default_listen_host):
     return args
 
 
+class ListenError(Exception):
+    pass
+
+
 async def serve(args, rdir, store):
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     relay = Relay(rdir, args.advertise, args.listen_host, args.accept_wait_ms)
-    sock = bind_listener(args.listen_host, args.listen_port)
+    try:
+        sock = bind_listener(args.listen_host, args.listen_port)
+    except OSError as e:
+        raise ListenError("cannot listen on %s: %s" % (args.listen, e.strerror or e))
     server = await asyncio.start_server(relay.handle, sock=sock, limit=MAX_FRAME_BYTES)
     host, port = sock.getsockname()[:2]
     pid = os.getpid()
@@ -956,7 +1007,7 @@ async def serve(args, rdir, store):
     addresses, problem = relay.addresses()
     log("LAN shares go on %s; running apps on %s" % (",".join(addresses) or "no address (%s)" % problem, LOOPBACK_HOST))
     hub_file = Path(rdir) / RENDEZVOUS["hubFile"]
-    if not hub_file.exists():
+    if not os.path.lexists(str(hub_file)):
         log("waiting for code-hub to create %s" % hub_file)
     await stop.wait()
     log("shutting down")
@@ -1005,12 +1056,11 @@ def main(argv=None):
                  % (STORE_DIRNAME, Path(__file__).resolve().parent, ", ".join(searched), STORE_DIRNAME))
     try:
         rdir = relay_dir(store)
-    except OSError as e:
-        sys.exit("code-hub-relay: cannot create %s: %s" % (Path(store) / RENDEZVOUS["dir"], e.strerror or e))
-    try:
         asyncio.run(serve(args, rdir, store))
+    except (ListenError, RendezvousError) as e:
+        sys.exit("code-hub-relay: %s" % e)
     except OSError as e:
-        sys.exit("code-hub-relay: cannot listen on %s: %s" % (args.listen, e.strerror or e))
+        sys.exit("code-hub-relay: %s" % e)
     return 0
 
 

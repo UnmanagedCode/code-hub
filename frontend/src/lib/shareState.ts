@@ -119,6 +119,8 @@ export function resolveLanReachNotice(shared: Partial<Tunnel> | null | undefined
   }
   if (relay?.state === 'down') {
     const why = relay.error ? ` (${relay.error})` : '';
+    if (relay.recovery === 'binding') return { level: 'warn', text: `⚠ The host relay hasn't bound this share's port yet.${container}` };
+    if (relay.recovery === 'relay-file') return { level: 'warn', text: `⚠ The host relay can't be used${why}; code-hub waits for the relay's host.json to change.${container}` };
     return { level: 'warn', text: `⚠ The host relay isn't connected${why}; code-hub keeps retrying.${container}` };
   }
   if (relay?.state === 'failed') return { level: 'warn', text: `⚠ Host exposure failed: ${relay.error}.${container}` };

@@ -7,6 +7,9 @@
 //   autoStatus    answer every ports frame with a status binding each pair (default on)
 //   dataDelayMs   hold each data handshake this long before the welcome
 //   statusDelayMs hold each status this long (they still go out in order)
+//   mute          accept TCP and never send a hello
+//   helloOver     (hello) → the hello frame actually sent
+//   welcomeOver   (welcome) → the control welcome actually sent (MAC computed first)
 // A bound pair's host port is 50000 + the number of the ports frame answered,
 // so a test can tell which answer a host port came from.
 import net from 'node:net';
@@ -17,10 +20,11 @@ import { RELAY_PROTOCOL as P, protoMac, frameStream, relaySecret } from '../help
 
 const send = (socket, frame) => { if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`); };
 
-export async function startFakeRelay({ root, impostor = false, impostorData = false, silent = false, autoStatus = true, dataDelayMs = 0, statusDelayMs = 0, version = P.protocolVersion } = {}) {
+export async function startFakeRelay({ root, impostor = false, impostorData = false, silent = false, autoStatus = true, dataDelayMs = 0, statusDelayMs = 0, mute = false, helloOver = (f) => f, welcomeOver = (f) => f, version = P.protocolVersion } = {}) {
   const secret = await relaySecret(root);
   const fake = {
     accepted: [], // accept times
+    auths: [], // every auth frame received
     controls: [], // { socket, session, ports: [frames], closed }
     dataAuths: [], // { conn, session }
     dataWelcomed: 0,
@@ -38,11 +42,15 @@ export async function startFakeRelay({ root, impostor = false, impostorData = fa
     const done = () => { if (counted) { counted = false; fake.preAuth -= 1; } };
     socket.on('close', done);
     const frames = frameStream(socket);
-    const nonceRelay = crypto.randomBytes(P.nonceBytes).toString('base64url');
-    send(socket, { t: P.frames.hello, v: version, nonce: nonceRelay });
+    if (mute) return;
+    const hello = helloOver({ t: P.frames.hello, v: version, nonce: crypto.randomBytes(P.nonceBytes).toString('base64url') });
+    const nonceRelay = hello.nonce;
+    send(socket, hello);
+    fake.hellos = (fake.hellos ?? 0) + 1;
     let auth;
     try { auth = await frames.next(5000); } catch { socket.destroy(); return; }
     if (!auth) return;
+    fake.auths.push(auth);
     const session = auth.session ?? '';
     const conn = auth.conn ?? '';
     if (auth.mac !== protoMac(secret, P.macLabels.hub, auth.role, nonceRelay, auth.nonce, session, conn)) {
@@ -64,7 +72,7 @@ export async function startFakeRelay({ root, impostor = false, impostorData = fa
     const c = { socket, session: id, ports: [], received: [], closed: false };
     socket.on('close', () => { c.closed = true; });
     fake.controls.push(c);
-    send(socket, { t: P.frames.welcome, mac: impostor ? 'f'.repeat(64) : proof, session: id, addresses: ['127.0.0.1'] });
+    send(socket, welcomeOver({ t: P.frames.welcome, mac: impostor ? 'f'.repeat(64) : proof, session: id, addresses: ['127.0.0.1'] }));
     let answered = Promise.resolve();
     for (;;) {
       let f;

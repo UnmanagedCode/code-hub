@@ -126,14 +126,15 @@ Response fields: `kind` (`"tunnel"`, `"lan"` or `"tailscale"`), `url` (primary s
 
 **LAN share through the host relay** (code-hub in a bridge-networked container; `docs/host-relay.md`). In a container (`/.dockerenv` or `/run/.containerenv`), every LAN share is also exposed through the host relay (scope `lan`, its proxy port) whenever a relay session is up — at share time or later — with no configuration. The response and `tunnel` carry:
 
-- `relay` (`RelayInfo`): `null` when code-hub isn't in a container, or no relay is running on the host (no relay file); else `{ state, error, port, requestedPort, portFallback }`:
+- `relay` (`RelayInfo`): `null` when code-hub isn't in a container, or no relay is running on the host (no relay file); else `{ state, error, port, requestedPort, portFallback, recovery }`:
 
   | Situation | `relay` | `url` / `urls` |
   |---|---|---|
-  | code-hub is connecting to or retrying the relay | `{ state: "down", error: <the last connection error, or null>, port: null, requestedPort: <proxy port>, portFallback: false }` | the container's own LAN URLs |
-  | session up, the relay has not reported on this port yet | `"down"`, `error: "waiting for the relay to bind the port"` | the container's own LAN URLs |
-  | session up, port bound on the host | `{ state: "up", error: null, port: <host port>, requestedPort: <proxy port>, portFallback }` | `<scheme>://<advertised host ip>:<relay.port>` per advertised address — the host URLs only |
-  | session up, the relay could not bind it | `{ state: "failed", error: <the relay's message>, port: null, … }` — `no_lan_address`, a bind error, or over `maxPorts` | the container's own LAN URLs |
+  | code-hub is connecting to or retrying the relay (backoff timer armed) | `{ state: "down", error: <the last connection error, or null>, port: null, requestedPort: <proxy port>, portFallback: false, recovery: "retrying" }` | the container's own LAN URLs |
+  | the relay file can't be used (another protocol version, invalid, unreadable) — no retry until it changes | `"down"`, `error`: why, `recovery: "relay-file"` | the container's own LAN URLs |
+  | session up, the relay has not reported on this port yet | `"down"`, `error: "waiting for the relay to bind the port"`, `recovery: "binding"` | the container's own LAN URLs |
+  | session up, port bound on the host | `{ state: "up", error: null, port: <host port>, requestedPort: <proxy port>, portFallback, recovery: null }` | `<scheme>://<advertised host ip>:<relay.port>` per advertised address — the host URLs only |
+  | session up, the relay could not bind it | `{ state: "failed", error: <the relay's message>, port: null, …, recovery: null }` — `no_lan_address`, a bind error, or over `maxPorts` | the container's own LAN URLs |
 
   `portFallback` is `true` when the proxy port was busy on the host and the relay took a free one. A relay problem **never fails the share**. A share made while a session is up waits for the relay's answer about its port (at most `STATUS_WAIT_MS` in `src/hostRelay.js`) before it answers.
 - `containerInternal`: `true` when the relay isn't `up` and the share's LAN addresses are a container's bridge addresses only (every LAN IPv4 in `172.16.0.0/12`). The UI then warns and hides the QR.
@@ -187,14 +188,15 @@ Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot s
 
 ## Host relay protocol (`relay/protocol.json`)
 
-The contract between code-hub (`src/hostRelay.js`, `src/relaySession.js`, `src/relayStore.js`) and the host relay (`relay/relay.py`). **`relay/protocol.json` is its single source**, read at load by both sides: the version, the rendezvous file names, the MAC labels, every frame type, role, scope and error code, the port range, and every cap and timing (`maxAddresses`, `maxPorts`, `maxFrameBytes`, `maxPendingHandshakes`, `maxHubHandshakes`, `maxIncomingPerPort`, `maxIncomingTotal`, `nonceBytes`, `minSecretLength`, `handshakeTimeoutMs`, `pingIntervalMs`, `keepaliveTimeoutMs`). Tests fail if a source file restates a frame type, role, scope, MAC label, error code or file name inside a string literal (`tests/python/test_relay.py` for `relay.py`; `tests/relay.test.mjs` V17 for the code-hub relay modules); comments, docstrings, a frame's own key names and Node event names are not scanned. Operator guide: `docs/host-relay.md`.
+The contract between code-hub (`src/hostRelay.js`, `src/relaySession.js`, `src/relayStore.js`, all reading it through `src/relayProtocol.js`) and the host relay (`relay/relay.py`). **`relay/protocol.json` is its single source**, read at load by both sides: the version, the rendezvous file names, the MAC labels, every frame type, role, scope and error code, the port range, and every cap and timing (`maxAddresses`, `maxRendezvousBytes`, `maxPorts`, `maxFrameBytes`, `maxPendingHandshakes`, `maxHubHandshakes`, `maxIncomingPerPort`, `maxIncomingTotal`, `nonceBytes`, `minSecretLength`, `handshakeTimeoutMs`, `pingIntervalMs`, `keepaliveTimeoutMs`). Tests fail if a source file restates a frame type, role, scope, MAC label, error code or file name inside a string literal (`tests/python/test_relay.py` for `relay.py`; `tests/relay.test.mjs` V17 for the code-hub relay modules); comments, docstrings, a frame's own key names and Node event names are not scanned. Operator guide: `docs/host-relay.md`.
 
 ### Rendezvous files — `<projectsRoot>/.code-hub/<rendezvous.dir>/`
 
 | File (`rendezvous.*`) | Writer | Shape | Rules |
 |---|---|---|---|
 | `hubFile` (`relay.json`) | code-hub | `{ "protocolVersion", "secret" }` — `secret` base64url of 32 random bytes | On every code-hub boot: dir made and chmod'ed `0700`; file created (tmp + rename, `0600`) when missing or invalid (not an object, or `secret` not a string of at least `minSecretLength`), otherwise left untouched. The relay reads only `secret`, on every handshake. |
-| `relayFile` (`host.json`) | the relay | `{ "protocolVersion", "listen": "<ipv4>:<port>", "pid" }` | Written atomically (tmp in the same dir + `os.replace`, `0600`) after the control socket is bound, with the bound port. Removed on a clean exit only while its `pid` is still the relay's. code-hub reads it on every connection attempt: missing → no relay; another `protocolVersion` → an error naming both versions, and no dial until the file changes. |
+| *both* | — | — | Read only when a regular file of at most `maxRendezvousBytes`, opened non-blocking (a FIFO, device or oversize file is unusable: code-hub replaces such a hub file and reports such a relay file; the relay refuses connections with `no_secret` naming why). Each writer creates its tmp file exclusively after removing whatever is at its path, so a planted symlink is never written through. |
+| `relayFile` (`host.json`) | the relay | `{ "protocolVersion", "listen": "<ipv4>:<port>", "pid" }` | Written atomically (tmp in the same dir + `os.replace`, `0600`) after the control socket is bound, with the bound port. Removed on a clean exit only while its `pid` is still the relay's. code-hub reads it on every connection attempt: missing → no relay; another `protocolVersion`, invalid or unusable → an error (naming both versions for a mismatch) and no dial until the file changes. |
 
 ### Framing and handshake
 
@@ -230,7 +232,7 @@ The contract between code-hub (`src/hostRelay.js`, `src/relaySession.js`, `src/r
 
 ### Data path (on demand)
 
-1. A client connects to the host listener of `(P, S)`. Over `maxIncomingPerPort` pending for that listener, or `maxIncomingTotal` for the session, it is cut at once. Otherwise the relay records `conn X`, arms a `--accept-wait-ms` timer, sends `incoming`, and reads nothing from the client yet.
+1. A client connects to the host listener of `(P, S)`. Over `maxIncomingPerPort` pending for that listener, or `maxIncomingTotal` for the session, it is cut at once. Otherwise the relay records `conn X`, arms a `--accept-wait-ms` timer and sends `incoming`. Bytes the client sends meanwhile stay buffered (the relay doesn't consume them) and are delivered first once the client is spliced.
 2. code-hub looks up its exposure for `(P, S)` — none (withdrawn meanwhile): it ignores the frame and the relay's timer drops the client — else opens one fresh connection to the control session's dial address and authenticates as `data` with `S` and `X`.
 3. The relay consumes `X`, cancels its timer, writes the `welcome` and splices client ↔ data connection. code-hub verifies the welcome, then connects the exposure's target — `lan`: the share's auth proxy; `loopback`: `127.0.0.1:<app port>` in the container — writes any bytes that followed the welcome (the client's first bytes, e.g. a TLS ClientHello) and pipes both ways, half-close preserved. A failed target connect destroys the data connection, and the relay closes the client.
 4. Unclaimed after `--accept-wait-ms`, a client is cut. A session close cuts every pending and spliced client.

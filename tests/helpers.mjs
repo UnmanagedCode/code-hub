@@ -365,6 +365,7 @@ export function tcpConnect(port, host = '127.0.0.1') {
 // Connect to a relay as code-hub would: read the hello, send `auth` (built
 // from `secret`, or overridden field by field via `authOver`), and return
 // { socket, frames, hello, auth, reply } — `reply` the welcome or error frame.
+// `authOver` may be a function of the hello, to build fields over its nonce.
 export async function relayLogin(port, secret, { role = RELAY_PROTOCOL.roles.control, session = '', conn = '', authOver = {} } = {}) {
   const socket = await tcpConnect(port);
   const frames = frameStream(socket);
@@ -374,7 +375,7 @@ export async function relayLogin(port, secret, { role = RELAY_PROTOCOL.roles.con
     t: RELAY_PROTOCOL.frames.auth, v: RELAY_PROTOCOL.protocolVersion, role, nonce,
     mac: protoMac(secret, RELAY_PROTOCOL.macLabels.hub, role, hello.nonce, nonce, session, conn),
     ...(role === RELAY_PROTOCOL.roles.data ? { session, conn } : {}),
-    ...authOver,
+    ...(typeof authOver === 'function' ? authOver(hello) : authOver),
   };
   socket.write(`${JSON.stringify(auth)}\n`);
   const reply = await frames.next();
@@ -420,4 +421,26 @@ export function holdStateWrite(t) {
   };
   t.after(() => { release(); fs.writeFile = realWrite; fs.readFile = realRead; });
   return { parked, stateRead, release };
+}
+
+// The TCP addresses process `pid` is LISTENING on, as a Set of 'ip:port'
+// (Linux, from /proc: its socket inodes matched against /proc/<pid>/net/tcp).
+// What a process itself bound — unlike a connect probe, which another process
+// on the same port and address would answer.
+export async function listeningAddrs(pid) {
+  const inodes = new Set();
+  for (const fd of await fs.readdir(`/proc/${pid}/fd`)) {
+    const link = await fs.readlink(`/proc/${pid}/fd/${fd}`).catch(() => '');
+    const m = /^socket:\[(\d+)\]$/.exec(link);
+    if (m) inodes.add(m[1]);
+  }
+  const out = new Set();
+  for (const line of (await fs.readFile(`/proc/${pid}/net/tcp`, 'utf8')).split('\n').slice(1)) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 10 || f[3] !== '0A' || !inodes.has(f[9])) continue;
+    const [ipHex, portHex] = f[1].split(':');
+    const n = parseInt(ipHex, 16);
+    out.add(`${[n & 255, (n >>> 8) & 255, (n >>> 16) & 255, n >>> 24].join('.')}:${parseInt(portHex, 16)}`);
+  }
+  return out;
 }

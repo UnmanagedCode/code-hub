@@ -87,8 +87,9 @@ test('H1: an impostor relay is refused on the control and the data path', async 
   assert.equal(target.connections, 0);
 });
 
-// Invariant (S5): code-hub validates the relay's frames strictly — a status or
-// incoming frame with an extra key or an unknown scope ends the session.
+// Invariant (S5): code-hub validates the relay's frames strictly, keys and
+// values — a status or incoming frame with an extra key, an out-of-range port,
+// an unknown scope, an unknown error code or an out-of-range host port ends the session.
 test('H2: a malformed status or incoming frame closes the session', async (t) => {
   const root = await setup(t);
   const fake = await fakeFor(t, root, { autoStatus: false });
@@ -97,16 +98,28 @@ test('H2: a malformed status or incoming frame closes the session', async (t) =>
   const malformed = [
     { t: P.frames.status, addresses: ['127.0.0.1'], ports: [], extra: 1 },
     { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, hostPort: 40002, fallback: false, host: '10.0.0.1' }] },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 80, scope: SCOPES.loopback, hostPort: 40002, fallback: false }] },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: 'everywhere', hostPort: 40002, fallback: false }] },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, code: 'no_such_code', message: 'x' }] },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, hostPort: 70000, fallback: false }] },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, hostPort: 0, fallback: false }] },
+    { t: P.frames.status, addresses: ['not an ip'], ports: [] },
     { t: P.frames.incoming, port: 40002, scope: 'everywhere', conn: 'c'.repeat(16) },
     { t: P.frames.incoming, port: 40002, scope: SCOPES.loopback, conn: 'c'.repeat(16), target: '10.0.0.1:22' },
   ];
   for (const [i, frame] of malformed.entries()) {
-    await waitFor(() => fake.controls.length === i + 1 && hostRelay.status().state === 'up', { timeout: 5000 });
+    await waitFor(() => fake.controls.length === i + 1 && hostRelay.status().state === 'up', { timeout: 8000 });
     const c = fake.control();
     fake.send(frame);
     await waitFor(() => c.closed);
-    assert.match(hostRelay.status().error, /bad frame from the relay|malformed/, JSON.stringify(frame));
+    assert.match(hostRelay.status().error, /bad frame from the relay|malformed|invalid/, JSON.stringify(frame));
   }
+  // A well-formed status, by contrast, keeps the session.
+  await waitFor(() => fake.controls.length === malformed.length + 1 && hostRelay.status().state === 'up', { timeout: 8000 });
+  fake.send({ t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, code: P.errorCodes.bindFailed, message: 'x' }] });
+  await sleep(200);
+  assert.equal(fake.control().closed, false);
+  assert.equal(hostRelay.status().state, 'up');
 });
 
 // Invariant (S4): a relay that goes silent takes the session down within
@@ -123,7 +136,8 @@ test('H3: a silent relay drives code-hub down within the keepalive timeout', asy
   assert.ok(took >= 300 && took < 1200, `down after ${took}ms`);
   assert.match(hostRelay.status().error, /connection to the relay lost: no frame from the relay for over 400ms/);
   assert.equal(seen.at(-1)?.state, 'down');
-  assert.ok(fake.control().closed);
+  const first = fake.controls[0];
+  await waitFor(() => first.closed);
 });
 
 // Invariant (S2): failed attempts back off with growing gaps, and a change of
@@ -137,11 +151,13 @@ test('H4: backoff gaps grow, and a relay-file change cuts the wait short', async
   const hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
   const publish = (pid) => fs.writeFile(hostFile, JSON.stringify({ protocolVersion: P.protocolVersion, listen: `127.0.0.1:${refuser.address().port}`, pid }));
   await publish(1);
+  const { handle } = exposeFor(t, 40004, SCOPES.lan);
   await hostRelay.init();
   await waitFor(() => times.length >= 4, { timeout: 8000 });
   const gaps = times.slice(1).map((x, i) => x - times[i]);
   assert.ok(gaps[0] < gaps[1] && gaps[1] < gaps[2], `gaps ${gaps}`);
   assert.equal(hostRelay.status().state, 'retrying');
+  assert.equal(handle.info().recovery, 'retrying');
   // The next attempt is now a gap of several seconds away; a file change skips it.
   const changedAt = Date.now();
   await publish(2);
@@ -150,13 +166,17 @@ test('H4: backoff gaps grow, and a relay-file change cuts the wait short', async
 });
 
 // Invariant (S2): a relay file of another protocol version is reported and not
-// dialled at all until the file changes.
+// dialled at all until the file changes — a `waiting` state, which handles
+// report as recovery 'relay-file' (no retry is coming), unlike 'retrying'.
 test('H5: an incompatible relay file gives the version error and no dial until it changes', async (t) => {
   const root = await setup(t);
   const fake = await fakeFor(t, root);
   await fake.publish({ protocolVersion: 1 });
+  const { handle } = exposeFor(t, 40005, SCOPES.lan);
   await hostRelay.init();
   await waitFor(() => /speaks protocol 1, this code-hub speaks 2 — update the relay\/ copy on the host/.test(hostRelay.status().error ?? ''));
+  assert.equal(hostRelay.status().state, 'waiting');
+  assert.deepEqual({ state: handle.info().state, recovery: handle.info().recovery }, { state: 'down', recovery: 'relay-file' });
   await sleep(700);
   assert.equal(fake.accepted.length, 0);
   await fake.publish();
@@ -185,13 +205,16 @@ test('H6: ports frames carry the full set, both scopes, on connect, on change an
   assert.deepEqual(pairs(fake.control().ports[0]), ['40011/loopback', '40013/loopback']);
 });
 
-// Invariant (S5): the secret file is created private (dir 0700, file 0600),
-// left byte-identical while valid, and replaced when invalid or too short.
+// Invariant (S5): the secret file is created private (dir 0700 — a wider
+// existing dir is narrowed — file 0600), left byte-identical while valid, and
+// replaced when invalid or too short.
 test('H7: relay.json is created 0700/0600, kept when valid, replaced when invalid or short', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const dir = path.join(root, '.code-hub', P.rendezvous.dir);
   const file = path.join(dir, P.rendezvous.hubFile);
+  await fs.mkdir(dir, { recursive: true, mode: 0o755 });
+  await fs.chmod(dir, 0o755);
   const secret = await relayStore.ensureSecret();
   assert.ok(secret.length >= P.minSecretLength);
   const raw = await fs.readFile(file, 'utf8');
@@ -208,6 +231,141 @@ test('H7: relay.json is created 0700/0600, kept when valid, replaced when invali
     assert.ok(fresh.length >= P.minSecretLength, bad);
     assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).secret, fresh, bad);
   }
+});
+
+const posixOnly = process.platform === 'win32' ? 'FIFOs, symlinks and modes are POSIX' : false;
+
+// Invariant (S5): a rendezvous file is read only when it is a regular file
+// within maxRendezvousBytes — a FIFO never blocks a read, a huge file is never
+// loaded — and the hub's tmp file is created exclusively, so a symlink planted
+// at its path is removed, never written through.
+test('H12: rendezvous reads refuse FIFOs and oversize files; the tmp write never follows a planted symlink', { skip: posixOnly }, async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const { execFileSync } = await import('node:child_process');
+  const dir = path.join(root, '.code-hub', P.rendezvous.dir);
+  const hubFile = path.join(dir, P.rendezvous.hubFile);
+  const hostFile = path.join(dir, P.rendezvous.relayFile);
+  await relayStore.ensureSecret();
+
+  await fs.rm(hubFile);
+  execFileSync('mkfifo', [hubFile]);
+  const fromFifo = await relayStore.ensureSecret(); // a blocking read would hang here
+  assert.ok((await fs.stat(hubFile)).isFile(), 'the FIFO was replaced by a fresh secret file');
+  assert.equal(JSON.parse(await fs.readFile(hubFile, 'utf8')).secret, fromFifo);
+  await fs.writeFile(hubFile, JSON.stringify({ secret: 'x'.repeat(P.maxRendezvousBytes) }));
+  const fromHuge = await relayStore.ensureSecret();
+  assert.notEqual(fromHuge, 'x'.repeat(P.maxRendezvousBytes), 'an oversize file is not used');
+
+  execFileSync('mkfifo', [hostFile]);
+  assert.match((await relayStore.readHost()).error, /is not a regular file/);
+  await fs.rm(hostFile);
+  await fs.writeFile(hostFile, JSON.stringify({ protocolVersion: P.protocolVersion, listen: '127.0.0.1:7077', pid: 1, pad: 'x'.repeat(P.maxRendezvousBytes) }));
+  assert.match((await relayStore.readHost()).error, new RegExp(`is larger than ${P.maxRendezvousBytes} bytes`));
+
+  const victim = path.join(root, 'victim');
+  await fs.writeFile(victim, 'untouched');
+  await fs.symlink(victim, path.join(dir, `.${P.rendezvous.hubFile}.${process.pid}.tmp`));
+  await fs.writeFile(hubFile, 'invalid');
+  const fresh = await relayStore.ensureSecret();
+  assert.equal(await fs.readFile(victim, 'utf8'), 'untouched');
+  assert.equal(JSON.parse(await fs.readFile(hubFile, 'utf8')).secret, fresh);
+  assert.ok(!(await fs.lstat(hubFile)).isSymbolicLink());
+});
+
+// Invariant (S2): a relay that accepts the connection but never says hello
+// costs at most handshakeTimeoutMs per attempt — code-hub reports the timeout
+// and keeps retrying with backoff.
+test('H13: a relay that never sends hello times out the handshake, and code-hub keeps retrying', async (t) => {
+  const root = await setup(t, { timings: { handshakeTimeoutMs: 200 } });
+  const fake = await fakeFor(t, root, { mute: true });
+  await hostRelay.init();
+  await waitFor(() => /did not complete the handshake within 200ms/.test(hostRelay.status().error ?? ''), { timeout: 2000 });
+  assert.equal(hostRelay.status().state, 'retrying');
+  await waitFor(() => fake.accepted.length >= 3, { timeout: 4000 });
+  const gaps = fake.accepted.slice(1).map((x, i) => x - fake.accepted[i]);
+  assert.ok(gaps.every((g) => g >= 200 + 400), `each attempt waited out the timeout and a backoff (${gaps})`);
+});
+
+// Invariant (S5): code-hub checks the relay's handshake frames strictly — a
+// hello of another version is a version mismatch (not an auth failure); a
+// malformed nonce (length or alphabet), an extra, missing or mistyped key in
+// the hello or the welcome, or a malformed session id is a bad frame; in the
+// hello cases code-hub sends no auth at all.
+test('H14: hello and welcome are validated strictly: version, nonce, shape, session id', async (t) => {
+  const root = await setup(t);
+  const nonce = (n) => n.repeat(Math.ceil((P.nonceBytes * 8) / 6));
+  const cases = [
+    [{ helloOver: (f) => ({ ...f, v: P.protocolVersion + 1 }) }, new RegExp(`speaks protocol ${P.protocolVersion + 1}, this code-hub speaks ${P.protocolVersion}`), false],
+    [{ helloOver: (f) => ({ ...f, nonce: f.nonce.slice(1) }) }, /malformed nonce/, false],
+    [{ helloOver: (f) => ({ ...f, nonce: `${nonce('a').slice(1)}+` }) }, /malformed nonce/, false],
+    [{ helloOver: (f) => ({ ...f, extra: 1 }) }, /hello must have exactly the keys/, false],
+    [{ helloOver: ({ nonce: _n, ...f }) => f }, /hello must have exactly the keys/, false],
+    [{ helloOver: (f) => ({ ...f, nonce: 5 }) }, /hello: nonce is malformed/, false],
+    [{ welcomeOver: (f) => ({ ...f, extra: 1 }) }, /welcome must have exactly the keys/, true],
+    [{ welcomeOver: ({ addresses: _a, ...f }) => f }, /welcome must have exactly the keys/, true],
+    [{ welcomeOver: (f) => ({ ...f, addresses: '127.0.0.1' }) }, /welcome: addresses is malformed/, true],
+    [{ welcomeOver: (f) => ({ ...f, session: 'not a session!' }) }, /malformed session id/, true],
+  ];
+  for (const [opts, error, authSent] of cases) {
+    const fake = await startFakeRelay({ root, ...opts });
+    await hostRelay.init();
+    await waitFor(() => error.test(hostRelay.status().error ?? ''), { timeout: 3000 });
+    assert.notEqual(hostRelay.status().state, 'up');
+    assert.equal(fake.auths.length > 0, authSent, String(error));
+    hostRelay.stop();
+    await fake.close();
+  }
+});
+
+// Invariant (S4): the silence timer restarts on every frame — a relay that
+// answers keeps the session up across many keepalive windows, on one connection.
+test('H15: a responsive relay keeps the session up across several keepalive windows', async (t) => {
+  const root = await setup(t, { timings: { pingIntervalMs: 100, keepaliveTimeoutMs: 300 } });
+  const fake = await fakeFor(t, root);
+  await hostRelay.init();
+  await waitFor(() => hostRelay.status().state === 'up');
+  await sleep(1500); // five windows
+  assert.equal(hostRelay.status().state, 'up');
+  assert.equal(fake.controls.length, 1, 'never reconnected');
+  assert.equal(fake.control().closed, false);
+});
+
+// Invariant (S2): the relay file's content poll alone finds a relay — with
+// filesystem events suppressed entirely (Docker Desktop bind mounts).
+test('H16: the relay-file poll finds a relay with fs.watch suppressed', async (t) => {
+  const root = await setup(t);
+  let watched = 0;
+  relayStore._setWatch(() => { watched += 1; return { on() {}, unref() {}, close() {} }; });
+  t.after(() => relayStore._setWatch(null));
+  const changes = [];
+  const stop = relayStore.watchHost(() => changes.push(Date.now()));
+  t.after(stop);
+  assert.equal(watched, 1, 'the watcher was replaced, not merely unused');
+  const fake = await fakeFor(t, root);
+  await waitFor(() => changes.length >= 1, { timeout: 1000 });
+  await fs.rm(fake.hostFile);
+  await waitFor(() => changes.length >= 2, { timeout: 1000 });
+});
+
+// Invariant (S10): a mirrored app whose port changed is re-mirrored — its old
+// pair is withdrawn and the new one exposed.
+test('H17: loopbackMirror.sync moves an app\'s mirror to its new port', async (t) => {
+  const root = await setup(t);
+  const { sync, reset, hostPort } = await import('../src/loopbackMirror.js');
+  t.after(reset);
+  const fake = await fakeFor(t, root);
+  await hostRelay.init();
+  await waitFor(() => hostRelay.status().state === 'up');
+  sync([{ id: 'a', port: 40101 }]);
+  await waitFor(() => hostPort('a') !== null);
+  sync([{ id: 'a', port: 40102 }]);
+  await waitFor(() => pairs(fake.control().ports.at(-1)).join() === `40102/${SCOPES.loopback}`);
+  await waitFor(() => hostPort('a') !== null);
+  const settled = fake.control().ports.length;
+  sync([{ id: 'a', port: 40102 }]);
+  await sleep(100);
+  assert.equal(fake.control().ports.length, settled, 'an unchanged set sends nothing');
 });
 
 // Invariant (S6): a loopback listen is dialled through the Docker Desktop host

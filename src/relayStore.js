@@ -1,4 +1,4 @@
-import { promises as fs, readFileSync, watch } from 'node:fs';
+import { promises as fs, constants, openSync, fstatSync, readSync, closeSync, watch } from 'node:fs';
 import crypto from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
@@ -12,10 +12,62 @@ import { PROTOCOL } from './relayProtocol.js';
 // needs configuring.
 const { dir: DIR, hubFile: HUB_FILE, relayFile: RELAY_FILE } = PROTOCOL.rendezvous;
 const SECRET_BYTES = 32;
-let hostPollMs = 1000;
+// How often watchHost() polls the relay file's content.
+const HOST_POLL_MS = 1000;
+let hostPollMs = HOST_POLL_MS;
+let watchImpl = watch;
 
-// Test seam: how often watchHost() polls the relay file.
-export function _setHostPollMs(ms) { hostPollMs = ms; }
+// Test seams: the poll interval, and fs.watch itself (null restores each).
+export function _setHostPollMs(ms) { hostPollMs = ms ?? HOST_POLL_MS; }
+export function _setWatch(fn) { watchImpl = fn ?? watch; }
+
+// Opened non-blocking and checked on the open descriptor, so a FIFO or device
+// planted in the rendezvous dir can't block a read and a huge file can't bloat it.
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
+
+function unusable(file, why) {
+  return Object.assign(new Error(`${file} ${why}`), { code: 'EUNUSABLE' });
+}
+
+// The text of `file` if it is a regular file of at most maxRendezvousBytes;
+// null when it doesn't exist. Throws (`code: 'EUNUSABLE'`) naming why it can't be used.
+async function readSmall(file) {
+  let handle;
+  try {
+    handle = await fs.open(file, OPEN_FLAGS);
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw unusable(file, 'is not a regular file');
+    if (info.size > PROTOCOL.maxRendezvousBytes) throw unusable(file, `is larger than ${PROTOCOL.maxRendezvousBytes} bytes`);
+    const buf = Buffer.alloc(PROTOCOL.maxRendezvousBytes + 1);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    if (bytesRead > PROTOCOL.maxRendezvousBytes) throw unusable(file, `is larger than ${PROTOCOL.maxRendezvousBytes} bytes`);
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+// readSmall, synchronously, for watchHost's baseline; anything unusable reads as null.
+function readSmallSync(file) {
+  let fd;
+  try { fd = openSync(file, OPEN_FLAGS); } catch { return null; }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size > PROTOCOL.maxRendezvousBytes) return null;
+    const buf = Buffer.alloc(PROTOCOL.maxRendezvousBytes + 1);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    return n > PROTOCOL.maxRendezvousBytes ? null : buf.subarray(0, n).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function relayDir() {
   return path.join(storeRoot(), DIR);
@@ -34,20 +86,23 @@ function validSecretFile(raw) {
   }
 }
 
-// The shared secret, creating the hub file when it is missing or invalid and
-// otherwise leaving it untouched. The directory is (re)made 0700 every time;
-// a new file is written 0600 via a tmp file and a rename. Throws naming the path.
+// The shared secret, creating the hub file when it is missing or invalid (an
+// unusable file — not regular, too large — included) and otherwise leaving it
+// untouched. The directory is (re)made 0700 every time; a new file is written
+// 0600 via a tmp file created exclusively (a symlink planted at the tmp path is
+// removed, never followed) and a rename. Throws naming the path.
 export async function ensureSecret() {
   const dir = relayDir();
   const file = hubFilePath();
   try {
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.chmod(dir, 0o700);
-    const raw = await fs.readFile(file, 'utf8').catch((e) => { if (e.code === 'ENOENT') return null; throw e; });
+    const raw = await readSmall(file).catch((e) => { if (e.code === 'EUNUSABLE') return null; throw e; });
     if (raw !== null && validSecretFile(raw)) return JSON.parse(raw).secret;
     const secret = crypto.randomBytes(SECRET_BYTES).toString('base64url');
     const tmp = path.join(dir, `.${HUB_FILE}.${process.pid}.tmp`);
-    await fs.writeFile(tmp, `${JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, secret })}\n`, { mode: 0o600 });
+    await fs.rm(tmp, { force: true });
+    await fs.writeFile(tmp, `${JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, secret })}\n`, { mode: 0o600, flag: 'wx' });
     await fs.chmod(tmp, 0o600);
     await fs.rename(tmp, file);
     return secret;
@@ -57,13 +112,8 @@ export async function ensureSecret() {
 }
 
 // The relay file's content as a string, or null when there is none.
-async function readHostRaw() {
-  try {
-    return await fs.readFile(hostFilePath(), 'utf8');
-  } catch (e) {
-    if (e.code === 'ENOENT') return null;
-    throw e;
-  }
+function readHostRaw() {
+  return readSmall(hostFilePath());
 }
 
 // Where the relay listens: null when it has published nothing; `{ error }`
@@ -74,7 +124,7 @@ export async function readHost() {
   try {
     raw = await readHostRaw();
   } catch (e) {
-    return { error: `cannot read ${hostFilePath()}: ${e.message}` };
+    return { error: e.code === 'EUNUSABLE' ? e.message : `cannot read ${hostFilePath()}: ${e.message}` };
   }
   return raw === null ? null : parseHost(raw, hostFilePath());
 }
@@ -101,8 +151,7 @@ export function parseHost(raw, file) {
 // filesystem delivers events; the content poll is what makes it work where it
 // doesn't (Docker Desktop bind mounts often drop host-side writes). Returns stop().
 export function watchHost(onChange) {
-  let last;
-  try { last = readFileSync(hostFilePath(), 'utf8'); } catch { last = null; }
+  let last = readSmallSync(hostFilePath());
   let checking = false;
   let again = false;
   let stopped = false;
@@ -112,7 +161,7 @@ export function watchHost(onChange) {
     checking = true;
     try {
       let now;
-      try { now = await readHostRaw(); } catch { now = last; }
+      try { now = await readHostRaw(); } catch (e) { now = `unusable: ${e.message}`; }
       if (!stopped && now !== last) {
         last = now;
         try { onChange(); } catch (e) { console.error(`[relayStore] host-file change handler failed: ${e.message}`); }
@@ -124,7 +173,7 @@ export function watchHost(onChange) {
   };
   let watcher = null;
   try {
-    watcher = watch(relayDir(), (_event, name) => { if (!name || name.toString() === RELAY_FILE) check(); });
+    watcher = watchImpl(relayDir(), (_event, name) => { if (!name || name.toString() === RELAY_FILE) check(); });
     watcher.on('error', (e) => {
       console.error(`[relayStore] watching ${relayDir()} failed (${e.message}); polling continues`);
       watcher.close();

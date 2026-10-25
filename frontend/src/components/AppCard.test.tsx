@@ -280,6 +280,14 @@ describe('call sites', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/host relay isn't connected \(connection to the relay lost: the relay closed the connection\)/);
   });
 
+  // Invariant: a relay waiting for its host.json to change says so, and promises no retry (resolveLanReachNotice's call site).
+  it('a relay waiting for its host.json: an alert that names the wait', () => {
+    renderCard(lan({ containerInternal: true, relay: relayInfo({ state: 'down', error: 'bad host.json', port: null, recovery: 'relay-file' }) }));
+    const text = screen.getByRole('alert').textContent ?? '';
+    expect(text).toMatch(/waits for the relay's host\.json to change/);
+    expect(text).not.toMatch(/retrying/);
+  });
+
   // Invariant: the "edited X ago" label carries the commit's absolute date as its title.
   it('the edited label carries the absolute date', () => {
     const iso = '2026-01-02T03:04:05Z';

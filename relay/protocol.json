@@ -15,6 +15,7 @@
   "maxAddresses": 16,
   "maxPorts": 64,
   "maxFrameBytes": 16384,
+  "maxRendezvousBytes": 4096,
   "maxPendingHandshakes": 32,
   "maxHubHandshakes": 8,
   "maxIncomingPerPort": 32,

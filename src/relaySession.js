@@ -287,8 +287,9 @@ export async function openControl({ host, port, secret, limiter, onFrame, onClos
 // Claim host client `conn` of `session` with one fresh data connection, then
 // pipe it to `target` ({ host, port }), the bytes after the welcome first.
 // Returns a closer at once: close() destroys whatever exists (and cancels a
-// handshake still queued); onClose() fires once when the pipe or the attempt ends.
-export function openData({ host, port, secret, limiter, session, conn, target, onClose = () => {} }) {
+// handshake still queued); onClose() fires once when the pipe or the attempt
+// ends; onTargetError(error) fires when the target refuses the connection.
+export function openData({ host, port, secret, limiter, session, conn, target, onClose = () => {}, onTargetError = () => {} }) {
   const sockets = new Set();
   let closed = false;
   let ended = false;
@@ -303,6 +304,12 @@ export function openData({ host, port, secret, limiter, session, conn, target, o
   dialAndAuth({ host, port, limiter, secret, role: ROLES.data, session, conn, isCancelled: () => closed }).then(({ socket, head }) => {
     if (closed) { socket.destroy(); return; }
     const up = net.connect({ port: target.port, host: target.host, allowHalfOpen: true });
+    let connected = false;
+    up.once('connect', () => { connected = true; });
+    up.once('error', (e) => {
+      if (connected) return;
+      try { onTargetError(e); } catch (err) { console.error(`[relaySession] onTargetError failed: ${err.message}`); }
+    });
     sockets.add(socket);
     sockets.add(up);
     for (const s of [socket, up]) { s.on('error', end); s.on('close', end); }

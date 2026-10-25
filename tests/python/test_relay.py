@@ -317,6 +317,15 @@ class ParseArgs(unittest.TestCase):
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             relay.parse_args(["--advertise", "192.168.1.20,0.0.0.0"])
 
+    # A repeated --advertise address is kept once, order preserved (a repeat
+    # would make every lan bind collide with itself).
+    def test_advertise_deduplicated(self):
+        args = relay.parse_args(["--advertise", "10.0.0.6,10.0.0.5,10.0.0.6"])
+        self.assertEqual(args.advertise, ["10.0.0.6", "10.0.0.5"])
+        # Repeats are found by canonical form (Python 3.9.0-3.9.4 accept padding).
+        with mock.patch.object(relay.ipaddress, "IPv4Address", lenient_ipv4):
+            self.assertEqual(relay.parse_args(["--advertise", "10.0.0.5,010.0.0.5"]).advertise, ["10.0.0.5"])
+
     # --projects-root is taken as given; --accept-wait-ms must be positive.
     def test_projects_root_and_accept_wait(self):
         self.assertEqual(relay.parse_args(["--projects-root", "/some/root"]).projects_root, "/some/root")
@@ -362,14 +371,45 @@ class Mac(unittest.TestCase):
         self.assertFalse(relay.verify_mac(hub, None))
 
     def test_verify_is_constant_time(self):
-        fn = function_named(TREE, "verify_mac")
-        digest = [c for c in calls(fn) if isinstance(c.func, ast.Attribute) and c.func.attr == "compare_digest"
-                  and isinstance(c.func.value, ast.Name) and c.func.value.id == "hmac"]
-        self.assertEqual(len(digest), 1)
-        for node in ast.walk(fn):
-            if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
-                names = {n.id for part in [node.left] + node.comparators for n in ast.walk(part) if isinstance(n, ast.Name)}
-                self.assertFalse(names & {"expected", "given"}, "compared with ==/!=")
+        """verify_mac compares only through hmac.compare_digest — no ==, !=, is
+        or is not anywhere in it — and nothing in the relay compares a MAC value
+        with an equality operator; the scan flags planted violations."""
+        self.assertEqual(mac_compare_problems(TREE), [])
+        planted = ast.parse(
+            "import hmac\n"
+            "def verify_mac(expected, given):\n    x = given\n    return x != expected\n"
+            "def other(msg, proof):\n    return msg['mac'] == proof\n")
+        self.assertEqual(len(mac_compare_problems(planted)), 3, "no compare_digest, a != in verify_mac, a MAC compared elsewhere")
+
+
+def mac_compare_problems(tree):
+    """Why `tree`'s MAC comparisons aren't constant-time, as a list (empty = fine)."""
+    problems = []
+    fn = function_named(tree, "verify_mac")
+    digest = [c for c in calls(fn) if isinstance(c.func, ast.Attribute) and c.func.attr == "compare_digest"
+              and isinstance(c.func.value, ast.Name) and c.func.value.id == "hmac"]
+    if len(digest) != 1:
+        problems.append("verify_mac does not call hmac.compare_digest exactly once")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops):
+            problems.append("verify_mac compares with an equality operator at line %d" % node.lineno)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) for op in node.ops)):
+            continue
+        if any(n is node for n in ast.walk(fn)):
+            continue
+        words = []
+        for part in [node.left] + node.comparators:
+            for n in ast.walk(part):
+                if isinstance(n, ast.Name):
+                    words.append(n.id)
+                elif isinstance(n, ast.Attribute):
+                    words.append(n.attr)
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                    words.append(n.value)
+        if any("mac" in w.lower() or "proof" in w.lower() for w in words):
+            problems.append("a MAC value compared with an equality operator at line %d" % node.lineno)
+    return problems
 
 
 class Discovery(unittest.TestCase):
@@ -440,6 +480,108 @@ class Rendezvous(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertTrue(relay.remove_host_json_if_ours(self.dir, 4242))
         self.assertFalse(path.exists())
+
+
+class StartupErrors(unittest.TestCase):
+    """A1: a rendezvous file or dir the relay can't use names the path and, for
+    a permission failure, says to run the relay as the owner; only a failed
+    control bind is reported as "cannot listen"; any other OSError is reported
+    as itself."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(str(self.tmp), ignore_errors=True))
+        (self.tmp / ".code-hub").mkdir()
+
+    def run_main(self, **patches):
+        argv = ["--listen", "127.0.0.1:0", "--advertise", "127.0.0.1", "--projects-root", str(self.tmp)]
+        with mock.patch.object(relay, "log"), mock.patch.object(relay, "default_route_ipv4", side_effect=OSError("no route")), \
+                mock.patch.multiple(relay, **patches) if patches else mock.patch.object(relay, "LOOPBACK_HOST", relay.LOOPBACK_HOST), \
+                self.assertRaises(SystemExit) as caught:
+            relay.main(argv)
+        return str(caught.exception.code)
+
+    def test_permission_failures_name_the_owner(self):
+        denied = PermissionError(13, "Permission denied")
+        msg = relay.file_problem("write", self.tmp / "x", denied, self.tmp)
+        self.assertEqual(msg, "cannot write %s: Permission denied — run the relay as the user that owns %s" % (self.tmp / "x", self.tmp))
+        self.assertNotIn("run the relay", relay.file_problem("write", self.tmp / "x", OSError(28, "No space left on device"), self.tmp))
+        with mock.patch.object(relay.os, "open", side_effect=denied):
+            with self.assertRaises(relay.RendezvousError) as caught:
+                relay.write_host_json(self.tmp, "127.0.0.1:1", 7)
+        self.assertIn("run the relay as the user that owns %s" % self.tmp, str(caught.exception))
+        with mock.patch.object(relay.os, "makedirs", side_effect=denied):
+            with self.assertRaises(relay.RendezvousError) as caught:
+                relay.relay_dir(self.tmp / ".code-hub")
+        self.assertIn("cannot create", str(caught.exception))
+        self.assertIn("run the relay as the user that owns", str(caught.exception))
+        with mock.patch.object(relay.os, "open", side_effect=denied):
+            with self.assertRaises(relay.SecretUnavailable) as caught:
+                relay.read_secret(self.tmp)
+        self.assertIn("run the relay as the user that owns", str(caught.exception))
+
+    def test_main_names_what_failed(self):
+        def deny_host_json(rdir, listen, pid):
+            raise relay.RendezvousError(relay.file_problem("write", Path(rdir) / RDV["relayFile"], PermissionError(13, "Permission denied"), rdir))
+
+        msg = self.run_main(write_host_json=deny_host_json)
+        self.assertIn("run the relay as the user that owns", msg)
+        self.assertNotIn("cannot listen", msg)
+
+        def busy(host, port):
+            raise OSError(98, "Address already in use")
+
+        self.assertIn("cannot listen on 127.0.0.1:0: Address already in use", self.run_main(bind_listener=busy))
+
+        async def broken(args, rdir, store):
+            raise OSError(5, "Input/output error")
+
+        msg = self.run_main(serve=broken)
+        self.assertIn("Input/output error", msg)
+        self.assertNotIn("cannot listen", msg)
+
+
+class RendezvousFiles(unittest.TestCase):
+    """A5: a rendezvous file is read only if it is a regular file within
+    maxRendezvousBytes — a FIFO never blocks, an oversize file is never loaded
+    — and host.json's tmp file is created exclusively, so a symlink planted at
+    its path is replaced, never written through."""
+
+    def setUp(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("POSIX FIFOs and symlinks")
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(str(self.dir)))
+
+    def test_fifo_and_oversize_are_refused_without_blocking(self):
+        hub = self.dir / RDV["hubFile"]
+        os.mkfifo(str(hub))
+        with self.assertRaises(relay.SecretUnavailable) as caught:
+            relay.read_secret(self.dir)  # a blocking open would hang here
+        self.assertIn("is not a regular file", str(caught.exception))
+        host = self.dir / RDV["relayFile"]
+        os.mkfifo(str(host))
+        self.assertFalse(relay.remove_host_json_if_ours(self.dir, os.getpid()))
+        self.assertTrue(host.exists(), "a FIFO is not removed as if it were ours")
+        hub.unlink()
+        hub.write_text(json.dumps({"secret": "k" * (PROTOCOL["maxRendezvousBytes"] + 1)}), encoding="utf-8")
+        with self.assertRaises(relay.SecretUnavailable) as caught:
+            relay.read_secret(self.dir)
+        self.assertIn("is larger than %d bytes" % PROTOCOL["maxRendezvousBytes"], str(caught.exception))
+
+    def test_tmp_symlink_is_never_followed(self):
+        victim = self.dir / "victim"
+        victim.write_text("untouched", encoding="utf-8")
+        tmp = self.dir / (".%s.%d.tmp" % (RDV["relayFile"], 4242))
+        os.symlink(str(victim), str(tmp))
+        relay.write_host_json(self.dir, "127.0.0.1:7077", 4242)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "untouched")
+        written = self.dir / RDV["relayFile"]
+        self.assertFalse(written.is_symlink())
+        self.assertEqual(json.loads(written.read_text(encoding="utf-8"))["pid"], 4242)
+        os.symlink(str(self.dir / "nowhere"), str(tmp))  # dangling
+        relay.write_host_json(self.dir, "127.0.0.1:7077", 4242)
+        self.assertFalse((self.dir / "nowhere").exists())
 
 
 class FakeTransport:

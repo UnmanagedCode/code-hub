@@ -14,7 +14,7 @@ import { _setContainerProbe } from '../src/net.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
 import {
   REPO_ROOT, RELAY_PROTOCOL as PROTOCOL, requirePython, startRelay, runRelay, patchedRelayDir, canConnect, waitFor,
-  mkRoot, rmRoot, relayLogin, relaySecret, protoMac, frameStream, tcpConnect, ALT_LOOPBACK, altLoopbackBindable,
+  mkRoot, rmRoot, relayLogin, relaySecret, protoMac, frameStream, tcpConnect, ALT_LOOPBACK, altLoopbackBindable, listeningAddrs,
 } from './helpers.mjs';
 
 // The real Python relay (relay/relay.py) over loopback, driven by a raw
@@ -622,7 +622,9 @@ test('V17: the code-hub relay modules restate no protocol identifier', () => {
 });
 
 // Invariant (S10): scope confinement on the real relay — a loopback pair is
-// reachable on 127.0.0.1 only, a LAN pair on the advertised address only.
+// bound on 127.0.0.1 only, a LAN pair on the advertised address only. Asserted
+// on what the relay process itself listens on (/proc), so another process on
+// the same port of the other address can't make the check pass or fail.
 test('V18: loopback scope binds 127.0.0.1 only, lan scope the advertised address only', async (t) => {
   if (!requirePython(t)) return;
   if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
@@ -634,10 +636,12 @@ test('V18: loopback scope binds 127.0.0.1 only, lan scope the advertised address
   assert.deepEqual(status.addresses, [ALT_LOOPBACK]);
   const h1 = entryFor(status, p1, SCOPES.lan).hostPort;
   const h2 = entryFor(status, p2, SCOPES.loopback).hostPort;
+  const bound = await listeningAddrs(relay.proc.pid);
+  assert.ok(bound.has(`127.0.0.1:${h2}`) && !bound.has(`${ALT_LOOPBACK}:${h2}`), [...bound].join(' '));
+  assert.ok(bound.has(`${ALT_LOOPBACK}:${h1}`) && !bound.has(`127.0.0.1:${h1}`), [...bound].join(' '));
+  assert.equal([...bound].filter((a) => a.endsWith(`:${h1}`) || a.endsWith(`:${h2}`)).length, 2, 'nothing else, no wildcard');
   assert.equal(await canConnect(h2, '127.0.0.1'), true);
-  assert.equal(await canConnect(h2, ALT_LOOPBACK), false);
   assert.equal(await canConnect(h1, ALT_LOOPBACK), true);
-  assert.equal(await canConnect(h1, '127.0.0.1'), false);
 });
 
 // Invariant (S5): pending host clients are capped per port and per session;
@@ -675,4 +679,187 @@ test('V19: the incoming caps cut excess clients at once and keep the rest claima
   assert.equal(claim.reply.t, F.welcome);
   claim.socket.end('claimed');
   assert.equal((await got).data, 'claimed');
+});
+
+// Invariant (S4): the relay's silence timer restarts on every frame — a peer
+// that keeps answering stays connected across several keepalive windows, and
+// one that stops is dropped within one.
+test('V20: a responsive hub keeps its session across keepalive windows; silence ends it', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relayDir = await patchedRelayDir(t, { pingIntervalMs: 100, keepaliveTimeoutMs: 400 });
+  const relay = await relayFor(t, { projectsRoot: root, relayDir });
+  const s = await control(t, relay, secret);
+  const port = await freePort();
+  const hostPort = entryFor(await sendPorts(s, [{ port, scope: SCOPES.loopback }]), port, SCOPES.loopback).hostPort;
+  const end = Date.now() + 1600; // four windows
+  while (Date.now() < end) {
+    const f = await s.frames.next(500);
+    assert.notEqual(f, null, 'the relay closed a session that kept answering');
+    if (f.t === F.ping) s.socket.write(`${JSON.stringify({ t: F.pong })}\n`);
+  }
+  assert.equal(await canConnect(hostPort), true);
+  const quietSince = Date.now();
+  await s.frames.closed;
+  const quiet = Date.now() - quietSince;
+  assert.ok(quiet < 1500, `dropped ${quiet}ms after going quiet`);
+});
+
+// Invariant (S5): a handshake that ends — refused for a wrong MAC or a bad
+// frame, or timed out — gives its pre-auth slot back, so a full cap's worth of
+// failures never locks code-hub out.
+test('V21: refused and timed-out handshakes release their pre-auth slots', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relayDir = await patchedRelayDir(t, { maxPendingHandshakes: 2, handshakeTimeoutMs: 400 });
+  const relay = await relayFor(t, { projectsRoot: root, relayDir });
+  const welcomed = async () => {
+    const s = await relayLogin(relay.port, secret);
+    s.socket.destroy();
+    return s.reply.t;
+  };
+  for (let i = 0; i < 3; i++) {
+    const bad = await relayLogin(relay.port, 'w'.repeat(43));
+    assert.equal(bad.reply.code, E.authFailed);
+    await bad.frames.closed;
+  }
+  assert.equal(await welcomed(), F.welcome, 'after cap-many refused MACs');
+  for (let i = 0; i < 3; i++) {
+    const bad = await relayLogin(relay.port, secret, { authOver: { mac: 5 } });
+    assert.equal(bad.reply.code, E.badFrame);
+    await bad.frames.closed;
+  }
+  assert.equal(await welcomed(), F.welcome, 'after cap-many bad frames');
+  const silent = [];
+  for (let i = 0; i < 2; i++) {
+    const c = await tcpConnect(relay.port);
+    const frames = frameStream(c);
+    assert.equal((await frames.next()).t, F.hello);
+    silent.push(frames.closed);
+  }
+  await Promise.all(silent);
+  assert.equal(await welcomed(), F.welcome, 'after cap-many timeouts');
+});
+
+const nonceLen = Math.ceil((PROTOCOL.nonceBytes * 8) / 6);
+
+// Invariant (S5): the relay validates the peer's nonce — wrong length or a
+// character outside base64url is bad_frame even with a MAC correctly computed
+// over that very nonce.
+test('V22: a malformed hub nonce is bad_frame, whatever the MAC', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  for (const bad of ['a'.repeat(nonceLen - 1), 'a'.repeat(nonceLen + 1), `${'a'.repeat(nonceLen - 1)}+`, `${'a'.repeat(nonceLen - 1)}=`]) {
+    const s = await relayLogin(relay.port, secret, { authOver: (hello) => ({ nonce: bad, mac: protoMac(secret, LABELS.hub, ROLES.control, hello.nonce, bad) }) });
+    assert.deepEqual([s.reply.t, s.reply.code], [F.error, E.badFrame], bad);
+  }
+  const good = await relayLogin(relay.port, secret);
+  assert.equal(good.reply.t, F.welcome, 'the same path with a good nonce');
+  good.socket.destroy();
+});
+
+// Invariant (S5): the auth frame's shape is exact — an extra key, a missing
+// key or a mistyped value is bad_frame, MAC notwithstanding.
+test('V23: an auth with an extra, missing or mistyped key is bad_frame', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const variants = [
+    { authOver: { extra: 1 } },
+    { authOver: { mac: undefined } }, // JSON.stringify drops it: missing
+    { authOver: { nonce: 5 } },
+    { authOver: { role: 'admin' } },
+    { authOver: { session: 'x'.repeat(16) } }, // control role with data keys
+    { role: ROLES.data, session: 'x'.repeat(16), conn: 'y'.repeat(16), authOver: { conn: undefined } },
+    { role: ROLES.data, session: 'x'.repeat(16), conn: 'y'.repeat(16), authOver: { conn: 7 } },
+  ];
+  for (const v of variants) {
+    const s = await relayLogin(relay.port, secret, v);
+    assert.deepEqual([s.reply.t, s.reply.code], [F.error, E.badFrame], JSON.stringify(v));
+  }
+});
+
+// Invariant (S5): a version mismatch is reported as one — distinct from an
+// authentication failure — even with a valid MAC.
+test('V24: an auth of another protocol version gets version_mismatch, not auth_failed', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const s = await relayLogin(relay.port, secret, { authOver: { v: PROTOCOL.protocolVersion + 1 } });
+  assert.deepEqual([s.reply.t, s.reply.code], [F.error, E.versionMismatch]);
+  assert.match(s.reply.message, /update the relay\/ copy on the host/);
+  const wrongSecret = await relayLogin(relay.port, 'w'.repeat(43));
+  assert.equal(wrongSecret.reply.code, E.authFailed, 'the contrast: same version, wrong MAC');
+});
+
+// Invariant: startup failures say what really failed — a rendezvous dir or
+// store the relay can't write names the path and says to run it as the owner
+// (never "cannot listen"); a busy --listen is "cannot listen".
+test('V25: store permission failures and a busy --listen each give their own message', { skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'needs POSIX permissions enforced (not root)' : false }, async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  const rdir = path.join(root, '.code-hub', PROTOCOL.rendezvous.dir);
+  await fs.chmod(rdir, 0o500);
+  t.after(() => fs.chmod(rdir, 0o700).catch(() => {}));
+  const unwritable = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1', '--projects-root', root]);
+  assert.notEqual(unwritable.code, 0);
+  assert.match(unwritable.stderr, new RegExp(`cannot write \\S*${PROTOCOL.rendezvous.relayFile}: Permission denied — run the relay as the user that owns`));
+  assert.doesNotMatch(unwritable.stderr, /cannot listen/);
+  await fs.chmod(rdir, 0o700);
+
+  const bare = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-bare-'));
+  t.after(async () => { await fs.chmod(path.join(bare, '.code-hub'), 0o700).catch(() => {}); await fs.rm(bare, { recursive: true, force: true }); });
+  await fs.mkdir(path.join(bare, '.code-hub'), { mode: 0o500 });
+  const noDir = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1', '--projects-root', bare]);
+  assert.notEqual(noDir.code, 0);
+  assert.match(noDir.stderr, /cannot create \S+: Permission denied — run the relay as the user that owns/);
+
+  const busy = net.createServer();
+  await new Promise((r) => busy.listen(0, '127.0.0.1', r));
+  t.after(() => busy.close());
+  const taken = await runRelay(['--listen', `127.0.0.1:${busy.address().port}`, '--advertise', '127.0.0.1', '--projects-root', root]);
+  assert.notEqual(taken.code, 0);
+  assert.match(taken.stderr, new RegExp(`cannot listen on 127\\.0\\.0\\.1:${busy.address().port}: Address already in use`));
+});
+
+// Invariant: a repeated --advertise address is bound once — LAN pairs bind
+// and the advertised list carries it once.
+test('V26: a duplicated --advertise address still binds lan pairs, listed once', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root, advertise: '127.0.0.1,127.0.0.1' });
+  const s = await control(t, relay, secret);
+  const port = await freePort();
+  const status = await sendPorts(s, [{ port, scope: SCOPES.lan }]);
+  assert.deepEqual(status.addresses, ['127.0.0.1']);
+  assert.deepEqual(entryFor(status, port, SCOPES.lan), { port, scope: SCOPES.lan, hostPort: port, fallback: false });
+});
+
+// Equality comparisons in JS source: { left, op, right } per `a OP b`.
+const equalities = (src) => [...src.matchAll(/([\w.$[\]'"`]+)\s*(===|!==|==|!=)\s*([\w.$[\]'"`]+)/g)].map((m) => ({ left: m[1], op: m[2], right: m[3] }));
+const fnBody = (src, name) => {
+  const start = src.indexOf(`function ${name}(`);
+  return start < 0 ? null : src.slice(start, src.indexOf('\n}', start) + 2);
+};
+// A comparison touching a MAC value: an operand naming one.
+const onMac = (e) => [e.left, e.right].some((x) => /mac|proof/i.test(x));
+// What verifyMac may compare with an equality: lengths and a typeof check.
+const allowedInVerify = (e) => [e.left, e.right].every((x) => /\.length$|^typeof$|^given$|^'string'$/.test(x)) && !(/^given$/.test(e.left) && /^given$/.test(e.right));
+
+// Invariant (S5): MACs are compared only in constant time — verifyMac goes
+// through crypto.timingSafeEqual and compares nothing else but lengths, and no
+// code-hub relay module compares a MAC value with an equality operator.
+test('V27: code-hub compares MACs only through timingSafeEqual', () => {
+  const planted = 'export function verifyMac(expected, given) {\n  const g = given;\n  return g === expected;\n}\nconst ok = reply.mac !== mine;';
+  assert.equal(fnBody(planted, 'verifyMac').includes('timingSafeEqual('), false);
+  assert.ok(equalities(fnBody(planted, 'verifyMac')).some((e) => !allowedInVerify(e)), 'the scanner flags a plain compare in verifyMac');
+  assert.ok(equalities(planted).some(onMac), 'the scanner flags a MAC compared outside it');
+  const session = readFileSync(path.join(REPO_ROOT, 'src', 'relaySession.js'), 'utf8');
+  const verify = fnBody(session, 'verifyMac');
+  assert.ok(verify && verify.includes('crypto.timingSafeEqual('), 'verifyMac uses timingSafeEqual');
+  assert.deepEqual(equalities(verify).filter((e) => !allowedInVerify(e)), []);
+  for (const file of ['relaySession.js', 'hostRelay.js']) {
+    assert.deepEqual(equalities(readFileSync(path.join(REPO_ROOT, 'src', file), 'utf8')).filter(onMac), [], file);
+  }
 });

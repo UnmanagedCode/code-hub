@@ -351,7 +351,8 @@ const lanShare = (over: Partial<Tunnel> = {}): Tunnel => ({ kind: 'lan', url: 'h
 
 // Invariant: each relay state maps to its notice level and says what the user needs — host exposure with the
 // port fallback when it happened, a retrying outage with its reason when there is one (and no empty parenthesis
-// when there isn't), the failure reason (plus the container sentence when the
+// when there isn't) — a retry promised only while one is coming (recovery 'retrying'), else the wait for the
+// relay's host.json to change or for the port to be bound — the failure reason (plus the container sentence when the
 // addresses are container-internal), the container warning with no relay, and nothing otherwise.
 test('resolveLanReachNotice: one row per relay state', () => {
   const up = resolveLanReachNotice(lanShare({ relay: relay() }));
@@ -368,6 +369,18 @@ test('resolveLanReachNotice: one row per relay state', () => {
   const downNoReason = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: null }) }));
   expect(downNoReason?.text).toMatch(/host relay isn't connected; code-hub keeps retrying/);
   expect(downNoReason?.text).not.toMatch(/\(/);
+
+  // Only a retrying state promises a retry: an unusable host.json waits for the
+  // file to change, and a connected relay that hasn't bound the port yet says so.
+  const waitingFile = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'the relay on the host speaks protocol 1', recovery: 'relay-file' }) }));
+  expect(waitingFile?.level).toBe('warn');
+  expect(waitingFile?.text).toMatch(/host relay can't be used \(the relay on the host speaks protocol 1\); code-hub waits for the relay's host\.json to change/);
+  expect(waitingFile?.text).not.toMatch(/retrying/);
+  const binding = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'waiting for the relay to bind the port', recovery: 'binding' }) }));
+  expect(binding?.text).toMatch(/hasn't bound this share's port yet/);
+  expect(binding?.text).not.toMatch(/retrying|isn't connected/);
+  const retrying = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'connect ECONNREFUSED', recovery: 'retrying' }) }));
+  expect(retrying?.text).toMatch(/isn't connected \(connect ECONNREFUSED\); code-hub keeps retrying/);
 
   const failed = resolveLanReachNotice(lanShare({ relay: relay({ state: 'failed', error: 'connect ECONNREFUSED' }) }));
   expect(failed?.level).toBe('warn');

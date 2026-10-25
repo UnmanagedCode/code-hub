@@ -15,7 +15,8 @@ import { runningInContainer, defaultGatewayIPv4 } from './net.js';
 //
 // State machine: off → (init in a container) absent ⇄ connecting → up, with
 // retrying (an error and a backoff timer) after a failed attempt or a lost
-// session. An unusable relay file waits for the file to change instead.
+// session, and waiting (an error, no timer) for an unusable relay file, which
+// is retried only once the file changes.
 export const SCOPES = PROTOCOL.scopes;
 const FRAMES = PROTOCOL.frames;
 const SCOPE_VALUES = new Set(Object.values(SCOPES));
@@ -155,7 +156,7 @@ async function evaluate() {
     const host = await relayStore.readHost();
     if (myGen !== gen) return;
     if (!host) { setState('absent', null); return; }
-    if (host.error) { setState('retrying', host.error); return; } // until the file changes
+    if (host.error) { setState('waiting', host.error); return; } // no timer: until the file changes
     setState('connecting', error);
     let secret;
     try { secret = await relayStore.ensureSecret(); } catch (e) { if (myGen === gen) scheduleRetry(e.message); return; }
@@ -241,12 +242,13 @@ function onIncoming(f) {
   if (!inPortRange(f.port) || !SCOPE_VALUES.has(f.scope) || !ID_RE.test(f.conn)) throw new Error('an incoming frame is malformed');
   const handles = exposures.get(pairKey(f.port, f.scope));
   if (!handles?.size) return; // unexposed meanwhile: the relay drops the client after --accept-wait-ms
-  const target = [...handles].at(-1).target;
+  const newest = [...handles].at(-1);
   const s = session;
   const closer = openData({
     host: s.dial.host, port: s.dial.port, secret: s.secret, limiter,
-    session: s.id, conn: f.conn, target,
+    session: s.id, conn: f.conn, target: newest.target,
     onClose: () => pipes.delete(closer),
+    onTargetError: () => newest.onUnreachable(),
   });
   pipes.add(closer);
 }
@@ -261,14 +263,17 @@ function sendPorts() {
   session.send({ t: FRAMES.ports, ports });
 }
 
+// The API's RelayInfo. `recovery` says what a `down` pair is waiting on:
+// 'retrying' (connection attempts with backoff), 'relay-file' (no attempt
+// until the relay's host file changes) or 'binding' (the relay's answer).
 function infoFor(h) {
   if (state === 'off' || state === 'absent') return null;
-  const down = (why) => ({ state: 'down', error: why, port: null, requestedPort: h.port, portFallback: false });
-  if (state !== 'up') return down(error);
+  const down = (why, recovery) => ({ state: 'down', error: why, port: null, requestedPort: h.port, portFallback: false, recovery });
+  if (state !== 'up') return down(error, state === 'waiting' ? 'relay-file' : 'retrying');
   const s = statuses.get(h.key);
-  if (!s) return down('waiting for the relay to bind the port');
-  if ('code' in s) return { state: 'failed', error: s.message, port: null, requestedPort: h.port, portFallback: false };
-  return { state: 'up', error: null, port: s.hostPort, requestedPort: h.port, portFallback: s.fallback };
+  if (!s) return down('waiting for the relay to bind the port', 'binding');
+  if ('code' in s) return { state: 'failed', error: s.message, port: null, requestedPort: h.port, portFallback: false, recovery: null };
+  return { state: 'up', error: null, port: s.hostPort, requestedPort: h.port, portFallback: s.fallback, recovery: null };
 }
 
 // What a handle's owner sees: its info, plus the addresses for a LAN pair
@@ -299,13 +304,14 @@ function waitStatus(key) {
 // Expose container `port` in `scope` (a value of SCOPES): host clients reach
 // `target` ({ host, port }) through the relay while a session is up.
 // onChange() fires whenever info() — or, for a LAN pair, the advertised
-// addresses — changes. `ready` resolves once the relay reported on this pair,
+// addresses — changes; onUnreachable() whenever a client's connection to
+// `target` is refused. `ready` resolves once the relay reported on this pair,
 // after STATUS_WAIT_MS, or at once when no session is up. close() is idempotent.
-export function expose(port, scope, target, onChange = () => {}) {
+export function expose(port, scope, target, onChange = () => {}, { onUnreachable = () => {} } = {}) {
   if (!SCOPE_VALUES.has(scope)) throw new Error(`unknown relay scope ${JSON.stringify(scope)}`);
   if (!inPortRange(port)) throw new Error(`port ${port} is outside the relay's port range`);
   const key = pairKey(port, scope);
-  const h = { key, port, scope, target, onChange, last: null };
+  const h = { key, port, scope, target, onChange, onUnreachable, last: null };
   const isNew = !exposures.has(key);
   if (isNew) exposures.set(key, Object.assign(new Set(), { since: portsSent + 1 }));
   exposures.get(key).add(h);

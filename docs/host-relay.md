@@ -29,7 +29,7 @@ Without a relay, a LAN share from such a container is flagged container-internal
 | Linux / macOS | `python3 relay/relay.py` |
 | Windows | `py -3 relay\relay.py` |
 
-No flags and no environment variables. Start the relay and code-hub in either order; they find each other.
+No flags needed (the optional ones are under Configuration), and no environment variables. Start the relay and code-hub in either order; they find each other.
 
 - Windows: if `python3` opens the Microsoft Store, that is the App Execution Alias stub — install Python from python.org and use `py`.
 - macOS: the first `python3` may prompt to install the Command Line Tools; accept, they provide 3.9.
@@ -42,6 +42,7 @@ The relay finds code-hub's store by walking **up from its own script's directory
 
 - `--projects-root <dir>` overrides the walk: the store is `<dir>/.code-hub`, which must exist.
 - Finding none exits non-zero: `code-hub-relay: no .code-hub found in any parent of <script dir> (searched: <dirs…>) — start code-hub once so it creates <projectsRoot>/.code-hub, or pass --projects-root <dir>`.
+- A rendezvous dir or file the relay can't create, write or read exits (at startup) or refuses connections (the secret) with `cannot <create|write|read> <path>: <cause>`; for a permission failure it adds `— run the relay as the user that owns <dir>`. Only a failed control bind is reported as `cannot listen on <listen>: <cause>`.
 
 ### Rendezvous files
 
@@ -53,6 +54,8 @@ Both live in `<projectsRoot>/.code-hub/relay/` (names from `rendezvous` in `prot
 | `host.json` | the relay, at startup (atomically, `0600`) | Where the relay listens, and its pid. Removed on a clean exit. |
 
 code-hub watches `host.json` (filesystem events plus a content poll every `HOST_POLL_MS` in `src/relayStore.js`, since Docker Desktop bind mounts often drop host-side events) and connects whenever it appears or changes.
+
+Either side reads a rendezvous file only when it is a regular file of at most `maxRendezvousBytes` (`protocol.json`), opened non-blocking — a FIFO, device or oversize file is reported as unusable and never read. Both write through a tmp file created exclusively in the same dir and renamed into place, so a symlink planted at the tmp path is removed, never written through.
 
 ## Per-platform setup
 
@@ -73,8 +76,9 @@ code-hub watches `host.json` (filesystem events plus a content poll every `HOST_
 | `loopback` | every running app's own port | `127.0.0.1` only | **none** — the same trust as an ordinary local dev server |
 
 - **Same port where free.** Each is bound at its container port when that is free on the host, else at a free one; the share panel ("Port N was busy on the host, so it is on port M there") and the app's Start URL show the port actually used. A devcontainer port-forward (VS Code's, for one) often holds the same host port already, so a fallback for mirrors is common and expected.
-- **Loopback mirrors** appear once the app is **ready** (its readiness check passed — `readyWhen`, `healthPath` or the default TCP probe — or, for an app adopted after a code-hub restart, its process is alive), never while it is still starting: where the host's loopback is the app's own (a host-network container), a relay listener bound first would take the app's port. The always-on host code-conductor is never mirrored. A stopped, crashed or exited app's mirror closes at once.
-- While an app is mirrored, its **Start URL** (the first URL of the app and of each route) is `http://127.0.0.1:<host port>`; otherwise `http://localhost:<port>`.
+- **Loopback mirrors** appear once the app is **ready** (its readiness check passed — `readyWhen`, `healthPath` or the default TCP probe — or, for an app adopted after a code-hub restart, its process is alive), never while it is still starting: where the host's loopback is the app's own (a host-network container), a relay listener bound first would take the app's port. The always-on host code-conductor is never mirrored.
+- **A mirror closes** at once when its app is stopped or restarted, or when an app code-hub started crashes or exits. An **adopted** app (running from before a code-hub restart, so no child of code-hub's exits when it dies) that dies keeps its mirror until a host client connects to it: that client's connection to the app's port is refused, and code-hub then re-checks the app and drops the mirror.
+- While an app is mirrored, its **Start URL** is `http://127.0.0.1:<host port>` — the app's first URL — and each route's first URL is that base plus the route's path (`http://127.0.0.1:<host port><path>`; `/` adds nothing); otherwise `http://localhost:<port>` likewise.
 - **No periodic refresh**: a relay connecting or dropping changes share URLs and Start URLs server-side, and `GET /api/apps` reflects it within seconds; the page shows it on **Refresh** or when you return to the tab.
 
 ## Advertised address and `--advertise`
@@ -90,7 +94,7 @@ Pass `--advertise <ip>[,<ip>…]` when:
 - the host has **no default route** (offline, no DHCP);
 - your LAN genuinely uses CGNAT space.
 
-`--advertise` values must be IPv4 literals and not a wildcard (at most `maxAddresses` in `protocol.json`); they are otherwise taken as given.
+`--advertise` values must be IPv4 literals and not a wildcard (at most `maxAddresses` in `protocol.json`); a repeated address counts once (order kept), and they are otherwise taken as given.
 
 ## Configuration
 
@@ -107,19 +111,19 @@ Timings and caps (`pingIntervalMs`, `keepaliveTimeoutMs`, `handshakeTimeoutMs`, 
 ## Lifecycle
 
 - **Any start order.** code-hub provisions `relay.json` on every boot; the relay publishes `host.json` once listening. A relay started first waits for the secret (it re-reads it on every connection); a code-hub started first connects as soon as `host.json` appears.
-- **One session.** code-hub holds one authenticated control session and sends the full set of exposures over it on connect and on every change. A failed attempt retries with doubling backoff (`BACKOFF_BASE_MS` up to `BACKOFF_CAP_MS` in `src/hostRelay.js`); a `host.json` change retries at once. A `host.json` of another protocol version is reported (`update the relay/ copy on the host`) and not dialled until it changes.
+- **One session.** code-hub holds one authenticated control session and sends the full set of exposures over it on connect and on every change. A failed attempt retries with doubling backoff (`BACKOFF_BASE_MS` up to `BACKOFF_CAP_MS` in `src/hostRelay.js`); a `host.json` change retries at once. A `host.json` that can't be used — another protocol version (`update the relay/ copy on the host`), invalid, unreadable — is reported and **not retried**: code-hub waits for the file to change, and the share panel says so instead of promising a retry.
 - **Session-scoped exposure.** Every host listener belongs to the session: it closes when the session ends — code-hub exits or is killed (the socket closes), freezes (both sides ping every `pingIntervalMs`; silence past `keepaliveTimeoutMs` ends the session), or a newer code-hub session replaces it — and comes back when code-hub reconnects.
 - **A relay restart** ends the session: shares fall back to their container URLs and Start URLs to `localhost`, then return once code-hub reconnects to the new relay — no action in code-hub.
 
 ## Running it as a service (Linux)
 
-A sample systemd **system** unit (a user unit can't order itself after `docker.service`); replace the placeholders. No `--listen` is needed: the default finds `docker0`.
+A sample systemd **system** unit (a user unit can't order itself after `docker.service`); replace the placeholders. No `--listen` is needed when `docker0` exists by the time the relay starts — hence the ordering after Docker.
 
 ```ini
 [Unit]
 Description=code-hub host relay
 After=network-online.target docker.service
-Wants=network-online.target
+Wants=network-online.target docker.service
 
 [Service]
 User=<the user that owns <projectsRoot>/.code-hub>
@@ -131,7 +135,8 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-`Restart=on-failure` covers `docker0` or the store not being there yet at boot.
+- `Restart=on-failure` covers code-hub's store not being there yet at boot (the relay exits until code-hub has created `<projectsRoot>/.code-hub`).
+- It does **not** cover a missing `docker0`: without one the relay listens on `127.0.0.1:7077` and stays up — healthy to systemd, unreachable from a native-Linux container. The `After=`/`Wants=docker.service` ordering is what makes `docker0` exist first; if Docker can start later than the relay on your host, pass `--listen <docker0 address>:7077` instead, so a missing `docker0` fails the start and is retried.
 
 ## Security model
 
@@ -143,7 +148,7 @@ WantedBy=multi-user.target
 - **TLS end to end** for LAN shares: the relay never imports `ssl`; LAN devices talk TLS straight to code-hub's per-share self-signed cert, whose SAN includes the advertised host address (re-issued in place when the relay advertises one the share didn't know).
 - **Control listener off the LAN.** `--listen` is refused when it is a wildcard, or a non-loopback address equal to an advertised address or to the host's default-route address (probed even when `--advertise` is given). Every address is canonicalised once at startup, and that canonical form is both what is checked and what is bound; the check runs before any listening socket is bound. A loopback `--listen` is always allowed.
 - **What the secret grants**: holding a session — listening on the advertised addresses and on `127.0.0.1` at ports from `port.min` to `port.max`, and carrying whatever the holder pipes into them — never reaching into the LAN.
-- **Out of scope**: an attacker on the host able to hold every pre-auth slot can delay code-hub's handshakes by up to `handshakeTimeoutMs` per slot — a local denial of service.
+- **Out of scope**: anything that can reach the control listener — a process on the host, and any container on the host's Docker networks (a native-Linux `docker0` listen is reachable from every bridge container; on Docker Desktop, every container reaches the host's loopback listener through `host.docker.internal`) — can hold every pre-auth slot and so delay code-hub's handshakes by up to `handshakeTimeoutMs` per slot: a denial of service from co-located containers or processes, not a bypass of the challenge-response.
 
 ## Limitations
 

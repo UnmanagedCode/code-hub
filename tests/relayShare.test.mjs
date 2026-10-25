@@ -320,16 +320,18 @@ test('W9: outside a container code-hub never dials, even with a valid relay file
   assert.equal(portOf(s.url), s.proxyPort);
 });
 
-// Invariant (S5): a burst well past the relay's old fixed cap of 8 — 24
-// concurrent clients over two shares, against the unpatched relay — all get
-// through, because code-hub's own handshake bound stays under the relay's cap.
-test('B1: 24 concurrent clients over two shares all complete through the real relay', async (t) => {
+// Invariant (S5): a burst well past maxHubHandshakes — three times as many
+// concurrent clients, over two shares, against the unpatched relay — all get
+// through: code-hub queues its handshakes under its own bound, which stays
+// below the relay's pre-auth cap.
+test('B1: a burst of 3 × maxHubHandshakes clients over two shares all complete through the real relay', async (t) => {
   if (!requirePython(t)) return;
   const { root, base } = await boot(t, { ids: ['app', 'two'] });
   await relayFor(t, { projectsRoot: root });
   await waitFor(() => hostRelay.status().state === 'up', { timeout: 4000 });
   const urls = [];
   for (const id of ['app', 'two']) urls.push((await share(base, { tls: false, auth: false }, id)).body.url);
-  const results = await Promise.all(Array.from({ length: 24 }, (_, i) => hit(urls[i % 2]).then((r) => r.status, (e) => e.message)));
-  assert.deepEqual(results, Array(24).fill(200));
+  const burst = 3 * P.maxHubHandshakes;
+  const results = await Promise.all(Array.from({ length: burst }, (_, i) => hit(urls[i % 2]).then((r) => r.status, (e) => e.message)));
+  assert.deepEqual(results, Array(burst).fill(200));
 });

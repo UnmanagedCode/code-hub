@@ -289,9 +289,10 @@ function funnelBlockedBy(id) {
 
 // The loopback mirror set is derived from the store each mutation persists:
 // every ready app but the always-on host conductor (code-hub never started
-// it). Also run when a start's readiness settles (see start()) and when a
-// child exits (see runner.onExit below), so a crash drops its mirror without
-// waiting for a persist.
+// it). Also run when a start's readiness settles (see start()), when a child
+// exits (see runner.onExit below), so a crash drops its mirror without waiting
+// for a persist, and when a host client finds a mirrored port refusing — the
+// one signal that an ADOPTED app (no child of ours to exit) has died.
 async function persist() {
   syncMirrors();
   await state.save(store);
@@ -309,7 +310,7 @@ function appMirrorable(rec) {
 function syncMirrors() {
   loopbackMirror.sync(Object.values(store.apps)
     .filter((rec) => !isHostConductorId(rec.id) && appMirrorable(rec))
-    .map((rec) => ({ id: rec.id, port: rec.port })));
+    .map((rec) => ({ id: rec.id, port: rec.port })), syncMirrors);
 }
 
 runner.onExit(() => syncMirrors());

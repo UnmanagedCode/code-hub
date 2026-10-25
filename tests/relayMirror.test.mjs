@@ -12,8 +12,12 @@ import { _setContainerProbe } from '../src/net.js';
 import { unregisterInMemory } from '../src/projects.js';
 import {
   requirePython, startRelay, canConnect, waitFor, useConductorOverlay, resetConductorOverlay,
-  mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ALT_LOOPBACK, altLoopbackBindable,
+  mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ALT_LOOPBACK, altLoopbackBindable, listeningAddrs,
 } from './helpers.mjs';
+import * as loopbackMirror from '../src/loopbackMirror.js';
+import { storeRoot } from '../src/projects.js';
+import { spawn } from 'node:child_process';
+import net from 'node:net';
 
 // Loopback mirrors (S10): every running app's port, mirrored onto the host's
 // 127.0.0.1 by the real relay, driven by an in-process code-hub in a
@@ -165,21 +169,60 @@ test('M5: a session drop closes every mirror', async (t) => {
   for (const p of ports) await waitFor(async () => !(await canConnect(p)), { timeout: 2000 });
 });
 
-// Invariant (S10): end-to-end scope confinement — a mirror is not reachable on
-// the advertised address, and a LAN share is not reachable on loopback.
+// Invariant (S10): end-to-end scope confinement — a mirror is bound on
+// loopback only, and a LAN share on the advertised address only. Asserted on
+// what the relay process itself listens on (/proc), so another process on the
+// same port of the other address can't make the check pass or fail.
 test('M6: a mirror is loopback-only and a LAN share is advertised-address-only', async (t) => {
   if (!requirePython(t)) return;
   if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
-  const { base } = await boot(t, { advertise: ALT_LOOPBACK });
+  const { base, relay } = await boot(t, { advertise: ALT_LOOPBACK });
   await startApp();
   const h = await mirrorPort(base);
-  assert.equal(await canConnect(h, '127.0.0.1'), true);
-  assert.equal(await canConnect(h, ALT_LOOPBACK), false);
   const s = await appManager.share('app', { mode: 'lan', tls: false });
   assert.equal(s.relay.state, 'up');
   assert.equal(s.url, `http://${ALT_LOOPBACK}:${s.relay.port}`);
+  const bound = await listeningAddrs(relay.proc.pid);
+  assert.ok(bound.has(`127.0.0.1:${h}`) && !bound.has(`${ALT_LOOPBACK}:${h}`), [...bound].join(' '));
+  assert.ok(bound.has(`${ALT_LOOPBACK}:${s.relay.port}`) && !bound.has(`127.0.0.1:${s.relay.port}`), [...bound].join(' '));
+  assert.equal(await canConnect(h, '127.0.0.1'), true);
   assert.equal(await canConnect(s.relay.port, ALT_LOOPBACK), true);
-  assert.equal(await canConnect(s.relay.port, '127.0.0.1'), false);
+});
+
+// Invariant (S10): an ADOPTED app (running from before a code-hub restart, so
+// no child of this process exits when it dies) that dies loses its mirror as
+// soon as a host client finds its port refusing — with no API call and no
+// store change.
+test('M8: a dead adopted app\'s mirror closes on the first refused client', async (t) => {
+  if (!requirePython(t)) return;
+  const conns = new Set();
+  const app = net.createServer((sock) => { conns.add(sock); sock.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok'); });
+  await new Promise((r) => app.listen(0, '127.0.0.1', r));
+  t.after(() => app.close());
+  const sleeper = spawn(process.execPath, ['-e', 'setInterval(()=>{}, 1e9)'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-sleeper.pid, 'SIGKILL'); } catch { /* gone */ } });
+  const { relay } = await boot(t, {
+    ids: [],
+    beforeInit: async (root) => {
+      await mkProject(root, 'app', { start: fakeAppCmd() });
+      await fs.mkdir(storeRoot(), { recursive: true });
+      const rec = { id: 'app', project: 'app', path: path.join(root, 'app'), isWorktree: false, branch: null, pid: sleeper.pid, pgid: sleeper.pid,
+        port: app.address().port, fixedPort: null, startedSha: null, startedAt: null, tunnel: null };
+      await fs.writeFile(path.join(storeRoot(), 'state.json'), JSON.stringify({ apps: { app: rec } }));
+    },
+  });
+  await waitFor(() => loopbackMirror.hostPort('app') !== null, { timeout: 3000 });
+  const h = loopbackMirror.hostPort('app');
+  const appPort = app.address().port;
+  assert.deepEqual(await get(h), { status: 200, body: 'ok' });
+  process.kill(-sleeper.pid, 'SIGKILL');
+  app.close();
+  for (const c of conns) c.destroy();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(loopbackMirror.hostPort('app'), h, 'nothing else noticed the death');
+  await canConnect(h); // a host client: its data connection finds the app's port refusing
+  await waitFor(() => loopbackMirror.hostPort('app') === null, { timeout: 2000 });
+  await waitFor(() => new RegExp(`closed loopback port ${appPort} \\(host port ${h}\\)`).test(relay.output().stderr), { timeout: 2000 });
 });
 
 // Invariant (S10): a mirror appears only once the app is ready — never while
