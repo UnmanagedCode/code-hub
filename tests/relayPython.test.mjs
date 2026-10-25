@@ -11,7 +11,7 @@ test('relay suite has a Python interpreter', (t) => {
   assert.ok(findPython().ok);
 });
 
-// Invariant: the relay's Python unit tests (tests/python, P1–P8) pass under the interpreter npm test uses.
+// Invariant: the relay's Python unit tests (tests/python) pass under the interpreter npm test uses.
 test('relay Python unit tests pass', (t) => {
   if (!requirePython(t)) return;
   const py = findPython();

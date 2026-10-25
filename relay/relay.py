@@ -163,7 +163,7 @@ def ip_problem(ip, listen_host=None):
     if addr in THIS_NETWORK:
         return "unspecified"
     if addr.is_loopback:
-        return "loopback"
+        return "loopback address"
     if addr.is_link_local:
         return "link-local"
     if addr.is_multicast:
