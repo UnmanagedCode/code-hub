@@ -1,15 +1,19 @@
 """code-hub host relay.
 
-Runs on the Docker HOST and exposes a containerised code-hub's LAN share on the
-host's own LAN address. code-hub dials OUT to this relay and parks upgraded
-HTTP connections ("accepts") on a forward; each LAN connection to the forward's
-port is spliced byte-for-byte onto one parked accept. The relay never dials
-anything itself, never terminates TLS and never learns where code-hub sends the
-bytes. Python 3.9+, standard library only.
+Runs on the Docker HOST and exposes a containerised code-hub's ports on the
+host: each LAN share on the host's LAN address, and every running app on the
+host's 127.0.0.1. code-hub dials OUT to this relay and holds one authenticated
+control session carrying the full set of ports to expose; the relay binds a
+host listener per port and, for each client, asks code-hub over that session to
+open one fresh authenticated data connection, which it splices byte-for-byte to
+the client. The relay never dials anything itself, never terminates TLS and
+never learns where code-hub sends the bytes. Python 3.9+, standard library only.
 
-The wire protocol (paths, upgrade token, error codes) lives in protocol.json
-next to this file; keep the two files together. See the README's
-"Host relay" section and docs/protocol.md.
+The two sides meet through a rendezvous directory in code-hub's store
+(<projectsRoot>/.code-hub/relay/): code-hub writes the shared secret there, the
+relay writes its listen address. The wire protocol (frames, MAC labels, caps,
+timings, error codes) lives in protocol.json next to this file; keep the two
+files together. See docs/host-relay.md and docs/protocol.md.
 """
 
 import argparse
@@ -24,8 +28,8 @@ import re
 import secrets
 import signal
 import socket
+import struct
 import sys
-from collections import deque
 from pathlib import Path
 
 if sys.version_info < (3, 9):
@@ -37,27 +41,37 @@ def load_protocol():
 
 
 PROTOCOL = load_protocol()
-PATHS = PROTOCOL["paths"]
+VERSION = PROTOCOL["protocolVersion"]
+RENDEZVOUS = PROTOCOL["rendezvous"]
+LABELS = PROTOCOL["macLabels"]
+FRAMES = PROTOCOL["frames"]
+ROLES = PROTOCOL["roles"]
+SCOPES = PROTOCOL["scopes"]
 ERROR_CODES = PROTOCOL["errorCodes"]
-UPGRADE_TOKEN = PROTOCOL["upgradeToken"]
+PORT_MIN, PORT_MAX = PROTOCOL["port"]["min"], PROTOCOL["port"]["max"]
+NONCE_BYTES = PROTOCOL["nonceBytes"]
+MAX_FRAME_BYTES = PROTOCOL["maxFrameBytes"]
+MAX_PORTS = PROTOCOL["maxPorts"]
+MAX_PENDING_HANDSHAKES = PROTOCOL["maxPendingHandshakes"]
+MAX_INCOMING_PER_PORT = PROTOCOL["maxIncomingPerPort"]
+MAX_INCOMING_TOTAL = PROTOCOL["maxIncomingTotal"]
+HANDSHAKE_TIMEOUT_S = PROTOCOL["handshakeTimeoutMs"] / 1000.0
+PING_INTERVAL_S = PROTOCOL["pingIntervalMs"] / 1000.0
+KEEPALIVE_TIMEOUT_S = PROTOCOL["keepaliveTimeoutMs"] / 1000.0
 
 # Relay-only limits.
-MAX_FORWARDS = 64
-MAX_PARKED_PER_FORWARD = 16
-MAX_QUEUED_PER_FORWARD = 64
-MAX_HEAD_BYTES = 16 * 1024
-HEAD_TIMEOUT_S = 5.0
-MAX_BODY_BYTES = 4 * 1024
 PUMP_CHUNK = 65536
 LISTEN_BACKLOG = 128
 KEEPALIVE_IDLE_S = 15
 KEEPALIVE_INTERVAL_S = 5
 
-DEFAULT_LISTEN = "127.0.0.1:7077"
-DEFAULT_SECRET_FILE = Path.home() / ".code-hub-relay" / "secret"
-DEFAULT_LEASE_MS = 30000
-MIN_LEASE_MS = 100
+STORE_DIRNAME = ".code-hub"
+DEFAULT_LISTEN_PORT = 7077
 DEFAULT_ACCEPT_WAIT_MS = 10000
+# The only address a loopback-scope listener ever binds.
+LOOPBACK_HOST = "127.0.0.1"
+SIOCGIFADDR = 0x8915
+DOCKER0 = b"docker0"
 
 # TEST-NET-1: a documentation address. A UDP connect() to it only makes the
 # kernel pick the source address of the default route; nothing is sent.
@@ -69,12 +83,20 @@ DOCKER_BRIDGE = ipaddress.ip_network("172.17.0.0/16")
 THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 WILDCARD_HOSTS = ("", "0.0.0.0", "::")
 
-REASONS = {
-    101: "Switching Protocols", 200: "OK", 201: "Created", 204: "No Content",
-    400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
-    405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
-    429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable",
+NONCE_RE = re.compile(r"\A[A-Za-z0-9_-]{%d}\Z" % ((NONCE_BYTES * 8 + 5) // 6))
+MAC_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+SCOPE_VALUES = frozenset(SCOPES.values())
+
+# Frame shapes: exactly these keys, each of this type. A dict literal per
+# shape, so frame keys are never confused with protocol identifiers.
+AUTH_SHAPES = {
+    ROLES["control"]: {"t": str, "v": int, "role": str, "nonce": str, "mac": str},
+    ROLES["data"]: {"t": str, "v": int, "role": str, "nonce": str, "mac": str, "session": str, "conn": str},
 }
+BARE_SHAPE = {"t": str}
+PORTS_SHAPE = {"t": str, "ports": list}
+PORT_ENTRY_SHAPE = {"port": int, "scope": str}
 
 
 def log(msg):
@@ -110,6 +132,29 @@ def default_route_ipv4(dest=None):
         return sock.getsockname()[0]
     finally:
         sock.close()
+
+
+def docker0_ipv4():
+    """The IPv4 address of the docker0 bridge (native Linux Docker), or None."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import fcntl
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            packed = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, struct.pack("256s", DOCKER0))
+        finally:
+            sock.close()
+        return socket.inet_ntoa(packed[20:24])
+    except (OSError, ImportError):
+        return None
+
+
+def default_listen_host(docker0=docker0_ipv4):
+    """Where the control listener goes without --listen: the docker0 address a
+    native-Linux container reaches the host on, else loopback (Docker Desktop
+    forwards host.docker.internal to the host's loopback)."""
+    return docker0() or LOOPBACK_HOST
 
 
 def ip_problem(ip, listen_host=None):
@@ -172,107 +217,172 @@ def control_listen_problem(listen_host, addresses, default_route=None):
     probe's answer, None when the probe found none). A loopback --listen is
     never LAN-reachable and is always allowed. What it can't know: a --listen
     on some other LAN interface the relay neither advertises nor probes; there,
-    the bearer secret is the remaining gate.
+    the challenge-response handshake is the remaining gate.
     """
     if listen_host in WILDCARD_HOSTS:
-        return "--listen %r is a wildcard address, which would expose the control API on every interface" % listen_host
+        return "--listen %r is a wildcard address, which would expose the control port on every interface" % listen_host
     if _is_loopback(listen_host):
         return None
     listen = canonical_ip(listen_host)
     if listen in [canonical_ip(a) for a in addresses]:
-        return "--listen %s is also an advertised address, so LAN devices could reach the control API" % listen_host
+        return "--listen %s is also an advertised address, so LAN devices could reach the control port" % listen_host
     if default_route is not None and listen == canonical_ip(default_route):
-        return "--listen %s is this host's default-route (LAN) address, so LAN devices could reach the control API" % listen_host
+        return "--listen %s is this host's default-route (LAN) address, so LAN devices could reach the control port" % listen_host
     return None
 
 
-class SecretError(Exception):
+# --- rendezvous ---------------------------------------------------------------
+
+def find_store(script_path, override=None):
+    """(store_dir or None, searched): code-hub's .code-hub store.
+
+    With `override` (--projects-root), <override>/.code-hub. Otherwise the
+    nearest ancestor of the script's directory holding a .code-hub directory,
+    so the answer never depends on the working directory.
+    """
+    if override is not None:
+        root = Path(override).resolve()
+        store = root / STORE_DIRNAME
+        return (store if store.is_dir() else None), [str(root)]
+    searched = []
+    for parent in Path(script_path).resolve().parent.parents:
+        searched.append(str(parent))
+        if (parent / STORE_DIRNAME).is_dir():
+            return parent / STORE_DIRNAME, searched
+    return None, searched
+
+
+def relay_dir(store):
+    path = Path(store) / RENDEZVOUS["dir"]
+    os.makedirs(str(path), mode=0o700, exist_ok=True)
+    return path
+
+
+class SecretUnavailable(Exception):
     pass
 
 
-def load_or_create_secret(path):
-    path = Path(path)
-    min_len = PROTOCOL["minSecretLength"]
+def read_secret(rdir):
+    """The secret code-hub wrote, re-read on every call so a regenerated one
+    applies at once. Raises SecretUnavailable naming the path and the cause."""
+    path = Path(rdir) / RENDEZVOUS["hubFile"]
     try:
-        secret = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        os.makedirs(str(path.parent), mode=0o700, exist_ok=True)
-        secret = secrets.token_urlsafe(32)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(secret + "\n")
-        return secret
-    if len(secret) < min_len:
-        raise SecretError("the secret in %s is shorter than %d characters" % (path, min_len))
+        raw = path.read_text(encoding="utf-8")
+    except PermissionError as e:
+        raise SecretUnavailable("cannot read %s: %s — run the relay as the user that owns %s" % (path, e.strerror, rdir))
+    except OSError as e:
+        raise SecretUnavailable("cannot read %s: %s" % (path, e.strerror or e))
+    try:
+        obj = json.loads(raw)
+    except ValueError as e:
+        raise SecretUnavailable("%s is not valid JSON: %s" % (path, e))
+    secret = obj.get("secret") if isinstance(obj, dict) else None
+    if not isinstance(secret, str) or len(secret) < PROTOCOL["minSecretLength"]:
+        raise SecretUnavailable("%s holds no secret of at least %d characters" % (path, PROTOCOL["minSecretLength"]))
     return secret
 
 
-def bearer_ok(header, secret):
-    """Constant-time check of an `Authorization: Bearer <secret>` header."""
-    if not header:
-        return False
-    scheme, _, value = header.strip().partition(" ")
-    if scheme.lower() != "bearer":
-        return False
-    given = hashlib.sha256(value.strip().encode("utf-8")).digest()
-    expected = hashlib.sha256(secret.encode("utf-8")).digest()
-    return hmac.compare_digest(given, expected)
+def write_host_json(rdir, listen, pid):
+    """Atomically publish where the relay listens (tmp file in the same dir, then rename)."""
+    path = Path(rdir) / RENDEZVOUS["relayFile"]
+    tmp = Path(rdir) / (".%s.%d.tmp" % (RENDEZVOUS["relayFile"], pid))
+    payload = json.dumps({"protocolVersion": VERSION, "listen": listen, "pid": pid}) + "\n"
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(str(tmp), str(path))
+    return path
 
 
-class BadRequest(Exception):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-
-
-async def read_request(reader):
-    """(method, path, headers, body) of one HTTP/1.1 request."""
+def remove_host_json_if_ours(rdir, pid):
+    """Remove host.json only while it still names `pid`: a newer relay's file stays."""
+    path = Path(rdir) / RENDEZVOUS["relayFile"]
     try:
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT_S)
-    except asyncio.LimitOverrunError:
-        raise BadRequest(413, "request head too large")
-    except asyncio.TimeoutError:
-        raise BadRequest(400, "request head timed out")
-    lines = head.decode("latin-1").split("\r\n")
-    parts = lines[0].split(" ")
-    if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
-        raise BadRequest(400, "malformed request line")
-    method, target = parts[0], parts[1]
-    headers = {}
-    for line in lines[1:]:
-        if not line:
-            continue
-        name, sep, value = line.partition(":")
-        if not sep:
-            raise BadRequest(400, "malformed header line")
-        headers[name.strip().lower()] = value.strip()
-    if "transfer-encoding" in headers:
-        raise BadRequest(400, "Transfer-Encoding is not supported; send Content-Length")
-    length = headers.get("content-length", "0")
-    if not length.isdigit():
-        raise BadRequest(400, "bad Content-Length")
-    if int(length) > MAX_BODY_BYTES:
-        raise BadRequest(413, "request body too large")
-    body = b""
-    if int(length):
-        body = await asyncio.wait_for(reader.readexactly(int(length)), HEAD_TIMEOUT_S)
-    return method, target.split("?", 1)[0], headers, body
-
-
-async def respond(writer, status, body=None):
-    head = "HTTP/1.1 %d %s\r\nConnection: close\r\n" % (status, REASONS[status])
-    payload = b""
-    if body is not None:
-        payload = json.dumps(body).encode("utf-8")
-        head += "Content-Type: application/json\r\n"
-    if status != 204:
-        head += "Content-Length: %d\r\n" % len(payload)
-    writer.write(head.encode("latin-1") + b"\r\n" + payload)
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(obj, dict) or obj.get("pid") != pid:
+        return False
     try:
-        await writer.drain()
-    finally:
-        writer.close()
+        path.unlink()
+    except OSError:
+        return False
+    return True
 
+
+# --- frames and the handshake --------------------------------------------------
+
+class BadFrame(Exception):
+    pass
+
+
+def encode(frame):
+    return json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def parse_frame(line):
+    try:
+        msg = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise BadFrame("not a JSON line")
+    if not isinstance(msg, dict) or not isinstance(msg.get("t"), str):
+        raise BadFrame("not an object with a string t")
+    return msg
+
+
+def check_shape(obj, shape, what):
+    if set(obj) != set(shape):
+        raise BadFrame("%s must have exactly the keys %s" % (what, ", ".join(sorted(shape))))
+    for key, kind in shape.items():
+        value = obj[key]
+        if type(value) is not kind:
+            raise BadFrame("%s: %s must be %s" % (what, key, kind.__name__))
+
+
+def mac(secret, label, role, nonce_relay, nonce_hub, session="", conn=""):
+    msg = "\n".join((label, role, nonce_relay, nonce_hub, session, conn))
+    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_mac(expected, given):
+    """Constant-time comparison of a MAC against the expected one."""
+    if not isinstance(given, str):
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), given.encode("utf-8"))
+
+
+def hosts_for(scope, addresses):
+    """The ONLY place bind hosts are chosen: loopback scope binds 127.0.0.1 and
+    nothing else, lan scope binds exactly the advertised addresses."""
+    if scope == SCOPES["loopback"]:
+        return [LOOPBACK_HOST]
+    if scope == SCOPES["lan"]:
+        return list(addresses)
+    raise ValueError("unknown scope %r" % scope)
+
+
+def ports_entries(msg):
+    """The (port, scope) pairs of a ports frame, in frame order. Raises BadFrame."""
+    check_shape(msg, PORTS_SHAPE, "a ports frame")
+    pairs = []
+    for entry in msg["ports"]:
+        if not isinstance(entry, dict):
+            raise BadFrame("a ports entry must be an object")
+        check_shape(entry, PORT_ENTRY_SHAPE, "a ports entry")
+        port, scope = entry["port"], entry["scope"]
+        if not PORT_MIN <= port <= PORT_MAX:
+            raise BadFrame("port %d is outside %d-%d" % (port, PORT_MIN, PORT_MAX))
+        if scope not in SCOPE_VALUES:
+            raise BadFrame("unknown scope %r" % scope)
+        if (port, scope) in pairs:
+            raise BadFrame("duplicate entry for port %d, scope %s" % (port, scope))
+        pairs.append((port, scope))
+    return pairs
+
+
+# --- sockets --------------------------------------------------------------------
 
 def set_keepalive(writer):
     sock = writer.get_extra_info("socket")
@@ -346,43 +456,45 @@ async def pump(reader, writer, other):
         other.transport.abort()
 
 
-class Parked:
-    """A parked accept: an upgraded control connection waiting for a LAN client."""
+class PortError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
-    def __init__(self, reader, writer):
+
+class Incoming:
+    """A host client waiting for code-hub to claim it with a data connection."""
+
+    def __init__(self, listener, reader, writer, timer):
+        self.listener = listener
         self.reader = reader
         self.writer = writer
-        self.watcher = None
+        self.timer = timer
 
 
-class Forward:
-    def __init__(self, relay, fid, port, addresses):
-        self.relay = relay
-        self.id = fid
+class Listener:
+    """The host listener(s) for one (port, scope) pair of a session."""
+
+    def __init__(self, session, port, scope, host_port, fallback):
+        self.session = session
         self.port = port
-        self.addresses = addresses
+        self.scope = scope
+        self.host_port = host_port
+        self.fallback = fallback
         self.servers = []
-        self.parked = deque()
-        self.waiters = deque()
         self.writers = set()
         self.tasks = set()
-        self.lease = None
+        self.pending = 0
         self.closed = False
 
     async def start(self, socks):
         for sock in socks:
-            self.servers.append(await asyncio.start_server(self._on_lan, sock=sock))
-        self.renew()
+            self.servers.append(await asyncio.start_server(self._on_client, sock=sock))
 
-    def renew(self):
-        if self.lease is not None:
-            self.lease.cancel()
-        loop = asyncio.get_running_loop()
-        self.lease = loop.call_later(self.relay.lease_ms / 1000.0, self._expire)
-
-    def _expire(self):
-        log("forward %s on port %d expired (lease not renewed)" % (self.id, self.port))
-        self.relay.drop(self.id)
+    async def _on_client(self, reader, writer):
+        if self.closed or not self.session.offer(self, reader, writer):
+            writer.transport.abort()
 
     def _task(self, coro):
         task = asyncio.get_running_loop().create_task(coro)
@@ -390,13 +502,29 @@ class Forward:
         task.add_done_callback(self.tasks.discard)
         return task
 
+    async def splice(self, client_reader, client_writer, data_reader, data_writer):
+        if self.closed:
+            client_writer.transport.abort()
+            data_writer.transport.abort()
+            return
+        self.writers.add(client_writer)
+        self.writers.add(data_writer)
+        set_keepalive(client_writer)
+        set_keepalive(data_writer)
+        up = self._task(pump(client_reader, data_writer, client_writer))
+        down = self._task(pump(data_reader, client_writer, data_writer))
+        try:
+            await asyncio.gather(up, down, return_exceptions=True)
+        finally:
+            for w in (client_writer, data_writer):
+                self.writers.discard(w)
+                w.close()
+
     def close(self):
-        """Release everything synchronously: listeners, parked, queued and spliced connections."""
+        """Release everything synchronously: listeners, pending and spliced connections."""
         if self.closed:
             return
         self.closed = True
-        if self.lease is not None:
-            self.lease.cancel()
         for server in self.servers:
             server.close()
         for writer in list(self.writers):
@@ -404,251 +532,372 @@ class Forward:
         self.writers.clear()
         for task in list(self.tasks):
             task.cancel()
-        while self.waiters:
-            fut = self.waiters.popleft()
-            if not fut.done():
-                fut.set_result(None)
-        self.parked.clear()
 
-    # --- parked accepts ---------------------------------------------------
 
-    def park(self, reader, writer):
-        """Hold an upgraded control connection until a LAN client needs it. False = cap reached."""
-        if len(self.parked) >= MAX_PARKED_PER_FORWARD:
+class Session:
+    """The one authenticated control session, and every listener it asked for."""
+
+    def __init__(self, relay, sid, reader, writer, addresses, problem):
+        self.relay = relay
+        self.id = sid
+        self.reader = reader
+        self.writer = writer
+        self.lan_addresses = addresses
+        self.lan_problem = problem
+        self.listeners = {}
+        self.incoming = {}
+        self.closed = False
+        self.silence = None
+        self.pinger = None
+
+    def send(self, frame):
+        if self.closed or self.writer.is_closing():
+            return
+        self.writer.write(encode(frame))
+
+    # --- liveness -------------------------------------------------------------
+
+    def _heard(self):
+        if self.silence is not None:
+            self.silence.cancel()
+        self.silence = asyncio.get_running_loop().call_later(KEEPALIVE_TIMEOUT_S, self._silent)
+
+    def _silent(self):
+        log("control session %s: no frame for over %d ms — closing it" % (self.id, PROTOCOL["keepaliveTimeoutMs"]))
+        self.close()
+
+    async def _ping(self):
+        while not self.closed:
+            await asyncio.sleep(PING_INTERVAL_S)
+            self.send({"t": FRAMES["ping"]})
+
+    async def run(self):
+        self._heard()
+        self.pinger = asyncio.get_running_loop().create_task(self._ping())
+        try:
+            while not self.closed:
+                try:
+                    line = await self.reader.readline()
+                except ValueError:
+                    self.fatal(ERROR_CODES["badFrame"], "a frame is longer than %d bytes" % MAX_FRAME_BYTES)
+                    return
+                if not line.endswith(b"\n"):
+                    return
+                self._heard()
+                try:
+                    await self._on_frame(parse_frame(line))
+                except BadFrame as e:
+                    log("control session %s: bad frame (%s) — closing it" % (self.id, e))
+                    self.fatal(ERROR_CODES["badFrame"], str(e))
+                    return
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self.close()
+
+    async def _on_frame(self, msg):
+        t = msg["t"]
+        if t == FRAMES["ping"]:
+            check_shape(msg, BARE_SHAPE, "a ping frame")
+            self.send({"t": FRAMES["pong"]})
+        elif t == FRAMES["pong"]:
+            check_shape(msg, BARE_SHAPE, "a pong frame")
+        elif t == FRAMES["ports"]:
+            status = await self.apply_ports(ports_entries(msg))
+            self.send(status)
+        else:
+            raise BadFrame("unexpected %r frame on a control session" % t)
+
+    # --- listeners --------------------------------------------------------------
+
+    def _drop_listener(self, key):
+        listener = self.listeners.pop(key, None)
+        if listener is None:
+            return
+        for conn, inc in list(self.incoming.items()):
+            if inc.listener is listener:
+                self.incoming.pop(conn)
+                inc.timer.cancel()
+        listener.close()
+        log("closed %s port %d (host port %d)" % (listener.scope, listener.port, listener.host_port))
+
+    async def _open(self, port, scope):
+        if scope == SCOPES["lan"] and self.lan_problem:
+            raise PortError(ERROR_CODES["noLanAddress"], "no LAN address to advertise (%s)" % self.lan_problem)
+        hosts = hosts_for(scope, self.lan_addresses)
+        fallback = False
+        try:
+            socks, bound = bind_all(hosts, port)
+        except OSError as e:
+            if not is_addr_in_use(e):
+                raise PortError(ERROR_CODES["bindFailed"], "bind failed: %s" % (e.strerror or e))
+            try:
+                socks, bound = bind_all(hosts, 0)
+            except OSError as e2:
+                raise PortError(ERROR_CODES["bindFailed"], "bind failed: %s" % (e2.strerror or e2))
+            fallback = True
+        listener = Listener(self, port, scope, bound, fallback)
+        try:
+            await listener.start(socks)
+        except Exception as e:
+            listener.close()
+            for sock in socks:
+                sock.close()
+            raise PortError(ERROR_CODES["bindFailed"], "could not serve the port: %s" % e)
+        log("%s port %d on host %s port %d%s" % (scope, port, ",".join(hosts), bound,
+                                                 " (requested port busy)" if fallback else ""))
+        return listener
+
+    async def apply_ports(self, pairs):
+        """Reconcile the listeners with the full requested set; returns the status frame."""
+        addresses, problem = self.relay.addresses()
+        if (addresses, problem) != (self.lan_addresses, self.lan_problem):
+            log("LAN addresses changed from %s to %s — rebinding LAN listeners"
+                % (",".join(self.lan_addresses) or "none", ",".join(addresses) or "none (%s)" % problem))
+            for key in [k for k in self.listeners if k[1] == SCOPES["lan"]]:
+                self._drop_listener(key)
+            self.lan_addresses, self.lan_problem = addresses, problem
+        wanted = pairs[:MAX_PORTS]
+        for key in list(self.listeners):
+            if key not in wanted:
+                self._drop_listener(key)
+        results = []
+        for port, scope in wanted:
+            listener = self.listeners.get((port, scope))
+            if listener is None:
+                try:
+                    listener = await self._open(port, scope)
+                except PortError as e:
+                    results.append({"port": port, "scope": scope, "code": e.code, "message": e.message})
+                    continue
+                if self.closed:
+                    listener.close()
+                    continue
+                self.listeners[(port, scope)] = listener
+            results.append({"port": port, "scope": scope, "hostPort": listener.host_port, "fallback": listener.fallback})
+        for port, scope in pairs[MAX_PORTS:]:
+            results.append({"port": port, "scope": scope, "code": ERROR_CODES["tooManyPorts"],
+                            "message": "at most %d ports per session" % MAX_PORTS})
+        return {"t": FRAMES["status"], "addresses": list(self.lan_addresses), "ports": results}
+
+    # --- the data path ------------------------------------------------------------
+
+    def offer(self, listener, reader, writer):
+        """Register a host client and ask code-hub to claim it. False = refused (closed or capped)."""
+        if self.closed or listener.closed:
             return False
-        p = Parked(reader, writer)
-        self.writers.add(writer)
-        set_keepalive(writer)
-        # Any byte or EOF from a parked accept means its client vanished or
-        # broke protocol: it is dropped. Cancelling this read consumes nothing.
-        p.watcher = self._task(reader.read(1))
-        p.watcher.add_done_callback(lambda t: self._parked_died(p, t))
-        while self.waiters:
-            fut = self.waiters.popleft()
-            if not fut.done():
-                fut.set_result(p)
-                return True
-        self.parked.append(p)
+        if listener.pending >= MAX_INCOMING_PER_PORT or len(self.incoming) >= MAX_INCOMING_TOTAL:
+            return False
+        conn = secrets.token_urlsafe(12)
+        timer = asyncio.get_running_loop().call_later(self.relay.accept_wait_ms / 1000.0, self._unclaimed, conn)
+        self.incoming[conn] = Incoming(listener, reader, writer, timer)
+        listener.pending += 1
+        listener.writers.add(writer)
+        self.send({"t": FRAMES["incoming"], "port": listener.port, "scope": listener.scope, "conn": conn})
         return True
 
-    def _parked_died(self, p, task):
-        if task.cancelled():
+    def claim(self, conn):
+        """The pending client `conn`, consumed; None when unknown or already claimed."""
+        inc = self.incoming.pop(conn, None)
+        if inc is None:
+            return None
+        inc.timer.cancel()
+        inc.listener.pending -= 1
+        return inc
+
+    def _unclaimed(self, conn):
+        inc = self.incoming.pop(conn, None)
+        if inc is None:
             return
-        if p in self.parked:
-            self.parked.remove(p)
-        self.writers.discard(p.writer)
-        p.writer.transport.abort()
+        inc.listener.pending -= 1
+        inc.listener.writers.discard(inc.writer)
+        inc.writer.transport.abort()
 
-    def _take_parked(self):
-        while self.parked:
-            p = self.parked.popleft()
-            if not p.watcher.done():
-                return p
-        return None
+    # --- teardown ---------------------------------------------------------------------
 
-    async def _claim(self, p):
-        """Stop watching `p` before splicing it. False when it died meanwhile."""
-        p.watcher.cancel()
-        await asyncio.wait([p.watcher])
-        return p.watcher.cancelled()
+    def fatal(self, code, message):
+        """Send an error frame, then close (flushing the frame first)."""
+        self.send({"t": FRAMES["error"], "code": code, "message": message})
+        self.close(flush=True)
 
-    # --- LAN side -----------------------------------------------------------
-
-    async def _on_lan(self, reader, writer):
+    def close(self, flush=False):
+        """Close synchronously and idempotently: every listener, every pending
+        and spliced client, and the control connection."""
         if self.closed:
-            writer.transport.abort()
             return
-        self.writers.add(writer)
-        loop = asyncio.get_running_loop()
-        while True:
-            p = self._take_parked()
-            if p is None:
-                if len(self.waiters) >= MAX_QUEUED_PER_FORWARD:
-                    break
-                fut = loop.create_future()
-                self.waiters.append(fut)
-                try:
-                    p = await asyncio.wait_for(fut, self.relay.accept_wait_ms / 1000.0)
-                except asyncio.TimeoutError:
-                    p = None
-                finally:
-                    if fut in self.waiters:
-                        self.waiters.remove(fut)
-                if p is None:
-                    break
-            if self.closed:
-                break
-            if await self._claim(p):
-                await self._splice(reader, writer, p)
-                return
-        self.writers.discard(writer)
-        writer.transport.abort()
-
-    async def _splice(self, lan_reader, lan_writer, p):
-        set_keepalive(lan_writer)
-        p.writer.write(
-            ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: %s\r\nConnection: Upgrade\r\n\r\n" % UPGRADE_TOKEN).encode("latin-1"))
-        up = self._task(pump(lan_reader, p.writer, lan_writer))
-        down = self._task(pump(p.reader, lan_writer, p.writer))
-        try:
-            await asyncio.gather(up, down, return_exceptions=True)
-        finally:
-            for w in (lan_writer, p.writer):
-                self.writers.discard(w)
-                w.close()
+        self.closed = True
+        if self.silence is not None:
+            self.silence.cancel()
+        if self.pinger is not None:
+            self.pinger.cancel()
+        for key in list(self.listeners):
+            self._drop_listener(key)
+        for inc in self.incoming.values():
+            inc.timer.cancel()
+            inc.writer.transport.abort()
+        self.incoming.clear()
+        if flush:
+            self.writer.close()
+        else:
+            self.writer.transport.abort()
+        if self.relay.session is self:
+            self.relay.session = None
+        log("control session %s closed" % self.id)
 
 
 class Relay:
-    def __init__(self, secret, advertise, listen_host, lease_ms, accept_wait_ms, probe=default_route_ipv4):
-        self.secret = secret
+    def __init__(self, rdir, advertise, listen_host, accept_wait_ms, probe=default_route_ipv4):
+        self.relay_dir = rdir
         self.advertise = advertise
         self.listen_host = listen_host
-        self.lease_ms = lease_ms
         self.accept_wait_ms = accept_wait_ms
         self.probe = probe
-        self.forwards = {}
-        self.routes = [(name, self._pattern(PATHS[name])) for name in ("health", "forwards", "renew", "accept", "forward")]
-
-    @staticmethod
-    def _pattern(template):
-        return re.compile("^" + "([A-Za-z0-9_-]+)".join(re.escape(part) for part in template.split("{id}")) + "$")
+        self.pending_handshakes = 0
+        self.session = None
+        self.conns = set()
+        self.closing = False
 
     def addresses(self):
         return resolve_addresses(self.advertise, self.listen_host, self.probe)
 
-    def drop(self, fid):
-        fwd = self.forwards.pop(fid, None)
-        if fwd is not None:
-            fwd.close()
-        return fwd
-
     def close(self):
-        for fid in list(self.forwards):
-            self.drop(fid)
+        self.closing = True
+        if self.session is not None:
+            self.session.close()
+        for writer in list(self.conns):
+            writer.transport.abort()
+        self.conns.clear()
 
     async def handle(self, reader, writer):
+        if self.closing or self.pending_handshakes >= MAX_PENDING_HANDSHAKES:
+            writer.transport.abort()
+            return
+        self.pending_handshakes += 1
+        self.conns.add(writer)
         try:
             try:
-                method, path, headers, body = await read_request(reader)
-            except BadRequest as e:
-                await respond(writer, e.status, {"error": str(e)})
-                return
-            except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+                then = await asyncio.wait_for(self._handshake(reader, writer), HANDSHAKE_TIMEOUT_S)
+            except asyncio.TimeoutError:
                 writer.transport.abort()
                 return
-            if not bearer_ok(headers.get("authorization"), self.secret):
-                await respond(writer, 401)
-                return
-            await self._dispatch(method, path, headers, body, reader, writer)
+            finally:
+                self.pending_handshakes -= 1
+            if then is not None:
+                await then()
         except Exception as e:  # never let one connection take the relay down
-            log("control request failed: %r" % (e,))
+            log("connection failed: %r" % (e,))
             writer.transport.abort()
+        finally:
+            self.conns.discard(writer)
 
-    async def _dispatch(self, method, path, headers, body, reader, writer):
-        for name, pattern in self.routes:
-            m = pattern.match(path)
-            if m:
-                break
-        else:
-            await respond(writer, 404, {"error": "no such endpoint"})
-            return
-        want = {"health": "GET", "forwards": "POST", "renew": "POST", "accept": "GET", "forward": "DELETE"}[name]
-        if method != want:
-            await respond(writer, 405, {"error": "use %s" % want})
-            return
-        if name == "health":
-            addresses, _ = self.addresses()
-            await respond(writer, 200, {
-                "ok": True, "protocol": PROTOCOL["protocolVersion"], "addresses": addresses,
-                "leaseMs": self.lease_ms, "forwards": len(self.forwards),
-                "parked": sum(len(f.parked) for f in self.forwards.values()),
-            })
-            return
-        if name == "forwards":
-            await self._create(body, writer)
-            return
-        fwd = self.forwards.get(m.group(1))
-        if fwd is None:
-            await respond(writer, 404, {"error": "unknown or expired forward"})
-            return
-        if name == "renew":
-            fwd.renew()
-            await respond(writer, 200, {"leaseMs": self.lease_ms})
-        elif name == "forward":
-            self.drop(fwd.id)
-            log("forward %s on port %d closed" % (fwd.id, fwd.port))
-            await respond(writer, 204)
-        else:
-            if headers.get("upgrade", "").lower() != UPGRADE_TOKEN.lower():
-                await respond(writer, 400, {"error": "expected Upgrade: %s" % UPGRADE_TOKEN})
-            elif not fwd.park(reader, writer):
-                await respond(writer, 429, {"error": "too many parked accepts on this forward"})
-
-    async def _create(self, body, writer):
+    async def _refuse(self, writer, code, message):
+        writer.write(encode({"t": FRAMES["error"], "code": code, "message": message}))
         try:
-            req = json.loads(body.decode("utf-8")) if body else {}
-        except ValueError:
-            req = None
-        if not isinstance(req, dict):
-            await respond(writer, 400, {"error": "body must be a JSON object"})
-            return
-        extra = sorted(set(req) - set(PROTOCOL["createKeys"]))
-        if extra:
-            await respond(writer, 400, {"error": "unknown keys: %s" % ", ".join(extra)})
-            return
-        port = req.get("port", 0)
-        lo, hi = PROTOCOL["port"]["min"], PROTOCOL["port"]["max"]
-        if "port" in req and (type(port) is not int or not lo <= port <= hi):
-            await respond(writer, 400, {"error": "port must be an integer from %d to %d" % (lo, hi)})
-            return
-        if len(self.forwards) >= MAX_FORWARDS:
-            await respond(writer, 429, {"error": "too many forwards"})
-            return
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def _handshake(self, reader, writer):
+        """Authenticate one connection. Returns what to run once it is no longer
+        pre-auth, or None when it was refused or dropped."""
+        nonce_relay = secrets.token_urlsafe(NONCE_BYTES)
+        writer.write(encode({"t": FRAMES["hello"], "v": VERSION, "nonce": nonce_relay}))
+        await writer.drain()
+        try:
+            line = await reader.readline()
+        except (ValueError, ConnectionError):
+            writer.transport.abort()
+            return None
+        if not line.endswith(b"\n"):
+            writer.transport.abort()
+            return None
+        try:
+            msg = parse_frame(line)
+            if msg["t"] != FRAMES["auth"]:
+                raise BadFrame("expected an auth frame")
+        except BadFrame as e:
+            await self._refuse(writer, ERROR_CODES["badFrame"], str(e))
+            return None
+        try:
+            secret = read_secret(self.relay_dir)
+        except SecretUnavailable as e:
+            log(str(e))
+            await self._refuse(writer, ERROR_CODES["noSecret"], str(e))
+            return None
+        if msg.get("v") != VERSION:
+            await self._refuse(writer, ERROR_CODES["versionMismatch"],
+                               "this relay speaks protocol %d, the client %r — update the relay/ copy on the host" % (VERSION, msg.get("v")))
+            return None
+        role = msg.get("role")
+        shape = AUTH_SHAPES.get(role)
+        try:
+            if shape is None:
+                raise BadFrame("unknown role %r" % (role,))
+            check_shape(msg, shape, "an auth frame")
+            if not NONCE_RE.match(msg["nonce"]):
+                raise BadFrame("malformed nonce")
+            if not MAC_RE.match(msg["mac"]):
+                raise BadFrame("malformed mac")
+            session = msg.get("session", "")
+            conn = msg.get("conn", "")
+            if role == ROLES["data"] and not (ID_RE.match(session) and ID_RE.match(conn)):
+                raise BadFrame("malformed session or conn")
+        except BadFrame as e:
+            await self._refuse(writer, ERROR_CODES["badFrame"], str(e))
+            return None
+        expected = mac(secret, LABELS["hub"], role, nonce_relay, msg["nonce"], session, conn)
+        if not verify_mac(expected, msg["mac"]):
+            log("refused a %s connection: wrong MAC" % role)
+            await self._refuse(writer, ERROR_CODES["authFailed"], "authentication failed")
+            return None
+        proof = mac(secret, LABELS["relay"], role, nonce_relay, msg["nonce"], session, conn)
+        if role == ROLES["control"]:
+            return lambda: self._run_control(reader, writer, proof)
+        current = self.session
+        if current is None or session != current.id:
+            await self._refuse(writer, ERROR_CODES["staleSession"], "no current session %s" % session)
+            return None
+        inc = current.claim(conn)
+        if inc is None:
+            await self._refuse(writer, ERROR_CODES["unknownConn"], "no pending connection %s" % conn)
+            return None
+        return lambda: self._splice(inc, reader, writer, proof)
+
+    async def _run_control(self, reader, writer, proof):
         addresses, problem = self.addresses()
-        if problem:
-            await respond(writer, 503, {"code": ERROR_CODES["noLanAddress"], "error": "no LAN address to advertise (%s)" % problem})
-            return
-        try:
-            socks, bound = bind_all(addresses, port)
-        except OSError as e:
-            if is_addr_in_use(e):
-                await respond(writer, 409, {"code": ERROR_CODES["portInUse"], "error": "port %d is in use on the host" % port})
-            else:
-                await respond(writer, 500, {"error": "bind failed: %s" % (e.strerror or e)})
-            return
-        fid = secrets.token_urlsafe(18)
-        fwd = Forward(self, fid, bound, addresses)
-        self.forwards[fid] = fwd
-        try:
-            await fwd.start(socks)
-        except Exception as e:
-            self.drop(fid)
-            for sock in socks:
-                sock.close()
-            await respond(writer, 500, {"error": "could not serve the forward: %s" % e})
-            return
-        log("forward %s open on %s port %d" % (fid, ",".join(addresses), bound))
-        await respond(writer, 201, {
-            "id": fid, "port": bound, "addresses": addresses,
-            "leaseMs": self.lease_ms, "protocol": PROTOCOL["protocolVersion"],
-        })
+        if self.session is not None:
+            log("a new control session replaces %s" % self.session.id)
+            self.session.close()
+        sid = secrets.token_urlsafe(12)
+        session = Session(self, sid, reader, writer, addresses, problem)
+        self.session = session
+        set_keepalive(writer)
+        session.send({"t": FRAMES["welcome"], "mac": proof, "session": sid, "addresses": addresses})
+        log("control session %s opened; LAN addresses %s" % (sid, ",".join(addresses) or "none (%s)" % problem))
+        await session.run()
+
+    async def _splice(self, inc, reader, writer, proof):
+        writer.write(encode({"t": FRAMES["welcome"], "mac": proof}))
+        await inc.listener.splice(inc.reader, inc.writer, reader, writer)
 
 
-def parse_args(argv):
+def parse_args(argv, default_host=default_listen_host):
     parser = argparse.ArgumentParser(
         prog="relay.py",
-        description="Expose a containerised code-hub's LAN share on this host's LAN address.")
-    parser.add_argument("--listen", default=DEFAULT_LISTEN, metavar="IP:PORT",
-                        help="control listener code-hub dials (default %(default)s)")
+        description="Expose a containerised code-hub's LAN shares on this host's LAN address, "
+                    "and its running apps on this host's loopback.")
+    parser.add_argument("--listen", metavar="IP:PORT",
+                        help="control listener code-hub dials (default: the docker0 address, else 127.0.0.1, port %d)"
+                        % DEFAULT_LISTEN_PORT)
     parser.add_argument("--advertise", metavar="IP[,IP...]",
                         help="host LAN address(es) to expose shares on (default: the default-route IPv4)")
-    parser.add_argument("--secret-file", default=str(DEFAULT_SECRET_FILE), metavar="PATH",
-                        help="bearer secret, created on first run (default %(default)s)")
-    parser.add_argument("--lease-ms", type=int, default=DEFAULT_LEASE_MS, metavar="N",
-                        help="forward lifetime without renewal (default %(default)s)")
+    parser.add_argument("--projects-root", metavar="DIR",
+                        help="code-hub's projects root, holding .code-hub (default: the nearest parent of this script's directory that has one)")
     parser.add_argument("--accept-wait-ms", type=int, default=DEFAULT_ACCEPT_WAIT_MS, metavar="N",
-                        help="how long a LAN connection waits for a parked accept (default %(default)s)")
+                        help="how long a host client waits for code-hub to claim it (default %(default)s)")
     args = parser.parse_args(argv)
+    if args.listen is None:
+        args.listen = "%s:%d" % (default_host(), DEFAULT_LISTEN_PORT)
     try:
         args.listen_host, args.listen_port = parse_ip_port(args.listen)
     except ValueError as e:
@@ -657,7 +906,7 @@ def parse_args(argv):
     # is used from then on — by the guard and by every bind. Python 3.9.0-3.9.4
     # read a leading-zero octet as decimal while the C library's bind reads it
     # as octal, so checking one spelling and binding another could put the
-    # control API on an address the guard never saw.
+    # control port on an address the guard never saw.
     if args.listen_host not in WILDCARD_HOSTS:
         try:
             args.listen_host = str(ipaddress.IPv4Address(args.listen_host))
@@ -680,20 +929,20 @@ def parse_args(argv):
         if len(ips) > PROTOCOL["maxAddresses"]:
             parser.error("--advertise: at most %d addresses" % PROTOCOL["maxAddresses"])
         args.advertise = ips
-    if not MIN_LEASE_MS <= args.lease_ms <= PROTOCOL["maxLeaseMs"]:
-        parser.error("--lease-ms must be from %d to %d" % (MIN_LEASE_MS, PROTOCOL["maxLeaseMs"]))
     if args.accept_wait_ms < 1:
         parser.error("--accept-wait-ms must be positive")
     return args
 
 
-async def serve(args, secret, addresses):
+async def serve(args, rdir, store):
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
-    relay = Relay(secret, args.advertise, args.listen_host, args.lease_ms, args.accept_wait_ms)
+    relay = Relay(rdir, args.advertise, args.listen_host, args.accept_wait_ms)
     sock = bind_listener(args.listen_host, args.listen_port)
-    server = await asyncio.start_server(relay.handle, sock=sock, limit=MAX_HEAD_BYTES)
+    server = await asyncio.start_server(relay.handle, sock=sock, limit=MAX_FRAME_BYTES)
     host, port = sock.getsockname()[:2]
+    pid = os.getpid()
+    write_host_json(rdir, "%s:%d" % (host, port), pid)
 
     def on_signal(signum, frame):
         loop.call_soon_threadsafe(stop.set)
@@ -703,14 +952,17 @@ async def serve(args, secret, addresses):
             signal.signal(getattr(signal, name), on_signal)
 
     print("code-hub-relay listening on %s:%d" % (host, port), flush=True)
-    log("advertising %s; forwards expire %d ms after their last renewal" % (", ".join(addresses), args.lease_ms))
-    log("secret file: %s" % args.secret_file)
-    log("in code-hub's environment set CODEHUB_RELAY_URL=http://host.docker.internal:%d "
-        "and CODEHUB_RELAY_SECRET=<the contents of the secret file>" % port)
+    log("code-hub store: %s" % store)
+    addresses, problem = relay.addresses()
+    log("LAN shares go on %s; running apps on %s" % (",".join(addresses) or "no address (%s)" % problem, LOOPBACK_HOST))
+    hub_file = Path(rdir) / RENDEZVOUS["hubFile"]
+    if not hub_file.exists():
+        log("waiting for code-hub to create %s" % hub_file)
     await stop.wait()
     log("shutting down")
-    server.close()
     relay.close()
+    remove_host_json_if_ours(rdir, pid)
+    server.close()
     await server.wait_closed()
 
 
@@ -738,16 +990,25 @@ def main(argv=None):
 
     addresses, problem = resolve_addresses(args.advertise, args.listen_host, probe)
     if problem:
-        sys.exit("code-hub-relay: no LAN address to advertise (%s) — pass --advertise <ip>" % problem)
+        log("no LAN address to advertise (%s) — LAN shares fail until there is one (or pass --advertise <ip>); "
+            "running apps are still mirrored on %s" % (problem, LOOPBACK_HOST))
     problem = control_listen_problem(args.listen_host, addresses, route)
     if problem:
         sys.exit("code-hub-relay: " + problem)
+    store, searched = find_store(__file__, args.projects_root)
+    if store is None:
+        if args.projects_root is not None:
+            sys.exit("code-hub-relay: no %s directory in %s — start code-hub once with that projects root so it creates one"
+                     % (STORE_DIRNAME, searched[0]))
+        sys.exit("code-hub-relay: no %s found in any parent of %s (searched: %s) — start code-hub once so it creates "
+                 "<projectsRoot>/%s, or pass --projects-root <dir>"
+                 % (STORE_DIRNAME, Path(__file__).resolve().parent, ", ".join(searched), STORE_DIRNAME))
     try:
-        secret = load_or_create_secret(args.secret_file)
-    except (SecretError, OSError) as e:
-        sys.exit("code-hub-relay: %s" % e)
+        rdir = relay_dir(store)
+    except OSError as e:
+        sys.exit("code-hub-relay: cannot create %s: %s" % (Path(store) / RENDEZVOUS["dir"], e.strerror or e))
     try:
-        asyncio.run(serve(args, secret, addresses))
+        asyncio.run(serve(args, rdir, store))
     except OSError as e:
         sys.exit("code-hub-relay: cannot listen on %s: %s" % (args.listen, e.strerror or e))
     return 0

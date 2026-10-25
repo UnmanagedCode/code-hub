@@ -71,27 +71,24 @@ test('reconcile reports the tunnels of dropped records whose child is still aliv
   assert.equal(strandedShares[0].tunnel.pid, liveFunnel.pid, 'the pid survives the delete, in the caller\'s hands');
 });
 
-// Invariant: a LAN share's relay forward id is handed back whenever reconcile
-// drops its record (dead app) or clears its tunnel (a LAN tunnel has no pid) —
-// the record is the only place that id lives, so nothing could release it later.
-test('reconcile hands back every share holding a relay forward id it drops or clears', async (t) => {
+// Invariant: a LAN share holds no child (pid null), so reconcile clears it and
+// hands nothing back — its proxy and host-relay exposure lived in the dead process.
+test('reconcile clears a LAN share and hands nothing back for it', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const live = spawnLived();
   t.after(() => { try { process.kill(-live.pid, 'SIGKILL'); } catch {} });
-  const lan = (forwardId) => ({ kind: 'lan', pid: null, url: 'https://h', relay: forwardId ? { state: 'up', forwardId } : null });
+  const lan = () => ({ kind: 'lan', pid: null, url: 'https://h', relay: { state: 'up', error: null, port: 7100, requestedPort: 7100, portFallback: false } });
 
   const s = { apps: {
-    deadApp: { id: 'deadApp', pid: 2 ** 30, tunnel: lan('F1') },
-    liveApp: { id: 'liveApp', pid: live.pid, tunnel: lan('F2') },
-    plainLan: { id: 'plainLan', pid: live.pid, tunnel: lan(null) },
+    deadApp: { id: 'deadApp', pid: 2 ** 30, tunnel: lan() },
+    liveApp: { id: 'liveApp', pid: live.pid, tunnel: lan() },
   } };
   const { strandedShares } = await state.reconcile(s);
 
-  assert.deepEqual(strandedShares.map((x) => [x.id, x.tunnel.relay.forwardId]).sort(), [['deadApp', 'F1'], ['liveApp', 'F2']]);
+  assert.deepEqual(strandedShares, []);
   assert.equal(s.apps.deadApp, undefined);
   assert.equal(s.apps.liveApp.tunnel, null);
-  assert.equal(s.apps.plainLan.tunnel, null);
 });
 
 test('corrupt state file is moved aside, not fatal', async (t) => {

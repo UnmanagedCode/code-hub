@@ -7,7 +7,7 @@ import { storeRoot } from './projects.js';
 // stopped after its source/worktree has been deleted. Shape:
 //   { apps: { <id>: RunningRecord } }
 // RunningRecord = { id, project, path, isWorktree, branch, pid, pgid, port,
-//                   urls, startedSha, startedAt, tunnel: {pid,url}|null }
+//                   fixedPort, startedSha, startedAt, tunnel: {pid,url}|null }
 const STATE_FILENAME = 'state.json';
 
 function stateFile() {
@@ -63,31 +63,23 @@ export function pidAlive(pid) {
 // `{ state, strandedShares }`.
 //
 // `strandedShares` is `[{ id, tunnel }]` for every share this drops or clears
-// that still holds something live outside this process: a share child whose
-// pid is ALIVE, or a host-relay forward (`tunnel.relay.forwardId` — a LAN
-// share's tunnel has no pid, so it is always cleared here). The record was the
-// only thing holding that pid or forward id, so after the delete no code-hub
-// path could release it (a forward of a dead process is bounded only by the
-// relay's lease) — for a tailscale funnel that means a public URL left serving
-// 443 in front of a proxy that no longer exists. This module
-// can't release them itself (it doesn't know a share's kind, and must not grow
-// a dependency on the integrations to find out), so it hands them back and the
-// caller tears them down. The invariant callers must uphold: no path drops a
-// record carrying a LIVE share pid or a relay forward id without first
-// releasing it.
+// whose child pid is still ALIVE. The record was the only thing holding that
+// pid, so after the delete no code-hub path could kill it — for a tailscale
+// funnel that means a public URL left serving 443 in front of a proxy that no
+// longer exists. This module can't kill them itself (it doesn't know a share's
+// kind, and must not grow a dependency on the integrations to find out), so it
+// hands them back and the caller tears them down. The invariant callers must
+// uphold: no path drops a record carrying a LIVE share pid without first
+// killing it.
 export async function reconcile(state) {
   const strandedShares = [];
-  const holdsLive = (t) => pidAlive(t.pid) || !!t.relay?.forwardId;
   for (const [id, rec] of Object.entries(state.apps)) {
     if (!pidAlive(rec.pid)) {
-      if (rec.tunnel && holdsLive(rec.tunnel)) strandedShares.push({ id, tunnel: rec.tunnel });
+      if (rec.tunnel && pidAlive(rec.tunnel.pid)) strandedShares.push({ id, tunnel: rec.tunnel });
       delete state.apps[id];
       continue;
     }
-    if (rec.tunnel && !pidAlive(rec.tunnel.pid)) {
-      if (rec.tunnel.relay?.forwardId) strandedShares.push({ id, tunnel: rec.tunnel });
-      rec.tunnel = null;
-    }
+    if (rec.tunnel && !pidAlive(rec.tunnel.pid)) rec.tunnel = null;
   }
   await save(state);
   return { state, strandedShares };

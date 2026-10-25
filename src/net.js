@@ -1,8 +1,7 @@
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { childEnv } from './childEnv.js';
+import { existsSync, readFileSync } from 'node:fs';
 
 // Allocate a free TCP port by binding to 0 and reading the assigned port,
 // then closing. There is a small TOCTOU window between close and the child
@@ -156,7 +155,7 @@ function fallbackLanIPv4s() {
   let ips = [];
   for (const [cmd, args] of [['ip', ['-4', 'addr']], ['ifconfig', ['-a']]]) {
     try {
-      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: childEnv() });
+      const out = cp.execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
       ips = parseLanIPv4s(out);
       if (ips.length) break;
     } catch { /* binary missing / not permitted — try the next one */ }
@@ -219,11 +218,23 @@ export function enumerateUrls(port, { lanFallback = false, scheme = 'http' } = {
   return urls;
 }
 
-// Every URL serving `routePath` on an app bound to `port`: one per base
-// (loopback + LAN IPs). Root path keeps the clean `http://host:port` form;
-// a non-root path (which always starts with `/`) is appended to each base.
-export function routeUrls(port, routePath) {
-  return enumerateUrls(port).map((b) => (routePath === '/' ? b : b + routePath));
+// The default gateway in `/proc/net/route` text (Linux): the gateway of the
+// first default route, or null. Fields are hex in host byte order, so this
+// reads them as a little-endian host does.
+export function parseDefaultGateway(text) {
+  for (const line of text.split('\n').slice(1)) {
+    const [, dest, gateway, flags] = line.trim().split(/\s+/);
+    if (dest !== '00000000' || !/^[0-9A-Fa-f]{8}$/.test(gateway ?? '') || !(parseInt(flags, 16) & 0x2)) continue;
+    const n = parseInt(gateway, 16);
+    return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, n >>> 24].join('.');
+  }
+  return null;
+}
+
+// This machine's default gateway (from inside a bridge container: the Docker
+// host), or null where /proc/net/route can't be read.
+export function defaultGatewayIPv4() {
+  try { return parseDefaultGateway(readFileSync('/proc/net/route', 'utf8')); } catch { return null; }
 }
 
 // Resolve once a TCP connection to localhost:port succeeds, or reject after

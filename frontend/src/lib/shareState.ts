@@ -117,7 +117,10 @@ export function resolveLanReachNotice(shared: Partial<Tunnel> | null | undefined
     const fallback = relay.portFallback ? ` Port ${relay.requestedPort} was busy on the host, so it is on port ${relay.port} there.` : '';
     return { level: 'note', text: `Exposed on the host's LAN through the code-hub relay.${fallback}` };
   }
-  if (relay?.state === 'down') return { level: 'warn', text: `⚠ The host relay is unreachable; code-hub keeps retrying.${container}` };
+  if (relay?.state === 'down') {
+    const why = relay.error ? ` (${relay.error})` : '';
+    return { level: 'warn', text: `⚠ The host relay isn't connected${why}; code-hub keeps retrying.${container}` };
+  }
   if (relay?.state === 'failed') return { level: 'warn', text: `⚠ Host exposure failed: ${relay.error}.${container}` };
   if (shared.containerInternal) return { level: 'warn', text: `⚠ ${CONTAINER_INTERNAL}` };
   return null;

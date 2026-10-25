@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, waitForPort, parseLanIPv4s, localIPv4s, bridgeOnlyLan } from '../src/net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, waitForPort, parseLanIPv4s, localIPv4s, bridgeOnlyLan } from '../src/net.js';
 import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
@@ -38,17 +38,6 @@ test('localIPv4s returns an array of non-internal IPv4s (empty when none visible
   assert.deepEqual(localIPv4s(), []);
 });
 
-test('routeUrls for "/" equals the clean base URLs', () => {
-  assert.deepEqual(routeUrls(1234, '/'), enumerateUrls(1234));
-});
-
-test('routeUrls appends a non-root path to every base', () => {
-  const urls = routeUrls(1234, '/terrain-editor.html');
-  assert.ok(urls.includes('http://localhost:1234/terrain-editor.html'));
-  assert.ok(urls.every((u) => u.endsWith('/terrain-editor.html')));
-  assert.equal(urls.length, enumerateUrls(1234).length);
-});
-
 const NO_NON_INTERNAL_IFACES = { lo: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }] };
 const ONE_NON_INTERNAL_IFACE = { eth0: [{ family: 'IPv4', internal: false, address: '10.0.0.5' }] };
 const FAKE_IFCONFIG_OUTPUT = 'wlan0: flags=UP\n        inet 192.168.9.9  netmask 255.255.255.0\n';
@@ -71,12 +60,6 @@ test('enumerateUrls with lanFallback:true skips the shell-out when os.networkInt
   t.mock.method(cp, 'execFileSync', () => { throw new Error('must not shell out when an interface is already visible'); });
   const urls = enumerateUrls(1234, { lanFallback: true });
   assert.deepEqual(urls, ['http://localhost:1234', 'http://10.0.0.5:1234']);
-});
-
-test('routeUrls never passes lanFallback, so it stays localhost-only when no interface is visible', (t) => {
-  t.mock.method(os, 'networkInterfaces', () => NO_NON_INTERNAL_IFACES);
-  t.mock.method(cp, 'execFileSync', () => { throw new Error('must not shell out'); });
-  assert.deepEqual(routeUrls(1234, '/'), ['http://localhost:1234']);
 });
 
 // Captured from a real Termux/Android host where os.networkInterfaces()

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { buildRoutes } from './src/routes.js';
 import { DEFAULT_DIST, mountUi, securityHeaders, terminalHandlers } from './src/webui.js';
 import * as appManager from './src/appManager.js';
+import * as hostRelay from './src/hostRelay.js';
 
 // `distDir` is a test seam: the built UI to serve.
 export function createServer({ distDir = DEFAULT_DIST } = {}) {
@@ -37,6 +38,7 @@ function listenWithRetry(server, port, host, { tries = 40, delayMs = 100 } = {})
 
 export async function start({ port = Number(process.env.PORT) || 7000, host = process.env.HOST || '127.0.0.1' } = {}) {
   await appManager.init(); // reconcile persisted running-apps against live pids
+  await hostRelay.init(); // in a container: find and dial the host relay, in the background
   const server = createServer();
   await listenWithRetry(server, port, host);
   const addr = server.address();

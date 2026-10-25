@@ -1,11 +1,10 @@
 import { execFile } from 'node:child_process';
-import { childEnv } from './childEnv.js';
 
 // Termux's Node lacks util.promisify.custom on execFile (same quirk noted in
 // code-conductor), so wrap it manually to get {stdout} back.
 function run(cwd, args) {
   return new Promise((resolve) => {
-    execFile('git', ['-C', cwd, ...args], { maxBuffer: 1 << 20, env: childEnv() }, (err, stdout) => {
+    execFile('git', ['-C', cwd, ...args], { maxBuffer: 1 << 20 }, (err, stdout) => {
       if (err) resolve(null);
       else resolve(stdout.trim());
     });

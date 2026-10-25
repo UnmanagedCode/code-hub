@@ -1,324 +1,318 @@
-import http from 'node:http';
 import net from 'node:net';
-import { readFileSync } from 'node:fs';
+import { PROTOCOL } from './relayProtocol.js';
+import * as relayStore from './relayStore.js';
+import { openControl, openData, createLimiter, checkShape, isStr, isInt, isBool, isArr, ID_RE } from './relaySession.js';
+import { runningInContainer, defaultGatewayIPv4 } from './net.js';
 
-// Client for the host relay (relay/relay.py): when code-hub runs in a
-// bridge-networked container, a LAN share is exposed on the HOST's LAN address
-// through a relay forward instead of the container's unreachable bridge IP.
+// The host relay manager. When code-hub runs in a container, it dials OUT to
+// relay/relay.py on the Docker host — found through the rendezvous files (see
+// relayStore.js) — and keeps one authenticated control session to it. Every
+// exposure (a LAN share's proxy port, a running app's port) is a (port, scope)
+// pair; the session always carries the full set, and the relay binds a host
+// listener per pair for exactly as long as the session lives. A host client
+// arrives as an `incoming` frame and is claimed with one fresh data
+// connection, piped to the exposure's target here — the relay never learns it.
 //
-// code-hub dials out to the relay and parks upgraded HTTP connections on a
-// forward; the relay splices each LAN connection onto one, and code-hub pipes it
-// to the share's own auth proxy, which the relay never learns. The wire protocol
-// is defined once, in relay/protocol.json, and read here — never restated.
-const PROTOCOL = JSON.parse(readFileSync(new URL('../relay/protocol.json', import.meta.url), 'utf8'));
-const PATHS = PROTOCOL.paths;
+// State machine: off → (init in a container) absent ⇄ connecting → up, with
+// retrying (an error and a backoff timer) after a failed attempt or a lost
+// session. An unusable relay file waits for the file to change instead.
+export const SCOPES = PROTOCOL.scopes;
+const FRAMES = PROTOCOL.frames;
+const SCOPE_VALUES = new Set(Object.values(SCOPES));
+const ERROR_CODE_VALUES = new Set(Object.values(PROTOCOL.errorCodes));
 
-const ACCEPT_POOL = 4;
-const REPARK_FLOOR_MS = 250;
-const REPARK_BACKOFF_MS = 1000;
-// Control answers are small JSON objects; a bigger one fails without being
-// parsed (so a forward it might name is left to the relay's lease).
-const MAX_ANSWER_BYTES = 64 * 1024;
-// setTimeout's ceiling: a longer delay fires after 1ms instead.
-const MAX_TIMER_MS = 2 ** 31 - 1;
-let requestTimeoutMs = 3000;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_CAP_MS = 10000;
+const STATUS_WAIT_MS = 2000;
+const DEFAULT_LOOPBACK_DIAL_HOST = 'host.docker.internal';
+let loopbackDialHost = DEFAULT_LOOPBACK_DIAL_HOST;
 
-// Test seam: the per-request timeout of control calls (create, renew, delete).
-export function _setRequestTimeoutMs(ms) { requestTimeoutMs = ms; }
+// Test seam: the name dialled for a relay listening on the host's loopback (null restores it).
+export function _setLoopbackDialHost(host) { loopbackDialHost = host ?? DEFAULT_LOOPBACK_DIAL_HOST; }
 
-const withId = (template, id) => template.replace('{id}', encodeURIComponent(id));
+let state = 'off';
+let error = null;
+let currentAddresses = [];
+// Bumped by init() and stop(): async work begun under an older generation is dropped.
+let gen = 0;
+let stopWatch = null;
+let retryTimer = null;
+let attempts = 0;
+let connecting = false;
+let dirty = false;
+let session = null; // { token, id, send, close, dial: { host, port }, secret }
+const limiter = createLimiter(PROTOCOL.maxHubHandshakes);
+const exposures = new Map(); // pair key → Set of handles, oldest first
+let statuses = new Map(); // pair key → the relay's status entry
+const pipes = new Set(); // data-connection closers of the current session
+const statusWaiters = new Set();
 
-// The environment variables that configure the relay. The secret is a
-// capability to listen on the host's LAN, so childEnv.js keeps both out of
-// every child code-hub starts.
-export const RELAY_ENV = Object.freeze({ url: 'CODEHUB_RELAY_URL', secret: 'CODEHUB_RELAY_SECRET' });
+const pairKey = (port, scope) => `${port}/${scope}`;
 
-// The relay to use, read from the environment on every call (like
-// PROJECTS_ROOT): null when CODEHUB_RELAY_URL is unset (the feature is off),
-// else { url, host, port, secret, error } — `error` set when the config can't
-// work, which fails the forward with that reason rather than the share.
-export function relayConfig() {
-  const url = process.env[RELAY_ENV.url];
-  if (!url) return null;
-  const secret = process.env[RELAY_ENV.secret]?.trim() ?? '';
-  let parsed;
-  try { parsed = new URL(url); } catch {
-    return { url, error: `CODEHUB_RELAY_URL '${url}' is not a URL` };
+// Test seam: handshakes currently holding a limiter slot.
+export function _handshakesInFlight() { return limiter.inFlight; }
+
+// Where to dial a relay that listens on `listenHost`: a loopback listener is
+// reached through the Docker Desktop host name; any other address as written,
+// then the container's default gateway.
+export function dialCandidates(listenHost, gateway, loopbackHost = loopbackDialHost) {
+  if (net.isIPv4(listenHost) && listenHost.startsWith('127.')) return [loopbackHost];
+  return [...new Set([listenHost, gateway].filter(Boolean))];
+}
+
+export async function init() {
+  stop();
+  const myGen = gen;
+  try {
+    await relayStore.ensureSecret();
+  } catch (e) {
+    console.error(`[hostRelay] ${e.message} — the host relay stays off`);
+    return;
   }
-  if (parsed.protocol !== 'http:') return { url, error: `CODEHUB_RELAY_URL must be an http: URL, got '${url}'` };
-  if (!secret) return { url, error: 'CODEHUB_RELAY_URL is set but CODEHUB_RELAY_SECRET is empty — set it to the contents of the relay\'s secret file' };
-  return { url, host: parsed.hostname, port: Number(parsed.port) || 80, secret, error: null };
+  if (myGen !== gen || !runningInContainer()) return;
+  state = 'absent';
+  stopWatch = relayStore.watchHost(onHostChange);
+  evaluate();
 }
 
-function relayError(message, extra = {}) {
-  return Object.assign(new Error(message), extra);
+// Ends the session (the relay closes every host listener with it) and stops
+// watching. Exposures stay registered, so a later init() carries them again.
+export function stop() {
+  gen += 1;
+  stopWatch?.();
+  stopWatch = null;
+  clearTimeout(retryTimer);
+  retryTimer = null;
+  attempts = 0;
+  connecting = false;
+  dirty = false;
+  const s = session;
+  session = null;
+  s?.close();
+  dropSessionState();
+  state = 'off';
+  error = null;
+  notifyAll();
 }
 
-// One control call: resolves { status, body } (body parsed as JSON when it is
-// some), rejects on a network error or after requestTimeoutMs.
-function call(cfg, method, path, body) {
-  return new Promise((resolve, reject) => {
-    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
-    const req = http.request({
-      host: cfg.host, port: cfg.port, method, path, agent: false,
-      headers: {
-        Authorization: `Bearer ${cfg.secret}`,
-        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}),
-      },
-    }, (res) => {
-      const chunks = [];
-      let size = 0;
-      res.on('data', (c) => {
-        size += c.length;
-        if (size > MAX_ANSWER_BYTES) req.destroy(relayError(`the relay's answer is malformed (larger than ${MAX_ANSWER_BYTES} bytes)`));
-        else chunks.push(c);
-      });
-      res.on('end', () => {
-        clearTimeout(timer);
-        const text = Buffer.concat(chunks).toString('utf8');
-        let parsed = null;
-        try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
-        resolve({ status: res.statusCode, body: parsed });
-      });
-      res.on('error', reject);
-    });
-    const timer = setTimeout(() => req.destroy(relayError(`the relay at ${cfg.url} did not answer within ${requestTimeoutMs}ms`)), requestTimeoutMs);
-    req.on('error', (e) => { clearTimeout(timer); reject(e); });
-    req.end(payload ?? undefined);
+export function status() {
+  return { state, error, addresses: [...currentAddresses] };
+}
+
+// The relay's advertised LAN addresses while the session is up, else [].
+export function addresses() {
+  return state === 'up' ? [...currentAddresses] : [];
+}
+
+function dropSessionState() {
+  statuses = new Map();
+  currentAddresses = [];
+  for (const p of [...pipes]) p.close();
+  pipes.clear();
+  for (const w of [...statusWaiters]) w();
+}
+
+function setState(next, why) {
+  if (why && why !== error) console.error(`[hostRelay] ${why}`);
+  state = next;
+  error = why;
+  notifyAll();
+}
+
+function onHostChange() {
+  if (state === 'off' || state === 'up') return;
+  if (connecting) { dirty = true; return; }
+  attempts = 0;
+  evaluate();
+}
+
+function scheduleRetry(why) {
+  const delay = Math.min(BACKOFF_BASE_MS * 2 ** attempts, BACKOFF_CAP_MS);
+  attempts += 1;
+  setState('retrying', why);
+  retryTimer = setTimeout(evaluate, delay);
+  retryTimer.unref();
+}
+
+async function evaluate() {
+  const myGen = gen;
+  clearTimeout(retryTimer);
+  retryTimer = null;
+  if (state === 'off' || state === 'up' || connecting) return;
+  connecting = true;
+  dirty = false;
+  try {
+    const host = await relayStore.readHost();
+    if (myGen !== gen) return;
+    if (!host) { setState('absent', null); return; }
+    if (host.error) { setState('retrying', host.error); return; } // until the file changes
+    setState('connecting', error);
+    let secret;
+    try { secret = await relayStore.ensureSecret(); } catch (e) { if (myGen === gen) scheduleRetry(e.message); return; }
+    const token = {};
+    let opened = null;
+    let dial = null;
+    let lastError = null;
+    for (const candidate of dialCandidates(host.listenHost, defaultGatewayIPv4())) {
+      try {
+        opened = await openControl({
+          host: candidate, port: host.listenPort, secret, limiter,
+          onFrame: (f) => onFrame(token, f),
+          onClose: (why) => onSessionClose(token, why),
+        });
+        dial = candidate;
+        break;
+      } catch (e) {
+        lastError = e;
+        if (myGen !== gen) return;
+      }
+    }
+    if (myGen !== gen) { opened?.close(); return; }
+    if (!opened) { scheduleRetry(lastError.message); return; }
+    session = { ...opened, token, dial: { host: dial, port: host.listenPort }, secret };
+    attempts = 0;
+    currentAddresses = opened.addresses;
+    console.error(`[hostRelay] connected to the relay at ${dial}:${host.listenPort} (session ${opened.id})`);
+    setState('up', null);
+    sendPorts();
+  } finally {
+    if (myGen === gen) {
+      connecting = false;
+      if (dirty && state !== 'up') { dirty = false; attempts = 0; evaluate(); }
+    }
+  }
+}
+
+function onSessionClose(token, why) {
+  if (!session || session.token !== token) return;
+  session = null;
+  dropSessionState();
+  scheduleRetry(`connection to the relay lost: ${why}`);
+}
+
+const STATUS_SHAPE = { t: isStr, addresses: isArr, ports: isArr };
+const INCOMING_SHAPE = { t: isStr, port: isInt, scope: isStr, conn: isStr };
+const BOUND_SHAPE = { port: isInt, scope: isStr, hostPort: isInt, fallback: isBool };
+const REFUSED_SHAPE = { port: isInt, scope: isStr, code: isStr, message: isStr };
+
+// Whether the relay can expose container port `p` at all (relay/protocol.json's port range).
+export const inPortRange = (p) => Number.isInteger(p) && p >= PROTOCOL.port.min && p <= PROTOCOL.port.max;
+
+function onFrame(token, f) {
+  if (!session || session.token !== token) return;
+  if (f.t === FRAMES.status) applyStatus(f);
+  else if (f.t === FRAMES.incoming) onIncoming(f);
+  else throw new Error(`unexpected ${JSON.stringify(f.t)} frame`);
+}
+
+function applyStatus(f) {
+  checkShape(f, STATUS_SHAPE, 'a status frame');
+  if (f.addresses.length > PROTOCOL.maxAddresses || !f.addresses.every((a) => typeof a === 'string' && net.isIPv4(a))) {
+    throw new Error('a status frame carries malformed addresses');
+  }
+  const next = new Map();
+  for (const e of f.ports) {
+    checkShape(e, e && typeof e === 'object' && 'code' in e ? REFUSED_SHAPE : BOUND_SHAPE, 'a status entry');
+    if (!inPortRange(e.port) || !SCOPE_VALUES.has(e.scope)) throw new Error('a status entry names an invalid port or scope');
+    if ('code' in e ? !ERROR_CODE_VALUES.has(e.code) : (e.hostPort < 1 || e.hostPort > 65535)) throw new Error('a status entry is malformed');
+    next.set(pairKey(e.port, e.scope), e);
+  }
+  statuses = next;
+  currentAddresses = f.addresses;
+  for (const w of [...statusWaiters]) w();
+  notifyAll();
+}
+
+function onIncoming(f) {
+  checkShape(f, INCOMING_SHAPE, 'an incoming frame');
+  if (!inPortRange(f.port) || !SCOPE_VALUES.has(f.scope) || !ID_RE.test(f.conn)) throw new Error('an incoming frame is malformed');
+  const handles = exposures.get(pairKey(f.port, f.scope));
+  if (!handles?.size) return; // unexposed meanwhile: the relay drops the client after --accept-wait-ms
+  const target = [...handles].at(-1).target;
+  const s = session;
+  const closer = openData({
+    host: s.dial.host, port: s.dial.port, secret: s.secret, limiter,
+    session: s.id, conn: f.conn, target,
+    onClose: () => pipes.delete(closer),
+  });
+  pipes.add(closer);
+}
+
+function sendPorts() {
+  if (state !== 'up' || !session) return;
+  const ports = [...exposures.values()].map((set) => {
+    const { port, scope } = set.values().next().value;
+    return { port, scope };
+  });
+  session.send({ t: FRAMES.ports, ports });
+}
+
+function infoFor(h) {
+  if (state === 'off' || state === 'absent') return null;
+  const down = (why) => ({ state: 'down', error: why, port: null, requestedPort: h.port, portFallback: false });
+  if (state !== 'up') return down(error);
+  const s = statuses.get(h.key);
+  if (!s) return down('waiting for the relay to bind the port');
+  if ('code' in s) return { state: 'failed', error: s.message, port: null, requestedPort: h.port, portFallback: false };
+  return { state: 'up', error: null, port: s.hostPort, requestedPort: h.port, portFallback: s.fallback };
+}
+
+// What a handle's owner sees: its info, plus the addresses for a LAN pair
+// (they are part of its URLs).
+const snapshot = (h) => JSON.stringify([infoFor(h), h.scope === SCOPES.lan ? addresses() : null]);
+
+function notifyAll() {
+  for (const set of exposures.values()) {
+    for (const h of set) {
+      const snap = snapshot(h);
+      if (snap === h.last) continue;
+      h.last = snap;
+      try { h.onChange(); } catch (e) { console.error(`[hostRelay] a change handler for port ${h.port} failed: ${e.message}`); }
+    }
+  }
+}
+
+function waitStatus(key) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); statusWaiters.delete(check); resolve(); };
+    const check = () => { if (state !== 'up' || statuses.has(key)) done(); };
+    const timer = setTimeout(done, STATUS_WAIT_MS);
+    timer.unref();
+    statusWaiters.add(check);
   });
 }
 
-function describeFailure(cfg, status, body) {
-  if (status === 401) return `the relay at ${cfg.url} refused CODEHUB_RELAY_SECRET (401)`;
-  return `the relay answered ${status}${body?.error ? `: ${body.error}` : ''}`;
-}
-
-// POST a forward, falling back to a free port when the requested one is busy.
-// Resolves { id, port, addresses, leaseMs, portFallback }.
-async function createForward(cfg, port) {
-  let res = await call(cfg, 'POST', PATHS.forwards, port ? { port } : {});
-  let portFallback = false;
-  if (port && res.status === 409 && res.body?.code === PROTOCOL.errorCodes.portInUse) {
-    res = await call(cfg, 'POST', PATHS.forwards, {});
-    portFallback = true;
-  }
-  if (res.status !== 201) throw relayError(describeFailure(cfg, res.status, res.body), { status: res.status, code: res.body?.code });
-  const body = res.body;
-  const id = body && typeof body === 'object' ? body.id : undefined;
-  const discard = () => { if (typeof id === 'string' && id) call(cfg, 'DELETE', withId(PATHS.forward, id)).catch(() => {}); };
-  // Malformed before mismatched: a garbled answer must be named as such, not
-  // read as a version it never stated.
-  const malformed = createdProblem(body);
-  if (malformed) {
-    discard();
-    throw relayError(`the relay's create response is malformed (${malformed})`);
-  }
-  if (body.protocol !== PROTOCOL.protocolVersion) {
-    discard();
-    throw relayError(`relay speaks protocol ${body.protocol}, this code-hub speaks ${PROTOCOL.protocolVersion} — update the relay/ copy on the host`);
-  }
-  return { id, port: body.port, addresses: body.addresses, leaseMs: body.leaseMs, portFallback };
-}
-
-// Why a 201 create body can't be used, or null. Checked here, at the boundary,
-// so nothing downstream ever builds URLs or timers from a half-formed forward.
-function createdProblem(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'not a JSON object';
-  const { protocol, id, port, addresses, leaseMs } = body;
-  if (!Number.isInteger(protocol)) return `protocol ${JSON.stringify(protocol)}`;
-  if (typeof id !== 'string' || !id) return 'no forward id';
-  if (!Number.isInteger(port) || port < PROTOCOL.port.min || port > PROTOCOL.port.max) return `port ${JSON.stringify(port)}`;
-  if (!Array.isArray(addresses) || !addresses.length || !addresses.every((a) => typeof a === 'string' && net.isIPv4(a))) return 'addresses is not a non-empty list of IPv4 addresses';
-  if (addresses.length > PROTOCOL.maxAddresses) return `${addresses.length} addresses, more than ${PROTOCOL.maxAddresses}`;
-  if (!Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > PROTOCOL.maxLeaseMs) return `leaseMs ${JSON.stringify(leaseMs)}`;
-  return null;
-}
-
-// Live handles by their current forward id, so release() can close the one
-// that owns an id.
-const handles = new Map();
-
-// Open a forward on the relay, at `port` when given (falling back to a free one
-// if the host's port is busy — `portFallback`). Rejects with the reason when
-// the relay is misconfigured, unreachable, refuses, or speaks another protocol.
-//
-// The handle renews the lease every leaseMs/3. A lost forward (404, or the
-// relay unreachable) goes `down`, and each later tick re-creates it on the same
-// port; every state change calls `onChange({ prevId })`. `attach({ host, port })`
-// starts parking accepts that are piped to that local target. `close()` stops
-// everything, cuts live connections and deletes the forward (best effort).
-export async function openForward({ port, onChange = () => {} } = {}) {
-  const cfg = relayConfig();
-  if (!cfg) throw relayError('the host relay is not configured (CODEHUB_RELAY_URL is unset)');
-  if (cfg.error) throw relayError(cfg.error);
-  const fwd = await createForward(cfg, port);
-  return makeHandle(cfg, fwd, { requestedPort: port ?? null, onChange });
-}
-
-function makeHandle(cfg, fwd, { requestedPort, onChange }) {
-  let { id, port: boundPort, addresses, leaseMs, portFallback } = fwd;
-  let state = 'up';
-  let error = null;
+// Expose container `port` in `scope` (a value of SCOPES): host clients reach
+// `target` ({ host, port }) through the relay while a session is up.
+// onChange() fires whenever info() — or, for a LAN pair, the advertised
+// addresses — changes. `ready` resolves once the relay reported on this pair,
+// after STATUS_WAIT_MS, or at once when no session is up. close() is idempotent.
+export function expose(port, scope, target, onChange = () => {}) {
+  if (!SCOPE_VALUES.has(scope)) throw new Error(`unknown relay scope ${JSON.stringify(scope)}`);
+  if (!inPortRange(port)) throw new Error(`port ${port} is outside the relay's port range`);
+  const key = pairKey(port, scope);
+  const h = { key, port, scope, target, onChange, last: null };
+  const isNew = !exposures.has(key);
+  if (isNew) exposures.set(key, new Set());
+  exposures.get(key).add(h);
+  h.last = snapshot(h);
+  if (isNew) sendPorts();
+  const ready = state !== 'up' || statuses.has(key) ? Promise.resolve() : waitStatus(key);
   let closed = false;
-  let target = null;
-  let ticking = false;
-  const parks = new Set(); // pending accept requests
-  const pipes = new Set(); // live spliced sockets
-  const timers = new Set(); // lease ticks
-  const parkTimers = new Set(); // slots waiting to re-park
-  // The pool is ACCEPT_POOL slots, each a loop of park → (splice) → re-park.
-  // A drain bumps `poolGen` and forgets every slot at once, so a callback of a
-  // drained slot (a destroyed request's error, a pending re-park) is a no-op and
-  // the next fill starts exactly ACCEPT_POOL fresh ones.
-  let poolGen = 0;
-  let slots = 0;
-
-  const later = (fn, ms, set = timers) => {
-    const t = setTimeout(() => { set.delete(t); fn(); }, ms);
-    t.unref();
-    set.add(t);
-  };
-
-  // --- accept pool --------------------------------------------------------
-  const runSlot = (gen) => {
-    if (gen !== poolGen) return;
-    if (closed || state !== 'up' || !target) { slots -= 1; return; }
-    const startedAt = Date.now();
-    const forwardId = id;
-    const again = (minDelay) => {
-      if (gen !== poolGen) return;
-      later(() => runSlot(gen), Math.max(minDelay, REPARK_FLOOR_MS - (Date.now() - startedAt)), parkTimers);
-    };
-    const req = http.request({
-      host: cfg.host, port: cfg.port, method: 'GET', path: withId(PATHS.accept, forwardId), agent: false,
-      headers: { Authorization: `Bearer ${cfg.secret}`, Connection: 'Upgrade', Upgrade: PROTOCOL.upgradeToken },
-    });
-    parks.add(req);
-    let settled = false;
-    const settle = () => { if (settled) return false; settled = true; parks.delete(req); return true; };
-    req.on('socket', (s) => s.setKeepAlive(true, 15000));
-    req.on('upgrade', (_res, socket, head) => {
-      if (!settle()) { socket.destroy(); return; }
-      if (closed) { socket.destroy(); return; }
-      pipe(socket, head);
-      again(0);
-    });
-    req.on('response', (res) => {
-      // Any non-upgrade answer ends this park: its body is never needed, and a
-      // relay that sends headers but never ends the body must not hold sockets.
-      res.destroy();
-      if (!settle()) return;
-      if (res.statusCode === 404 && forwardId === id && gen === poolGen) markDown(`the relay no longer knows forward ${forwardId}`);
-      else again(REPARK_BACKOFF_MS);
-    });
-    req.on('error', () => { if (settle()) again(REPARK_BACKOFF_MS); });
-    req.end();
-  };
-
-  const pipe = (socket, head) => {
-    const up = net.connect(target.port, target.host);
-    pipes.add(socket); pipes.add(up);
-    if (head?.length) up.write(head);
-    socket.pipe(up);
-    up.pipe(socket);
-    const done = () => { socket.destroy(); up.destroy(); pipes.delete(socket); pipes.delete(up); };
-    socket.on('error', done); up.on('error', done);
-    socket.on('close', done); up.on('close', done);
-  };
-
-  const fillPool = () => {
-    if (closed || state !== 'up' || !target) return;
-    while (slots < ACCEPT_POOL) { slots += 1; runSlot(poolGen); }
-  };
-  const drainPool = () => {
-    poolGen += 1;
-    slots = 0;
-    for (const t of parkTimers) clearTimeout(t);
-    parkTimers.clear();
-    for (const req of parks) req.destroy();
-    parks.clear();
-  };
-
-  // --- lease ---------------------------------------------------------------
-  const emit = (prevId) => { try { onChange({ prevId }); } catch (e) { console.error(`[hostRelay] onChange failed: ${e.message}`); } };
-
-  const markDown = (why) => {
-    if (closed || state !== 'up') return;
-    state = 'down'; error = why;
-    drainPool();
-    console.error(`[hostRelay] forward ${id} is down (${why}) — retrying`);
-    emit(id);
-  };
-
-  const tick = async () => {
-    if (closed || ticking) return;
-    ticking = true;
-    try {
-      if (state === 'up') {
-        const res = await call(cfg, 'POST', withId(PATHS.renew, id)).catch((e) => ({ status: 0, error: e }));
-        if (closed) return;
-        if (res.status === 200) return;
-        markDown(res.status ? describeFailure(cfg, res.status, res.body) : `the relay at ${cfg.url} is unreachable: ${res.error.message}`);
-      } else {
-        let next;
-        try { next = await createForward(cfg, boundPort); } catch (e) { error = e.message; return; }
-        if (closed) { call(cfg, 'DELETE', withId(PATHS.forward, next.id)).catch(() => {}); return; }
-        const prevId = id;
-        handles.delete(prevId);
-        ({ id, port: boundPort, addresses, leaseMs } = next);
-        portFallback = portFallback || next.portFallback;
-        handles.set(id, handle);
-        state = 'up'; error = null;
-        console.error(`[hostRelay] forward re-created as ${id} on port ${boundPort}`);
-        emit(prevId);
-        fillPool();
-      }
-    } finally {
-      ticking = false;
-      scheduleTick();
-    }
-  };
-  const scheduleTick = () => { if (!closed) later(tick, Math.min(MAX_TIMER_MS, Math.max(50, Math.floor(leaseMs / 3)))); };
-
-  const handle = {
-    get id() { return id; },
-    get port() { return boundPort; },
-    get addresses() { return addresses; },
-    get state() { return state; },
-    get error() { return error; },
-    get portFallback() { return portFallback; },
-    requestedPort,
-    attach(t) {
-      if (closed || target) return;
-      target = t;
-      fillPool();
+  return {
+    ready,
+    info: () => (closed ? null : infoFor(h)),
+    hostPort: () => {
+      const info = closed ? null : infoFor(h);
+      return info?.state === 'up' ? info.port : null;
     },
-    // Idempotent. Resolves once the relay answered the DELETE (or it failed).
     close() {
-      if (closed) return Promise.resolve();
+      if (closed) return;
       closed = true;
-      for (const t of timers) clearTimeout(t);
-      timers.clear();
-      drainPool();
-      for (const s of pipes) s.destroy();
-      pipes.clear();
-      handles.delete(id);
-      return state === 'up' ? call(cfg, 'DELETE', withId(PATHS.forward, id)).then(() => {}, () => {}) : Promise.resolve();
+      const set = exposures.get(key);
+      if (!set?.delete(h) || set.size) return;
+      exposures.delete(key);
+      sendPorts();
     },
   };
-  handles.set(id, handle);
-  scheduleTick();
-  return handle;
-}
-
-// Release forward `forwardId`: close the live handle that owns it, else send a
-// best-effort DELETE (a forward left by an earlier code-hub process). Never
-// throws; idempotent. The lease is the backstop when the relay can't be reached.
-export function release(forwardId) {
-  if (!forwardId) return Promise.resolve();
-  const live = handles.get(forwardId);
-  if (live) return live.close();
-  const cfg = relayConfig();
-  if (!cfg || cfg.error) return Promise.resolve();
-  return call(cfg, 'DELETE', withId(PATHS.forward, forwardId)).then(() => {}, () => {});
 }

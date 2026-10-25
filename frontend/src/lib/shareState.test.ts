@@ -350,7 +350,8 @@ const relay = (over: Partial<RelayInfo> = {}): RelayInfo => ({ state: 'up', erro
 const lanShare = (over: Partial<Tunnel> = {}): Tunnel => ({ kind: 'lan', url: 'https://192.168.1.20:7100', auth: true, qrSvg: '<svg>qr</svg>', ...over });
 
 // Invariant: each relay state maps to its notice level and says what the user needs — host exposure with the
-// port fallback when it happened, a retrying outage, the failure reason (plus the container sentence when the
+// port fallback when it happened, a retrying outage with its reason when there is one (and no empty parenthesis
+// when there isn't), the failure reason (plus the container sentence when the
 // addresses are container-internal), the container warning with no relay, and nothing otherwise.
 test('resolveLanReachNotice: one row per relay state', () => {
   const up = resolveLanReachNotice(lanShare({ relay: relay() }));
@@ -361,9 +362,12 @@ test('resolveLanReachNotice: one row per relay state', () => {
   expect(fallback?.level).toBe('note');
   expect(fallback?.text).toMatch(/Port 8080 was busy on the host, so it is on port 41000/);
 
-  const down = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'gone' }) }));
+  const down = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: 'connect ECONNREFUSED 10.0.0.1:7077' }) }));
   expect(down?.level).toBe('warn');
-  expect(down?.text).toMatch(/host relay is unreachable; code-hub keeps retrying/);
+  expect(down?.text).toMatch(/host relay isn't connected \(connect ECONNREFUSED 10\.0\.0\.1:7077\); code-hub keeps retrying/);
+  const downNoReason = resolveLanReachNotice(lanShare({ relay: relay({ state: 'down', error: null }) }));
+  expect(downNoReason?.text).toMatch(/host relay isn't connected; code-hub keeps retrying/);
+  expect(downNoReason?.text).not.toMatch(/\(/);
 
   const failed = resolveLanReachNotice(lanShare({ relay: relay({ state: 'failed', error: 'connect ECONNREFUSED' }) }));
   expect(failed?.level).toBe('warn');
