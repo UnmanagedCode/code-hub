@@ -1,4 +1,5 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -221,31 +222,39 @@ function trackRelay(proc) {
   proc.once('exit', () => liveRelays.delete(proc));
 }
 
-// Spawn the real relay on loopback. The relay probes the default route at
-// startup in every run (its listen guard compares against the answer);
-// `advertise` null also makes that answer the advertised address, and
-// CODEHUB_RELAY_PROBE_DEST (via `env`) is the seam that forces it. `relayDir`
-// points at a (patched) copy of relay/. Resolves once its listening line is
-// printed: { url, secret, secretFile, port, proc, output(), exited, stop() }.
-// Rejects with the relay's stderr if it exits first, or kills it and rejects
-// if it neither listens nor exits within RELAY_START_TIMEOUT_MS.
+// A copy of relay/ in a fresh temp dir whose protocol.json has `overrides`
+// merged in (shorter timings, smaller caps), so a test can reach a bound
+// quickly with no extra seam in the relay. Removed after `t`.
+export async function patchedRelayDir(t, overrides = {}) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relaycopy-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  await fs.copyFile(path.join(REPO_ROOT, 'relay', 'relay.py'), path.join(dir, 'relay.py'));
+  const protocol = JSON.parse(await fs.readFile(path.join(REPO_ROOT, 'relay', 'protocol.json'), 'utf8'));
+  await fs.writeFile(path.join(dir, 'protocol.json'), JSON.stringify({ ...protocol, ...overrides }));
+  return dir;
+}
+
+// Spawn the real relay on loopback, finding code-hub's store through
+// `--projects-root <projectsRoot>` (which must hold a .code-hub dir). The
+// relay probes the default route at startup in every run (its listen guard
+// compares against the answer); `advertise` null also makes that answer the
+// advertised address, and CODEHUB_RELAY_PROBE_DEST (via `env`) is the seam that
+// forces it. `relayDir` points at a (patched) copy of relay/. Resolves once its
+// listening line is printed: { port, proc, output(), exited, stop() }. Rejects
+// with the relay's stderr if it exits first, or kills it and rejects if it
+// neither listens nor exits within RELAY_START_TIMEOUT_MS.
 export async function startRelay({
-  listenPort = 0, advertise = '127.0.0.1', leaseMs = 300, secretFile, acceptWaitMs,
-  relayDir = path.join(REPO_ROOT, 'relay'), env = {}, extraArgs = [],
+  projectsRoot, listenPort = 0, advertise = '127.0.0.1', acceptWaitMs,
+  relayDir = path.join(REPO_ROOT, 'relay'), env = {}, extraArgs = [], cwd,
 } = {}) {
   const py = findPython();
   if (!py.ok) throw new Error(`${PYTHON_MISSING} (${py.reason})`);
-  let ownDir = null;
-  if (!secretFile) {
-    ownDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-    secretFile = path.join(ownDir, 'secret');
-  }
-  const argv = [...py.args, path.join(relayDir, 'relay.py'), '--listen', `127.0.0.1:${listenPort}`,
-    '--secret-file', secretFile, '--lease-ms', String(leaseMs)];
+  const argv = [...py.args, path.join(relayDir, 'relay.py'), '--listen', `127.0.0.1:${listenPort}`];
+  if (projectsRoot) argv.push('--projects-root', projectsRoot);
   if (advertise !== null) argv.push('--advertise', advertise);
   if (acceptWaitMs !== undefined) argv.push('--accept-wait-ms', String(acceptWaitMs));
   argv.push(...extraArgs);
-  const proc = spawn(py.cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+  const proc = spawn(py.cmd, argv, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
   trackRelay(proc);
   let stdout = '', stderr = '';
   proc.stdout.on('data', (d) => { stdout += d; });
@@ -266,16 +275,14 @@ export async function startRelay({
   });
   // From here on the relay can't keep the test file alive; waiting on its exit refs it again.
   proc.unref(); proc.stdout.unref(); proc.stderr.unref();
-  const secret = (await fs.readFile(secretFile, 'utf8')).trim();
   return {
-    url: `http://127.0.0.1:${port}`, port, secret, secretFile, proc,
+    port, proc,
     output: () => ({ stdout, stderr }),
     get exited() { proc.ref(); return exitedPromise; },
     async stop(signal = 'SIGKILL') {
       if (proc.exitCode === null && proc.signalCode === null) proc.kill(signal);
       proc.ref();
       await exitedPromise;
-      if (ownDir) await fs.rm(ownDir, { recursive: true, force: true });
     },
   };
 }
@@ -284,11 +291,11 @@ export async function startRelay({
 // stderr }. One still running after RELAY_RUN_TIMEOUT_MS — it was expected to
 // refuse, and started instead — is killed and the call rejects, so a failing
 // test can't wedge the run.
-export async function runRelay(args, { env = {}, relayDir = path.join(REPO_ROOT, 'relay') } = {}) {
+export async function runRelay(args, { env = {}, relayDir = path.join(REPO_ROOT, 'relay'), cwd } = {}) {
   const py = findPython();
   if (!py.ok) throw new Error(`${PYTHON_MISSING} (${py.reason})`);
   const proc = spawn(py.cmd, [...py.args, path.join(relayDir, 'relay.py'), ...args],
-    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
+    { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', ...env } });
   trackRelay(proc);
   let stdout = '', stderr = '';
   proc.stdout.on('data', (d) => { stdout += d; });
@@ -301,29 +308,83 @@ export async function runRelay(args, { env = {}, relayDir = path.join(REPO_ROOT,
   return { code, stdout, stderr };
 }
 
-// Point code-hub at `relay` for the rest of test `t` (CODEHUB_RELAY_URL/SECRET).
-export function withRelayEnv(t, relay) {
-  const prev = { url: process.env.CODEHUB_RELAY_URL, secret: process.env.CODEHUB_RELAY_SECRET };
-  process.env.CODEHUB_RELAY_URL = relay.url;
-  process.env.CODEHUB_RELAY_SECRET = relay.secret;
-  t.after(() => {
-    for (const [k, v] of [['CODEHUB_RELAY_URL', prev.url], ['CODEHUB_RELAY_SECRET', prev.secret]]) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
+// --- a raw host-relay protocol peer, written independently of src/ ------------
+// Tests drive the real relay (or play the relay against code-hub) with it, so
+// a fault shared by both of code-hub's sides can't hide behind agreement.
+
+export const RELAY_PROTOCOL = JSON.parse(readFileSync(path.join(REPO_ROOT, 'relay', 'protocol.json'), 'utf8'));
+
+export function protoMac(secret, label, role, nonceRelay, nonceHub, session = '', conn = '') {
+  return crypto.createHmac('sha256', secret).update(`${label}\n${role}\n${nonceRelay}\n${nonceHub}\n${session}\n${conn}`).digest('hex');
+}
+
+export const freshNonce = () => crypto.randomBytes(RELAY_PROTOCOL.nonceBytes).toString('base64url');
+
+// Newline-delimited JSON frames off a socket, plus the raw bytes after them:
+// { next(timeoutMs) → frame | null at close, rest() → the unread bytes,
+//   closed: Promise<void>, received() → every byte so far }.
+export function frameStream(socket) {
+  let buf = Buffer.alloc(0);
+  let all = Buffer.alloc(0);
+  let ended = false;
+  let wake = null;
+  const closed = new Promise((r) => socket.once('close', r));
+  socket.on('data', (d) => { buf = Buffer.concat([buf, d]); all = Buffer.concat([all, d]); wake?.(); });
+  socket.on('error', () => {});
+  socket.on('close', () => { ended = true; wake?.(); });
+  return {
+    closed,
+    received: () => all,
+    rest: () => buf,
+    async next(timeoutMs = 3000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const i = buf.indexOf(10);
+        if (i !== -1) {
+          const line = buf.subarray(0, i).toString('utf8');
+          buf = buf.subarray(i + 1);
+          return JSON.parse(line);
+        }
+        if (ended) return null;
+        const left = deadline - Date.now();
+        if (left <= 0) throw new Error('no frame within the timeout');
+        await new Promise((r) => { wake = r; setTimeout(r, left); });
+        wake = null;
+      }
+    },
+  };
+}
+
+export function tcpConnect(port, host = '127.0.0.1') {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, host, () => { s.off('error', reject); resolve(s); });
+    s.once('error', reject);
   });
 }
 
-// A raw control call against a relay: { status, body }.
-export async function relayCall(relay, method, path_, body, { secret = relay.secret } = {}) {
-  const res = await fetch(relay.url + path_, {
-    method,
-    headers: { ...(secret ? { Authorization: `Bearer ${secret}` } : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
-    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
-  });
-  const text = await res.text();
-  let parsed = null;
-  try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
-  return { status: res.status, body: parsed };
+// Connect to a relay as code-hub would: read the hello, send `auth` (built
+// from `secret`, or overridden field by field via `authOver`), and return
+// { socket, frames, hello, auth, reply } — `reply` the welcome or error frame.
+export async function relayLogin(port, secret, { role = RELAY_PROTOCOL.roles.control, session = '', conn = '', authOver = {} } = {}) {
+  const socket = await tcpConnect(port);
+  const frames = frameStream(socket);
+  const hello = await frames.next();
+  const nonce = freshNonce();
+  const auth = {
+    t: RELAY_PROTOCOL.frames.auth, v: RELAY_PROTOCOL.protocolVersion, role, nonce,
+    mac: protoMac(secret, RELAY_PROTOCOL.macLabels.hub, role, hello.nonce, nonce, session, conn),
+    ...(role === RELAY_PROTOCOL.roles.data ? { session, conn } : {}),
+    ...authOver,
+  };
+  socket.write(`${JSON.stringify(auth)}\n`);
+  const reply = await frames.next();
+  return { socket, frames, hello, auth, reply };
+}
+
+// The secret code-hub provisioned under `projectsRoot`.
+export async function relaySecret(projectsRoot) {
+  const raw = await fs.readFile(path.join(projectsRoot, '.code-hub', RELAY_PROTOCOL.rendezvous.dir, RELAY_PROTOCOL.rendezvous.hubFile), 'utf8');
+  return JSON.parse(raw).secret;
 }
 
 // Resolves true when a TCP connect to host:port succeeds, false when refused.

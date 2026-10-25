@@ -1,225 +1,278 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
-import { createServer } from '../server.js';
-import * as appManager from '../src/appManager.js';
+import { promises as fs } from 'node:fs';
 import * as hostRelay from '../src/hostRelay.js';
-import { REPO_ROOT, mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin } from './helpers.mjs';
+import * as relayStore from '../src/relayStore.js';
+import { _setTimings } from '../src/relaySession.js';
+import { _setContainerProbe, parseDefaultGateway } from '../src/net.js';
+import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor } from './helpers.mjs';
+import { startFakeRelay } from './fixtures/fake-relay.mjs';
 
-// src/hostRelay.js and the LAN share against FAKE relays (no Python): relays
-// that misbehave in ways the real one never does.
+// src/hostRelay.js (with relayStore.js and relaySession.js) against FAKE relays
+// (tests/fixtures/fake-relay.mjs, no Python): relays that misbehave in ways
+// the real one never does, and that count what code-hub does to them.
 
-const PROTOCOL = JSON.parse(readFileSync(path.join(REPO_ROOT, 'relay', 'protocol.json'), 'utf8'));
-const SECRET = 'f'.repeat(43);
+const { scopes: SCOPES } = P;
 
-function useRelay(t, url) {
-  const prev = { url: process.env.CODEHUB_RELAY_URL, secret: process.env.CODEHUB_RELAY_SECRET };
-  process.env.CODEHUB_RELAY_URL = url;
-  process.env.CODEHUB_RELAY_SECRET = SECRET;
-  t.after(() => {
-    for (const [k, v] of [['CODEHUB_RELAY_URL', prev.url], ['CODEHUB_RELAY_SECRET', prev.secret]]) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
-  });
-}
-
-// A code-hub serving one running fake app 'app' over HTTP: { base }.
-async function boot(t) {
-  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
-  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
+// A projects root with the secret provisioned, the hub in a "container", and
+// cleanup of everything module-level this file touches.
+async function setup(t, { timings } = {}) {
   const root = await mkRoot();
-  await mkProject(root, 'app', { start: fakeAppCmd() });
-  await appManager.init();
-  const server = createServer();
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  await relayStore.ensureSecret();
+  _setContainerProbe(() => true);
+  hostRelay._setLoopbackDialHost('127.0.0.1');
+  relayStore._setHostPollMs(50);
+  if (timings) _setTimings(timings);
   t.after(async () => {
-    await appManager.stop('app').catch(() => {});
-    server.close();
+    hostRelay.stop();
+    _setContainerProbe(null);
+    hostRelay._setLoopbackDialHost(null);
+    _setTimings(null);
     await rmRoot(root);
   });
-  await appManager.start('app');
-  await appManager.awaitSettled('app');
-  return { base: `http://127.0.0.1:${server.address().port}` };
+  return root;
 }
 
-const shareLan = async (base) => {
-  const r = await fetch(`${base}/api/apps/app/share`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'lan', tls: false }) });
-  return { status: r.status, body: await r.json() };
-};
-
-// Invariant: a relay's malformed create answer fails the relay at the boundary — the share still answers 200, and no renewing forward is left behind.
-test('a malformed 201 from the relay fails the relay, not the share, and leaves nothing renewing', async (t) => {
-  const counts = { create: 0, renew: 0, delete: 0 };
-  const fake = http.createServer((req, res) => {
-    req.resume();
-    if (req.method === 'POST' && req.url === PROTOCOL.paths.forwards) {
-      counts.create += 1;
-      res.writeHead(201, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ id: 'fwd-1', port: 40000, leaseMs: 300, protocol: PROTOCOL.protocolVersion })); // no addresses
-      return;
-    }
-    if (req.method === 'POST') counts.renew += 1;
-    if (req.method === 'DELETE') counts.delete += 1;
-    res.writeHead(404); res.end();
-  });
-  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+async function fakeFor(t, root, opts) {
+  const fake = await startFakeRelay({ root, ...opts });
   t.after(() => fake.close());
-  useRelay(t, `http://127.0.0.1:${fake.address().port}`);
-  const { base } = await boot(t);
-
-  const res = await shareLan(base);
-  assert.equal(res.status, 200);
-  assert.equal(res.body.relay.state, 'failed');
-  assert.match(res.body.relay.error, /create response is malformed \(addresses/);
-  assert.equal(counts.create, 1);
-  await new Promise((r) => setTimeout(r, 400)); // past a full 300ms lease of would-be renewals
-  assert.equal(counts.renew, 0, 'nothing renews the rejected forward');
-  assert.equal(counts.delete, 1, 'the half-formed forward is deleted');
-});
-
-// Invariant: a relay that accepts and never answers costs the share at most the request timeout — openForward rejects with the timeout, and the share commits with the relay failed.
-test('a relay that never answers times out: openForward rejects, the share still commits', async (t) => {
-  const held = new Set();
-  const silent = net.createServer((s) => { held.add(s); s.on('error', () => {}); });
-  await new Promise((r) => silent.listen(0, '127.0.0.1', r));
-  t.after(() => { for (const s of held) s.destroy(); silent.close(); });
-  hostRelay._setRequestTimeoutMs(200);
-  t.after(() => hostRelay._setRequestTimeoutMs(3000));
-  const url = `http://127.0.0.1:${silent.address().port}`;
-  useRelay(t, url);
-  await assert.rejects(hostRelay.openForward({}), new RegExp(`the relay at ${url} did not answer within 200ms`));
-
-  const { base } = await boot(t);
-  const started = Date.now();
-  const res = await shareLan(base);
-  assert.equal(res.status, 200);
-  assert.equal(res.body.relay.state, 'failed');
-  assert.match(res.body.relay.error, /did not answer within 200ms/);
-  assert.ok(Date.now() - started < 2000, `bounded by the timeout (${Date.now() - started}ms)`);
-});
-
-// A fake relay: `create(n)` answers the nth create with { status, text }, and
-// every request is counted. Accept upgrades are held open and counted per id.
-async function fakeRelay(t, { create, renew = () => 200, acceptAnswer = null }) {
-  const seen = { creates: 0, renews: [], deletes: [], accepts: new Map(), openAccepts: 0 };
-  const held = new Set();
-  const srv = http.createServer((req, res) => {
-    req.resume();
-    if (req.method === 'POST' && req.url === PROTOCOL.paths.forwards) {
-      seen.creates += 1;
-      const { status, text } = create(seen.creates);
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(text);
-      return;
-    }
-    const id = decodeURIComponent(req.url.split('/')[3] ?? '');
-    if (req.method === 'POST') { seen.renews.push(id); res.writeHead(renew(id, seen)); res.end(); return; }
-    if (req.method === 'DELETE') { seen.deletes.push(id); res.writeHead(204); res.end(); return; }
-    res.writeHead(404); res.end();
-  });
-  srv.on('upgrade', (req, socket) => {
-    const id = decodeURIComponent(req.url.split('/')[3] ?? '');
-    const list = seen.accepts.get(id) ?? [];
-    list.push(socket);
-    seen.accepts.set(id, list);
-    held.add(socket);
-    seen.openAccepts += 1;
-    // The client closing shows as 'end' on this half-open upgraded socket.
-    let open = true;
-    const gone = () => { if (open) { open = false; seen.openAccepts -= 1; } };
-    socket.on('end', gone);
-    socket.on('close', gone);
-    socket.on('error', () => {});
-    if (acceptAnswer) socket.write(acceptAnswer);
-  });
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  t.after(() => { for (const s of held) s.destroy(); srv.close(); });
-  useRelay(t, `http://127.0.0.1:${srv.address().port}`);
-  return seen;
+  return fake;
 }
 
-const created = (over = {}) => JSON.stringify({ id: 'fwd-1', port: 40000, addresses: ['127.0.0.1'], leaseMs: 300, protocol: PROTOCOL.protocolVersion, ...over });
+// expose() for the rest of the test: the handle, and every info() it was notified with.
+function exposeFor(t, port, scope, target = { host: '127.0.0.1', port }) {
+  const seen = [];
+  const handle = hostRelay.expose(port, scope, target, () => seen.push(handle.info()));
+  t.after(() => handle.close());
+  return { handle, seen };
+}
 
-// Invariant: every malformed create answer — one per createdProblem branch, the size and count caps included — is refused as malformed at the boundary (never as a version mismatch), and a well-formed answer of another version is refused as a mismatch.
-test('each malformed 201 is refused as malformed; a well-formed other version as a mismatch', async (t) => {
-  const many = Array.from({ length: PROTOCOL.maxAddresses + 1 }, (_, i) => `10.0.0.${i + 1}`);
-  const cases = [
-    ['not JSON', 'nope', /malformed \(not a JSON object\)/],
-    ['an array', '[]', /malformed \(not a JSON object\)/],
-    ['no protocol', created({ protocol: undefined }), /malformed \(protocol undefined\)/],
-    ['no id', created({ id: '' }), /malformed \(no forward id\)/],
-    ['a privileged port', created({ port: 80 }), /malformed \(port 80\)/],
-    ['no addresses', created({ addresses: undefined }), /malformed \(addresses is not a non-empty list of IPv4 addresses\)/],
-    ['a non-IPv4 address', created({ addresses: ['host.example'] }), /malformed \(addresses is not a non-empty list of IPv4 addresses\)/],
-    ['too many addresses', created({ addresses: many }), new RegExp(`malformed \\(${many.length} addresses, more than ${PROTOCOL.maxAddresses}\\)`)],
-    ['a zero lease', created({ leaseMs: 0 }), /malformed \(leaseMs 0\)/],
-    ['an overlong lease', created({ leaseMs: 1e10 }), /malformed \(leaseMs 10000000000\)/],
-    ['an oversized answer', created({ pad: 'x'.repeat(70 * 1024) }), /malformed \(larger than 65536 bytes\)/],
-    ['another version', created({ protocol: PROTOCOL.protocolVersion + 1 }), new RegExp(`relay speaks protocol ${PROTOCOL.protocolVersion + 1}, this code-hub speaks ${PROTOCOL.protocolVersion}`)],
+async function echoServer(t) {
+  const srv = net.createServer((s) => { s.on('error', () => {}); s.pipe(s); });
+  srv.connections = 0;
+  srv.on('connection', () => { srv.connections += 1; });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  return srv;
+}
+
+const pairs = (ports) => ports.map((e) => `${e.port}/${e.scope}`).sort();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Invariant (S5): a relay that can't prove the secret is never trusted — the
+// session never comes up and no ports frame is sent; and on the data path no
+// byte reaches the target behind an unproven data welcome.
+test('H1: an impostor relay is refused on the control and the data path', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root, { impostor: true });
+  exposeFor(t, 40001, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => /could not prove the secret/.test(hostRelay.status().error ?? ''));
+  assert.equal(hostRelay.status().state === 'up', false);
+  await waitFor(() => fake.controls.length >= 2, { timeout: 3000 }); // it retried, still refused
+  assert.deepEqual(fake.controls.flatMap((c) => c.ports), []);
+  hostRelay.stop();
+  await fake.close();
+
+  const data = await fakeFor(t, root, { impostorData: true });
+  const target = await echoServer(t);
+  exposeFor(t, target.address().port, SCOPES.lan);
+  await hostRelay.init();
+  await waitFor(() => hostRelay.status().state === 'up');
+  data.send({ t: P.frames.incoming, port: target.address().port, scope: SCOPES.lan, conn: 'c'.repeat(16) });
+  await waitFor(() => data.dataWelcomed === 1);
+  await sleep(200);
+  assert.equal(target.connections, 0);
+});
+
+// Invariant (S5): code-hub validates the relay's frames strictly — a status or
+// incoming frame with an extra key or an unknown scope ends the session.
+test('H2: a malformed status or incoming frame closes the session', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root, { autoStatus: false });
+  exposeFor(t, 40002, SCOPES.loopback);
+  await hostRelay.init();
+  const malformed = [
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [], extra: 1 },
+    { t: P.frames.status, addresses: ['127.0.0.1'], ports: [{ port: 40002, scope: SCOPES.loopback, hostPort: 40002, fallback: false, host: '10.0.0.1' }] },
+    { t: P.frames.incoming, port: 40002, scope: 'everywhere', conn: 'c'.repeat(16) },
+    { t: P.frames.incoming, port: 40002, scope: SCOPES.loopback, conn: 'c'.repeat(16), target: '10.0.0.1:22' },
   ];
-  let current = null;
-  const seen = await fakeRelay(t, { create: () => ({ status: 201, text: current }) });
-  for (const [name, text, error] of cases) {
-    current = text;
-    await assert.rejects(hostRelay.openForward({}), error, name);
+  for (const [i, frame] of malformed.entries()) {
+    await waitFor(() => fake.controls.length === i + 1 && hostRelay.status().state === 'up', { timeout: 5000 });
+    const c = fake.control();
+    fake.send(frame);
+    await waitFor(() => c.closed);
+    assert.match(hostRelay.status().error, /bad frame from the relay|malformed/, JSON.stringify(frame));
   }
-  await new Promise((r) => setTimeout(r, 200));
-  assert.deepEqual(seen.renews, [], 'no refused forward is ever renewed');
 });
 
-// Invariant: a drained accept slot can never re-park — after down→up the pool holds exactly ACCEPT_POOL parked accepts, the drained slots' late callbacks included.
-test('a drained slot\'s late callback does not re-park after down→up', async (t) => {
-  const seen = await fakeRelay(t, {
-    create: (n) => ({ status: 201, text: created({ id: `fwd-${n}` }) }),
-    renew: (id) => (id === 'fwd-1' ? 404 : 200), // the first forward is "lost" on its first renewal
-  });
-  const target = net.createServer((s) => s.destroy());
-  await new Promise((r) => target.listen(0, '127.0.0.1', r));
-  t.after(() => target.close());
-  const handle = await hostRelay.openForward({});
-  t.after(() => handle.close());
-  handle.attach({ host: '127.0.0.1', port: target.address().port });
-  const deadline = Date.now() + 3000;
-  while (handle.id !== 'fwd-2' || handle.state !== 'up') {
-    assert.ok(Date.now() < deadline, 'the forward was re-created');
-    await new Promise((r) => setTimeout(r, 20));
+// Invariant (S4): a relay that goes silent takes the session down within
+// keepaliveTimeoutMs, and every handle hears it.
+test('H3: a silent relay drives code-hub down within the keepalive timeout', async (t) => {
+  const root = await setup(t, { timings: { pingIntervalMs: 100, keepaliveTimeoutMs: 400 } });
+  const fake = await fakeFor(t, root, { silent: true });
+  const { handle, seen } = exposeFor(t, 40003, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => handle.info()?.state === 'up');
+  const upAt = Date.now();
+  await waitFor(() => hostRelay.status().state !== 'up', { timeout: 2000, interval: 10 });
+  const took = Date.now() - upAt;
+  assert.ok(took >= 300 && took < 1200, `down after ${took}ms`);
+  assert.match(hostRelay.status().error, /connection to the relay lost: no frame from the relay for over 400ms/);
+  assert.equal(seen.at(-1)?.state, 'down');
+  assert.ok(fake.control().closed);
+});
+
+// Invariant (S2): failed attempts back off with growing gaps, and a change of
+// the relay file resets the backoff and triggers an attempt at once.
+test('H4: backoff gaps grow, and a relay-file change cuts the wait short', async (t) => {
+  const root = await setup(t);
+  const times = [];
+  const refuser = net.createServer((s) => { times.push(Date.now()); s.destroy(); });
+  await new Promise((r) => refuser.listen(0, '127.0.0.1', r));
+  t.after(() => refuser.close());
+  const hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
+  const publish = (pid) => fs.writeFile(hostFile, JSON.stringify({ protocolVersion: P.protocolVersion, listen: `127.0.0.1:${refuser.address().port}`, pid }));
+  await publish(1);
+  await hostRelay.init();
+  await waitFor(() => times.length >= 4, { timeout: 8000 });
+  const gaps = times.slice(1).map((x, i) => x - times[i]);
+  assert.ok(gaps[0] < gaps[1] && gaps[1] < gaps[2], `gaps ${gaps}`);
+  assert.equal(hostRelay.status().state, 'retrying');
+  // The next attempt is now a gap of several seconds away; a file change skips it.
+  const changedAt = Date.now();
+  await publish(2);
+  await waitFor(() => times.length >= 5, { timeout: 1500 });
+  assert.ok(times[4] - changedAt < 1000, `attempted ${times[4] - changedAt}ms after the change`);
+});
+
+// Invariant (S2): a relay file of another protocol version is reported and not
+// dialled at all until the file changes.
+test('H5: an incompatible relay file gives the version error and no dial until it changes', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root);
+  await fake.publish({ protocolVersion: 1 });
+  await hostRelay.init();
+  await waitFor(() => /speaks protocol 1, this code-hub speaks 2 — update the relay\/ copy on the host/.test(hostRelay.status().error ?? ''));
+  await sleep(700);
+  assert.equal(fake.accepted.length, 0);
+  await fake.publish();
+  await waitFor(() => hostRelay.status().state === 'up');
+});
+
+// Invariant (S3/S10): the ports frame is always the full set of both scopes —
+// on connect, after every expose and close, and first thing after a reconnect.
+test('H6: ports frames carry the full set, both scopes, on connect, on change and after a reconnect', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root);
+  exposeFor(t, 40011, SCOPES.loopback);
+  const b = exposeFor(t, 40012, SCOPES.lan);
+  await hostRelay.init();
+  await waitFor(() => fake.control()?.ports.length === 1);
+  assert.deepEqual(pairs(fake.control().ports[0]), ['40011/loopback', '40012/lan']);
+  exposeFor(t, 40013, SCOPES.loopback);
+  await waitFor(() => fake.control().ports.length === 2);
+  assert.deepEqual(pairs(fake.control().ports[1]), ['40011/loopback', '40012/lan', '40013/loopback']);
+  b.handle.close();
+  await waitFor(() => fake.control().ports.length === 3);
+  assert.deepEqual(pairs(fake.control().ports[2]), ['40011/loopback', '40013/loopback']);
+  const first = fake.control();
+  first.socket.destroy();
+  await waitFor(() => fake.controls.length === 2 && fake.control().ports.length >= 1, { timeout: 4000 });
+  assert.deepEqual(pairs(fake.control().ports[0]), ['40011/loopback', '40013/loopback']);
+});
+
+// Invariant (S5): the secret file is created private (dir 0700, file 0600),
+// left byte-identical while valid, and replaced when invalid or too short.
+test('H7: relay.json is created 0700/0600, kept when valid, replaced when invalid or short', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = path.join(root, '.code-hub', P.rendezvous.dir);
+  const file = path.join(dir, P.rendezvous.hubFile);
+  const secret = await relayStore.ensureSecret();
+  assert.ok(secret.length >= P.minSecretLength);
+  const raw = await fs.readFile(file, 'utf8');
+  assert.deepEqual(JSON.parse(raw), { protocolVersion: P.protocolVersion, secret });
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
   }
-  assert.equal(seen.accepts.get('fwd-1')?.length, 4, 'the first pool parked');
-  // Past the drained slots' error backoff (1000ms) and every re-park floor.
-  await new Promise((r) => setTimeout(r, 1600));
-  assert.equal(seen.accepts.get('fwd-2')?.length, 4, 'exactly one fresh pool, no re-park from a drained slot');
-});
-
-// Invariant: a non-upgrade answer to a park ends that connection at once — a relay that sends headers and never ends the body can't make code-hub accumulate open sockets.
-test('an accept answered with headers and a never-ending body does not pile up sockets', async (t) => {
-  const seen = await fakeRelay(t, {
-    create: () => ({ status: 201, text: created({ leaseMs: 60000 }) }),
-    acceptAnswer: 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n\r\npartial',
-  });
-  const handle = await hostRelay.openForward({});
-  t.after(() => handle.close());
-  handle.attach({ host: '127.0.0.1', port: 9 });
-  // Two and a half re-park backoffs: a leak would hold about 4 sockets per second.
-  let peak = 0;
-  const until = Date.now() + 2500;
-  while (Date.now() < until) {
-    peak = Math.max(peak, seen.openAccepts);
-    await new Promise((r) => setTimeout(r, 25));
+  assert.equal(await relayStore.ensureSecret(), secret);
+  assert.equal(await fs.readFile(file, 'utf8'), raw, 'left byte-identical');
+  for (const bad of ['not json', '[]', JSON.stringify({ secret: 'short' }), JSON.stringify({ secret: 5 })]) {
+    await fs.writeFile(file, bad);
+    const fresh = await relayStore.ensureSecret();
+    assert.ok(fresh.length >= P.minSecretLength, bad);
+    assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).secret, fresh, bad);
   }
-  assert.ok(seen.accepts.get('fwd-1').length > 4, 'the slots did re-park');
-  assert.ok(peak <= 4, `open accept sockets stayed within the pool (peak ${peak})`);
 });
 
-// Invariant: a create answer exactly at each cap — maxLeaseMs, maxAddresses addresses — is accepted.
-test('a 201 exactly at maxLeaseMs and maxAddresses is accepted', async (t) => {
-  const addresses = Array.from({ length: PROTOCOL.maxAddresses }, (_, i) => `10.0.0.${i + 1}`);
-  await fakeRelay(t, { create: () => ({ status: 201, text: created({ leaseMs: PROTOCOL.maxLeaseMs, addresses }) }) });
-  const handle = await hostRelay.openForward({});
-  t.after(() => handle.close());
-  assert.deepEqual(handle.addresses, addresses);
-  assert.equal(handle.state, 'up');
+// Invariant (S6): a loopback listen is dialled through the Docker Desktop host
+// name; any other address as written, then the default gateway, deduplicated.
+test('H8: dialCandidates', () => {
+  assert.deepEqual(hostRelay.dialCandidates('127.0.0.1', '172.17.0.1', 'host.docker.internal'), ['host.docker.internal']);
+  assert.deepEqual(hostRelay.dialCandidates('127.0.0.5', null, 'h'), ['h']);
+  assert.deepEqual(hostRelay.dialCandidates('172.17.0.1', '172.18.0.1', 'h'), ['172.17.0.1', '172.18.0.1']);
+  assert.deepEqual(hostRelay.dialCandidates('172.17.0.1', '172.17.0.1', 'h'), ['172.17.0.1']);
+  assert.deepEqual(hostRelay.dialCandidates('192.168.1.5', null, 'h'), ['192.168.1.5']);
 });
 
+// Invariant (S6): the default gateway is the first default route's gateway in
+// /proc/net/route, read little-endian; no default route gives null.
+test('H9: parseDefaultGateway', () => {
+  const head = 'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n';
+  assert.equal(parseDefaultGateway(`${head}eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\neth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n`), '172.17.0.1');
+  assert.equal(parseDefaultGateway(`${head}eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n`), null);
+  assert.equal(parseDefaultGateway(`${head}eth0\t00000000\t0101A8C0\t0001\t0\t0\t0\t00000000\t0\t0\t0\n`), null, 'no RTF_GATEWAY flag');
+  assert.equal(parseDefaultGateway(`${head}wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n`), '192.168.2.1');
+  assert.equal(parseDefaultGateway(''), null);
+});
+
+// Invariant (S10): an incoming for a pair code-hub no longer exposes opens no
+// data connection, while one for an exposed pair does.
+test('H10: an incoming for an unexposed pair is ignored', async (t) => {
+  const root = await setup(t);
+  const fake = await fakeFor(t, root);
+  const target = await echoServer(t);
+  const gone = exposeFor(t, 40021, SCOPES.loopback);
+  exposeFor(t, target.address().port, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => fake.control()?.ports.length === 1);
+  gone.handle.close();
+  await waitFor(() => fake.control().ports.length === 2);
+  fake.send({ t: P.frames.incoming, port: 40021, scope: SCOPES.loopback, conn: 'g'.repeat(16) });
+  fake.send({ t: P.frames.incoming, port: target.address().port, scope: SCOPES.lan, conn: 'h'.repeat(16) });
+  await sleep(300);
+  assert.equal(fake.dataAuths.length, 0);
+  assert.equal(hostRelay.status().state, 'up', 'ignored, not fatal');
+  fake.send({ t: P.frames.incoming, port: target.address().port, scope: SCOPES.loopback, conn: 'i'.repeat(16) });
+  await waitFor(() => target.connections === 1);
+  assert.deepEqual(fake.dataAuths.map((d) => d.conn), ['i'.repeat(16)]);
+});
+
+// Invariant (S5): code-hub alone can never trip the relay's cap on
+// unauthenticated connections — its own bound is below the cap, and a burst of
+// incoming frames never has more than that many handshakes in flight, yet all
+// of them complete.
+test('B2: a burst of 50 incoming frames never exceeds maxHubHandshakes in flight, and all open', async (t) => {
+  assert.ok(P.maxHubHandshakes < P.maxPendingHandshakes, 'the hub\'s bound is below the relay\'s cap');
+  const root = await setup(t);
+  const fake = await fakeFor(t, root, { dataDelayMs: 40 });
+  const target = await echoServer(t);
+  const port = target.address().port;
+  exposeFor(t, port, SCOPES.loopback);
+  await hostRelay.init();
+  await waitFor(() => hostRelay.status().state === 'up');
+  let maxSeen = 0;
+  const sampler = setInterval(() => { maxSeen = Math.max(maxSeen, hostRelay._handshakesInFlight()); }, 2);
+  t.after(() => clearInterval(sampler));
+  for (let i = 0; i < 50; i++) fake.send({ t: P.frames.incoming, port, scope: SCOPES.loopback, conn: `burst${String(i).padStart(4, '0')}` });
+  await waitFor(() => target.connections === 50, { timeout: 10000 });
+  assert.equal(fake.dataWelcomed, 50);
+  assert.ok(fake.maxPreAuth <= P.maxHubHandshakes, `the relay saw ${fake.maxPreAuth} pre-auth connections at once`);
+  assert.ok(fake.maxPreAuth > 1, 'handshakes do run in parallel');
+  assert.ok(maxSeen <= P.maxHubHandshakes, `${maxSeen} in flight`);
+});

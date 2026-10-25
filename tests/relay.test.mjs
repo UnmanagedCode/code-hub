@@ -1,30 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import tls from 'node:tls';
-import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { promises as fs, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import * as hostRelay from '../src/hostRelay.js';
-import * as appManager from '../src/appManager.js';
+import * as relayStore from '../src/relayStore.js';
+import { _setContainerProbe } from '../src/net.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
 import {
-  REPO_ROOT, requirePython, startRelay, runRelay, withRelayEnv, relayCall, canConnect, waitFor,
-  mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin,
+  REPO_ROOT, RELAY_PROTOCOL as PROTOCOL, requirePython, startRelay, runRelay, patchedRelayDir, canConnect, waitFor,
+  mkRoot, rmRoot, relayLogin, relaySecret, protoMac, frameStream, tcpConnect, ALT_LOOPBACK, altLoopbackBindable,
 } from './helpers.mjs';
 
-// The real Python relay (relay/relay.py) over loopback, driven raw and through
-// src/hostRelay.js. Every relay advertises 127.0.0.1, so the route probe never
-// runs (except R15, which forces it through its test seam).
+// The real Python relay (relay/relay.py) over loopback, driven by a raw
+// protocol peer (tests/helpers.mjs, independent of src/) and through the
+// code-hub modules. Every relay advertises 127.0.0.1 unless a test says
+// otherwise, so the route probe never decides the addresses.
 
-const PROTOCOL = JSON.parse(readFileSync(path.join(REPO_ROOT, 'relay', 'protocol.json'), 'utf8'));
-const P = PROTOCOL.paths;
-const at = (template, id) => template.replace('{id}', id);
-const PROTOCOL_IDS = [...Object.values(P), ...Object.values(PROTOCOL.errorCodes), PROTOCOL.upgradeToken];
+const { frames: F, roles: ROLES, scopes: SCOPES, errorCodes: E, macLabels: LABELS } = PROTOCOL;
+const STAND_IN_HUB = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'relay-client.mjs');
+
+// A projects root with code-hub's relay secret provisioned: { root, secret }.
+async function hubRoot(t) {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await relayStore.ensureSecret();
+  return { root, secret: await relaySecret(root) };
+}
 
 async function relayFor(t, opts) {
   const relay = await startRelay(opts);
@@ -32,37 +39,50 @@ async function relayFor(t, opts) {
   return relay;
 }
 
-function handleFor(t, handle) {
-  t.after(() => handle.close());
-  return handle;
+// An authenticated raw control session.
+async function control(t, relay, secret) {
+  const s = await relayLogin(relay.port, secret);
+  assert.equal(s.reply.t, F.welcome, JSON.stringify(s.reply));
+  t.after(() => s.socket.destroy());
+  return s;
 }
 
-// Park one accept on forward `id`: resolves { upgraded: true, socket, head } once
-// the relay splices a LAN client onto it, or { upgraded: false, status } when it
-// answers instead.
-function parkAccept(relay, id, { secret = relay.secret } = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      host: '127.0.0.1', port: relay.port, path: at(P.accept, id), agent: false,
-      headers: { Connection: 'Upgrade', Upgrade: PROTOCOL.upgradeToken, ...(secret ? { Authorization: `Bearer ${secret}` } : {}) },
-    });
-    req.on('upgrade', (_res, socket, head) => resolve({ upgraded: true, socket, head, req }));
-    req.on('response', (res) => { res.resume(); resolve({ upgraded: false, status: res.statusCode, req }); });
-    req.on('error', reject);
-    req.end();
+// The next frame that isn't a ping (answered, like code-hub does) — nor an
+// `incoming`, unless `incoming` is asked for (a reachability probe makes one).
+async function nextFrame(s, { incoming = false, timeoutMs = 3000 } = {}) {
+  for (;;) {
+    const f = await s.frames.next(timeoutMs);
+    if (f?.t === F.ping) { s.socket.write(`${JSON.stringify({ t: F.pong })}\n`); continue; }
+    if (f?.t === F.incoming && !incoming) continue;
+    return f;
+  }
+}
+
+// Send a full ports set and return the status the relay answers with.
+async function sendPorts(s, entries) {
+  s.socket.write(`${JSON.stringify({ t: F.ports, ports: entries })}\n`);
+  const f = await nextFrame(s);
+  assert.equal(f?.t, F.status, JSON.stringify(f));
+  return f;
+}
+
+const entryFor = (status, port, scope) => status.ports.find((e) => e.port === port && e.scope === scope);
+
+function freePort(host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, host, () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
   });
 }
 
-// A live view of what `socket` has received: { data, closed }.
-function tap(socket, initial = '') {
-  const view = { data: initial, closed: false };
-  socket.on('data', (d) => { view.data += d; });
-  socket.on('error', () => {});
-  socket.on('close', () => { view.closed = true; });
-  return view;
+async function blocker(t, host = '127.0.0.1') {
+  const srv = net.createServer((s) => s.destroy());
+  await new Promise((r) => srv.listen(0, host, r));
+  t.after(() => srv.close());
+  return srv.address().port;
 }
 
-// Everything a raw client receives until the peer closes: { data, closedAt }.
+// Everything a socket receives until it closes: { data, closedAt }.
 function collect(socket) {
   return new Promise((resolve) => {
     let data = '';
@@ -72,330 +92,473 @@ function collect(socket) {
   });
 }
 
-const connect = (port) => new Promise((resolve, reject) => {
-  const s = net.connect(port, '127.0.0.1', () => resolve(s));
-  s.once('error', reject);
+// Spawn the stand-in hub exposing an echo server in `scopes`: { proc, hostPorts }.
+async function standInHub(t, root, scopes, env = {}) {
+  const proc = spawn(process.execPath, [STAND_IN_HUB, ...scopes], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PROJECTS_ROOT: root, ...env } });
+  t.after(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } });
+  let out = '', err = '';
+  proc.stderr.on('data', (d) => { err += d; });
+  const hostPorts = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`stand-in hub never bound its ports: ${err}`)), 10000);
+    proc.stdout.on('data', (d) => {
+      out += d;
+      const line = out.split('\n').find((l) => l.startsWith('{'));
+      if (line) { clearTimeout(timer); resolve(JSON.parse(line).hostPorts); }
+    });
+    proc.once('exit', (code) => { clearTimeout(timer); reject(new Error(`stand-in hub exited (${code}): ${err}`)); });
+  });
+  return { proc, hostPorts };
+}
+
+// Invariant (S5): a connection that fails the MAC check gets auth_failed and
+// is closed — nothing it sends after its auth is acted on.
+test('V1: a wrong-secret auth gets auth_failed and its ports are never bound', async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const port = await freePort();
+  const s = await relayLogin(relay.port, 'w'.repeat(43));
+  assert.deepEqual([s.reply.t, s.reply.code], [F.error, E.authFailed]);
+  s.socket.write(`${JSON.stringify({ t: F.ports, ports: [{ port, scope: SCOPES.loopback }] })}\n`);
+  await s.frames.closed;
+  assert.equal(await canConnect(port), false);
 });
 
-const echoServer = async (t) => {
-  const srv = net.createServer((s) => { s.on('error', () => {}); s.pipe(s); });
+// Invariant (S5): the relay proves the secret back (M_relay under the relay
+// label and both nonces), and an auth replayed onto a fresh hello is refused.
+test('V2: the relay\'s welcome MAC verifies, and a replayed auth is refused', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const first = await control(t, relay, secret);
+  const expected = protoMac(secret, LABELS.relay, ROLES.control, first.hello.nonce, first.auth.nonce);
+  assert.equal(first.reply.mac, expected);
+  assert.notEqual(first.reply.mac, protoMac(secret, LABELS.hub, ROLES.control, first.hello.nonce, first.auth.nonce), 'the relay label, not a reflection of the hub\'s MAC');
+  const replay = await tcpConnect(relay.port);
+  const frames = frameStream(replay);
+  const hello = await frames.next();
+  assert.notEqual(hello.nonce, first.hello.nonce);
+  replay.write(`${JSON.stringify(first.auth)}\n`);
+  const reply = await frames.next();
+  assert.deepEqual([reply.t, reply.code], [F.error, E.authFailed]);
+  await frames.closed;
+});
+
+// A TCP tap between a code-hub and the relay: every byte both ways.
+async function tap(t, relayPort) {
+  const seen = [];
+  const srv = net.createServer((client) => {
+    const upstream = net.connect(relayPort, '127.0.0.1');
+    for (const [a, b] of [[client, upstream], [upstream, client]]) {
+      a.on('data', (d) => { seen.push(Buffer.from(d)); b.write(d); });
+      a.on('error', () => b.destroy());
+      a.on('close', () => b.destroy());
+    }
+  });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   t.after(() => srv.close());
-  return srv.address().port;
-};
+  return { port: srv.address().port, bytes: () => Buffer.concat(seen) };
+}
 
-const healthForwards = async (relay) => (await relayCall(relay, 'GET', P.health)).body.forwards;
-
-// Invariant: the control API is authenticated — every endpoint, the accept upgrade included, answers 401 to a missing or wrong bearer and creates nothing.
-test('R1: every endpoint refuses a missing or wrong bearer with 401 and creates no listener', async (t) => {
+// Invariant (S5): the secret never crosses the wire, in any common encoding,
+// on the control session or the data path.
+test('V3: no byte between code-hub and the relay carries the secret', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  for (const secret of [null, 'x'.repeat(43)]) {
-    assert.equal((await relayCall(relay, 'GET', P.health, undefined, { secret })).status, 401);
-    assert.equal((await relayCall(relay, 'POST', P.forwards, {}, { secret })).status, 401);
-    assert.equal((await relayCall(relay, 'POST', at(P.renew, fwd.id), undefined, { secret })).status, 401);
-    assert.equal((await relayCall(relay, 'DELETE', at(P.forward, fwd.id), undefined, { secret })).status, 401);
-    const accept = await parkAccept(relay, fwd.id, { secret });
-    assert.deepEqual([accept.upgraded, accept.status], [false, 401]);
+  const { root: relayRoot, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: relayRoot });
+  // The stand-in hub's own root: the same secret, and a relay file naming the tap.
+  const hubRootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-tapped-'));
+  t.after(() => fs.rm(hubRootDir, { recursive: true, force: true }));
+  const rdir = path.join(hubRootDir, '.code-hub', PROTOCOL.rendezvous.dir);
+  await fs.mkdir(rdir, { recursive: true });
+  await fs.copyFile(path.join(relayRoot, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile), path.join(rdir, PROTOCOL.rendezvous.hubFile));
+  const wire = await tap(t, relay.port);
+  await fs.writeFile(path.join(rdir, PROTOCOL.rendezvous.relayFile), JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, listen: `127.0.0.1:${wire.port}`, pid: 1 }));
+  const { hostPorts } = await standInHub(t, hubRootDir, [SCOPES.loopback]);
+  const client = await tcpConnect(hostPorts[SCOPES.loopback]);
+  const got = collect(client);
+  client.write('through the data path');
+  await waitFor(() => wire.bytes().includes('through the data path'));
+  client.end();
+  assert.equal((await got).data, 'through the data path');
+  const bytes = wire.bytes();
+  assert.ok(bytes.includes(F.incoming), 'the tap saw the control session and the data path');
+  const key = Buffer.from(secret, 'base64url');
+  for (const form of [secret, Buffer.from(secret).toString('base64'), Buffer.from(secret).toString('hex'), key.toString('hex'), key.toString('base64')]) {
+    assert.ok(!bytes.includes(form), `the secret crossed the wire as ${form.slice(0, 8)}…`);
   }
-  assert.equal(await healthForwards(relay), 1, 'only the authenticated forward exists');
-  assert.equal((await relayCall(relay, 'POST', at(P.renew, fwd.id))).status, 200, 'and the refused DELETEs left it alone');
+  assert.ok(!bytes.includes(key), 'the raw key bytes crossed the wire');
 });
 
-// Invariant: no target exists in the protocol — a create body naming a host/target, a privileged port or not an object is refused.
-test('R2: a create body with a target, a host, a privileged port or a non-object is 400', async (t) => {
+// Invariant (S5): pre-auth connections are capped at maxPendingHandshakes (one
+// more is cut with no hello) and each gets handshakeTimeoutMs to authenticate.
+test('V4: the unauthenticated cap and the handshake timeout hold', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t);
-  for (const body of [{ host: '10.0.0.1' }, { target: '10.0.0.1:22' }, { port: 80 }, { port: '8080' }, [], 'x', 5, '{not json']) {
-    const res = await relayCall(relay, 'POST', P.forwards, body);
-    assert.equal(res.status, 400, JSON.stringify(body));
+  const { root } = await hubRoot(t);
+  const relayDir = await patchedRelayDir(t, { maxPendingHandshakes: 4, handshakeTimeoutMs: 800 });
+  const relay = await relayFor(t, { projectsRoot: root, relayDir });
+  const silent = [];
+  for (let i = 0; i < 4; i++) {
+    const s = await tcpConnect(relay.port);
+    const frames = frameStream(s);
+    assert.equal((await frames.next()).t, F.hello);
+    silent.push({ s, frames, at: Date.now() });
   }
-  assert.equal(await healthForwards(relay), 0);
+  const extra = await tcpConnect(relay.port);
+  const { data } = await collect(extra);
+  assert.equal(data, '', 'cut with no hello');
+  for (const { frames, at } of silent) {
+    await frames.closed;
+    const lived = Date.now() - at;
+    assert.ok(lived >= 600 && lived < 2500, `a silent connection lived ${lived}ms`);
+  }
 });
 
-// Invariant: a LAN client gets only the forwarded share — with no parked accept it is dropped after the wait and never reaches the control API.
-test('R3: a LAN client with no parked accept is dropped after the wait and never reaches the control API', async (t) => {
+// Invariant (S5): a data connection claims exactly one pending client of the
+// CURRENT session, once; a client nobody claims is dropped after --accept-wait-ms.
+test('V5: data claims need the current session and a pending conn, once; unclaimed clients are dropped', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t, { acceptWaitMs: 200, leaseMs: 5000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  const s = await connect(fwd.port);
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root, acceptWaitMs: 400 });
+  const s = await control(t, relay, secret);
+  const port = await freePort();
+  const status = await sendPorts(s, [{ port, scope: SCOPES.loopback }]);
+  const hostPort = entryFor(status, port, SCOPES.loopback).hostPort;
+
+  const client = await tcpConnect(hostPort);
+  const fromClient = collect(client);
+  client.write('early');
+  const inc = await nextFrame(s, { incoming: true });
+  assert.deepEqual({ ...inc, conn: undefined }, { t: F.incoming, port, scope: SCOPES.loopback, conn: undefined });
+  const data = { role: ROLES.data };
+  const stale = await relayLogin(relay.port, secret, { ...data, session: 'x'.repeat(16), conn: inc.conn });
+  assert.deepEqual([stale.reply.t, stale.reply.code], [F.error, E.staleSession]);
+  const unknown = await relayLogin(relay.port, secret, { ...data, session: s.reply.session, conn: 'y'.repeat(16) });
+  assert.deepEqual([unknown.reply.t, unknown.reply.code], [F.error, E.unknownConn]);
+  const claim = await relayLogin(relay.port, secret, { ...data, session: s.reply.session, conn: inc.conn });
+  assert.equal(claim.reply.t, F.welcome);
+  assert.equal(claim.reply.mac, protoMac(secret, LABELS.relay, ROLES.data, claim.hello.nonce, claim.auth.nonce, s.reply.session, inc.conn));
+  await waitFor(() => claim.frames.rest().toString() === 'early');
+  claim.socket.write('back');
+  claim.socket.end();
+  assert.equal((await fromClient).data, 'back');
+  const again = await relayLogin(relay.port, secret, { ...data, session: s.reply.session, conn: inc.conn });
+  assert.deepEqual([again.reply.t, again.reply.code], [F.error, E.unknownConn]);
+
+  const idle = await tcpConnect(hostPort);
   const opened = Date.now();
-  const got = collect(s);
-  s.write(`GET ${P.health} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${relay.secret}\r\n\r\n`);
-  const { data, closedAt } = await got;
-  assert.equal(data, '', 'no bytes, let alone JSON, come back');
-  assert.ok(closedAt - opened >= 150, `dropped after the wait, not before (${closedAt - opened}ms)`);
+  const idleDone = collect(idle);
+  assert.equal((await nextFrame(s, { incoming: true })).t, F.incoming);
+  const { data: idleData, closedAt } = await idleDone;
+  assert.equal(idleData, '');
+  assert.ok(closedAt - opened >= 300 && closedAt - opened < 2500, `dropped after ${closedAt - opened}ms`);
 });
 
-// Invariant: bytes pass through untouched — TLS ends at the origin (its cert is what the client sees) and the body round-trips.
-test('R4: through hostRelay the TLS peer is the origin itself and the body round-trips', async (t) => {
+// Invariant (S5): a ports frame is validated strictly — a host or target key,
+// an unknown scope, an out-of-range port or a duplicate pair is bad_frame, and
+// the whole session (its listeners included) closes.
+test('V6: a malformed ports frame gets bad_frame and closes the session and its listeners', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000 });
-  withRelayEnv(t, relay);
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const good = { port: await freePort(), scope: SCOPES.loopback };
+  const bad = [
+    [{ ...good, host: '10.0.0.1' }],
+    [{ ...good, target: '10.0.0.1:22' }],
+    [{ port: good.port, scope: 'everywhere' }],
+    [{ port: 80, scope: SCOPES.loopback }],
+    [good, good],
+  ];
+  for (const entries of bad) {
+    const s = await control(t, relay, secret);
+    const hostPort = entryFor(await sendPorts(s, [good]), good.port, good.scope).hostPort;
+    assert.equal(await canConnect(hostPort), true);
+    s.socket.write(`${JSON.stringify({ t: F.ports, ports: entries })}\n`);
+    const f = await nextFrame(s);
+    assert.deepEqual([f?.t, f?.code], [F.error, E.badFrame], JSON.stringify(entries));
+    await s.frames.closed;
+    await waitFor(async () => !(await canConnect(hostPort)), { timeout: 2000 });
+  }
+});
+
+// Invariant (S3): a free requested port is bound as is; a busy one falls back
+// to a working free port, flagged — in both scopes, with the scope echoed.
+test('V7: same port when free, a flagged fallback when busy, in both scopes', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const s = await control(t, relay, secret);
+  const [freeLan, freeLoop, busyLan, busyLoop] = [await freePort(), await freePort(), await blocker(t), await blocker(t)];
+  const entries = [
+    { port: freeLan, scope: SCOPES.lan }, { port: freeLoop, scope: SCOPES.loopback },
+    { port: busyLan, scope: SCOPES.lan }, { port: busyLoop, scope: SCOPES.loopback },
+  ];
+  const status = await sendPorts(s, entries);
+  assert.deepEqual(status.addresses, ['127.0.0.1']);
+  for (const { port, scope } of entries.slice(0, 2)) {
+    assert.deepEqual(entryFor(status, port, scope), { port, scope, hostPort: port, fallback: false });
+    assert.equal(await canConnect(port), true);
+  }
+  for (const { port, scope } of entries.slice(2)) {
+    const e = entryFor(status, port, scope);
+    assert.equal(e.fallback, true, scope);
+    assert.notEqual(e.hostPort, port, scope);
+    assert.equal(await canConnect(e.hostPort), true, scope);
+  }
+});
+
+// Invariant (S3): the ports set is live — a pair dropped from it closes, a pair
+// kept in it stays on the same host port.
+test('V8: ports [A,B] then [B] closes A and keeps B where it was', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const s = await control(t, relay, secret);
+  const [a, b] = [await freePort(), await freePort()];
+  const first = await sendPorts(s, [{ port: a, scope: SCOPES.loopback }, { port: b, scope: SCOPES.lan }]);
+  const hostB = entryFor(first, b, SCOPES.lan).hostPort;
+  assert.equal(await canConnect(a), true);
+  const second = await sendPorts(s, [{ port: b, scope: SCOPES.lan }]);
+  assert.equal(entryFor(second, a, SCOPES.loopback), undefined);
+  assert.equal(entryFor(second, b, SCOPES.lan).hostPort, hostB);
+  assert.equal(await canConnect(a), false);
+  assert.equal(await canConnect(hostB), true);
+});
+
+// Invariant (S4/S10): exposure is session-scoped — a code-hub killed outright
+// takes every host listener of both scopes with it, promptly.
+test('V9: SIGKILL of the code-hub side closes all its host listeners promptly', async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const { proc, hostPorts } = await standInHub(t, root, [SCOPES.lan, SCOPES.loopback]);
+  for (const p of Object.values(hostPorts)) assert.equal(await canConnect(p), true);
+  proc.kill('SIGKILL');
+  for (const p of Object.values(hostPorts)) await waitFor(async () => !(await canConnect(p)), { timeout: 1500 });
+  assert.match(relay.output().stderr, /control session \S+ closed/);
+});
+
+// Invariant (S4/S10): a code-hub that stops answering (frozen, not dead) loses
+// its listeners within keepaliveTimeoutMs.
+test('V10: SIGSTOP of the code-hub side closes its listeners within the keepalive timeout', { skip: process.platform === 'win32' ? 'POSIX signals only' : false }, async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  const relayDir = await patchedRelayDir(t, { pingIntervalMs: 150, keepaliveTimeoutMs: 700 });
+  await relayFor(t, { projectsRoot: root, relayDir });
+  const { proc, hostPorts } = await standInHub(t, root, [SCOPES.lan, SCOPES.loopback], { RELAY_CLIENT_TIMINGS: JSON.stringify({ pingIntervalMs: 150, keepaliveTimeoutMs: 700 }) });
+  await new Promise((r) => setTimeout(r, 900)); // pings keep it alive past one timeout
+  for (const p of Object.values(hostPorts)) assert.equal(await canConnect(p), true);
+  proc.kill('SIGSTOP');
+  t.after(() => { try { proc.kill('SIGCONT'); } catch { /* gone */ } });
+  const stopped = Date.now();
+  for (const p of Object.values(hostPorts)) await waitFor(async () => !(await canConnect(p)), { timeout: 3000, interval: 50 });
+  assert.ok(Date.now() - stopped >= 500, 'not before the timeout');
+});
+
+// Invariant (S4): one session at a time — a newly authenticated control
+// session replaces the old one, whose socket and listeners close.
+test('V11: a second control session replaces the first', async (t) => {
+  if (!requirePython(t)) return;
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const first = await control(t, relay, secret);
+  const port = await freePort();
+  const hostPort = entryFor(await sendPorts(first, [{ port, scope: SCOPES.loopback }]), port, SCOPES.loopback).hostPort;
+  const second = await control(t, relay, secret);
+  assert.notEqual(second.reply.session, first.reply.session);
+  await first.frames.closed;
+  assert.equal(await canConnect(hostPort), false);
+  assert.equal(entryFor(await sendPorts(second, [{ port, scope: SCOPES.loopback }]), port, SCOPES.loopback).hostPort, port, 'the port is free for the new session');
+});
+
+// Code-hub's own relay client in this process, against relay files under `root`.
+function hubInProcess(t) {
+  _setContainerProbe(() => true);
+  hostRelay._setLoopbackDialHost('127.0.0.1');
+  relayStore._setHostPollMs(50);
+  t.after(() => { hostRelay.stop(); _setContainerProbe(null); hostRelay._setLoopbackDialHost(null); });
+}
+
+// Invariant (S5): bytes pass through untouched — TLS ends at the origin (its
+// certificate is the one the client sees) and early client bytes come first.
+test('V12: through the code-hub modules the TLS peer is the origin and early bytes arrive first', async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  await relayFor(t, { projectsRoot: root });
+  hubInProcess(t);
   const { key, cert } = generateSelfSigned({ ipAddresses: ['127.0.0.1'], dnsNames: ['localhost'] });
   const origin = https.createServer({ key, cert }, (req, res) => res.end(`hello ${req.url}`));
   await new Promise((r) => origin.listen(0, '127.0.0.1', r));
   t.after(() => origin.close());
-  const handle = handleFor(t, await hostRelay.openForward({}));
-  handle.attach({ host: '127.0.0.1', port: origin.address().port });
+  const echo = net.createServer((s) => { s.on('error', () => {}); s.pipe(s); });
+  await new Promise((r) => echo.listen(0, '127.0.0.1', r));
+  t.after(() => echo.close());
+  const tlsHandle = hostRelay.expose(origin.address().port, SCOPES.lan, { host: '127.0.0.1', port: origin.address().port });
+  const echoHandle = hostRelay.expose(echo.address().port, SCOPES.loopback, { host: '127.0.0.1', port: echo.address().port });
+  t.after(() => { tlsHandle.close(); echoHandle.close(); });
+  await hostRelay.init();
+  await waitFor(() => tlsHandle.hostPort() && echoHandle.hostPort());
 
-  const peer = await new Promise((resolve, reject) => {
-    const s = tls.connect({ host: '127.0.0.1', port: handle.port, rejectUnauthorized: false }, () => { resolve(s.getPeerX509Certificate()); s.destroy(); });
-    s.on('error', reject);
+  const { body, fingerprint } = await new Promise((resolve, reject) => {
+    const req = https.get({ host: '127.0.0.1', port: tlsHandle.hostPort(), path: '/x', rejectUnauthorized: false, agent: false }, (res) => {
+      const fp = res.socket.getPeerCertificate().fingerprint256;
+      let b = '';
+      res.on('data', (d) => { b += d; });
+      res.on('end', () => resolve({ body: b, fingerprint: fp }));
+    });
+    req.on('error', reject);
   });
-  assert.equal(peer.fingerprint256, new crypto.X509Certificate(cert).fingerprint256);
-  const body = await new Promise((resolve, reject) => {
-    https.get({ host: '127.0.0.1', port: handle.port, path: '/ping', rejectUnauthorized: false, agent: false }, (res) => {
-      let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => resolve(d));
-    }).on('error', reject);
-  });
-  assert.equal(body, 'hello /ping');
+  assert.equal(body, 'hello /x');
+  assert.equal(fingerprint, new crypto.X509Certificate(cert).fingerprint256);
+
+  const client = net.connect(echoHandle.hostPort(), '127.0.0.1');
+  client.write('early;'); // before the connection is even established
+  const got = collect(client);
+  await new Promise((r) => setTimeout(r, 100));
+  client.end('later');
+  assert.equal((await got).data, 'early;later');
 });
 
-// Invariant: a forward that is never renewed expires — its port refuses connections and renew answers 404.
-test('R5: an unrenewed forward expires within about 3 leases: it is gone and renew is 404', async (t) => {
+// Invariant (S5): the control listener is never LAN-reachable — a wildcard, an
+// advertised non-loopback or the default-route address is refused before any bind.
+test('V13: the relay refuses a wildcard, an advertised or a default-route --listen before binding', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 300 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  assert.equal(await canConnect(fwd.port), true);
-  await waitFor(async () => (await healthForwards(relay)) === 0, { timeout: 3 * 300 });
-  assert.equal((await relayCall(relay, 'POST', at(P.renew, fwd.id))).status, 404);
-});
-
-// Invariant: hostRelay's renewal keeps a forward alive well past its lease.
-test('R6: a hostRelay forward stays connectable for at least 5 lease periods', async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 600 });
-  withRelayEnv(t, relay);
-  const handle = handleFor(t, await hostRelay.openForward({}));
-  const until = Date.now() + 5 * 600 + 100;
-  while (Date.now() < until) {
-    assert.equal(await canConnect(handle.port), true);
-    assert.equal(handle.state, 'up');
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  assert.equal((await relayCall(relay, 'POST', at(P.renew, handle.id))).status, 200);
-});
-
-// Invariant: a crashed code-hub leaves nothing behind — its forward closes within the lease.
-test('R7: SIGKILLing the code-hub side closes its forward within the lease, plus a poll margin', async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 1000 });
-  const child = spawn(process.execPath, [path.join(REPO_ROOT, 'tests', 'fixtures', 'relay-client.mjs')], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    env: { ...process.env, CODEHUB_RELAY_URL: relay.url, CODEHUB_RELAY_SECRET: relay.secret },
-  });
-  t.after(() => child.kill('SIGKILL'));
-  const { port } = await new Promise((resolve) => {
-    let out = '';
-    child.stdout.on('data', (d) => { out += d; if (out.includes('\n')) resolve(JSON.parse(out)); });
-  });
-  await new Promise((r) => setTimeout(r, 1200)); // renewed past one lease while alive
-  assert.equal(await canConnect(port), true);
-  assert.equal(await healthForwards(relay), 1);
-  child.kill('SIGKILL');
-  // Within one lease of the kill (its last renewal came before it), plus a poll margin.
-  await waitFor(async () => (await healthForwards(relay)) === 0, { timeout: 1000 + 300 });
-});
-
-// Invariant: DELETE closes immediately — the listener goes and a live spliced connection is cut on both sides.
-test('R8: DELETE closes the listener and cuts a live spliced connection', async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  const parked = parkAccept(relay, fwd.id);
-  const lanSocket = await connect(fwd.port);
-  const lan = tap(lanSocket);
-  lanSocket.write('ping');
-  const { upgraded, socket: hubSocket, head } = await parked;
-  assert.equal(upgraded, true);
-  const hub = tap(hubSocket, head.toString());
-  await waitFor(() => hub.data.includes('ping'));
-  hubSocket.write('pong');
-  await waitFor(() => lan.data.includes('pong'));
-  assert.equal((await relayCall(relay, 'DELETE', at(P.forward, fwd.id))).status, 204);
-  await waitFor(() => lan.closed && hub.closed, { timeout: 2000 });
-  assert.equal(await healthForwards(relay), 0);
-});
-
-// Invariant: a LAN client that connects before any accept is parked is spliced onto the first one that parks, its early bytes delivered first and in order.
-test('R18: a LAN client waiting for an accept is handed the next one parked, early bytes first', async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000, acceptWaitMs: 5000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  const lanSocket = await connect(fwd.port);
-  const lan = tap(lanSocket);
-  lanSocket.write('first;');
-  lanSocket.write('second;');
-  await new Promise((r) => setTimeout(r, 150)); // queued, nothing parked yet
-  const { upgraded, socket: hubSocket, head } = await parkAccept(relay, fwd.id);
-  assert.equal(upgraded, true);
-  const hub = tap(hubSocket, head.toString());
-  lanSocket.write('third;');
-  await waitFor(() => hub.data.includes('third;'));
-  assert.equal(hub.data, 'first;second;third;');
-  hubSocket.write('back');
-  await waitFor(() => lan.data === 'back');
-  hubSocket.destroy();
-  lanSocket.destroy();
-});
-
-// Invariant: the accept pool stays at ACCEPT_POOL parked accepts across repeated down→up cycles — drained slots never come back alongside the fresh ones.
-test('R19: the accept pool does not grow across down→up cycles', async (t) => {
-  if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const secretFile = path.join(dir, 'secret');
-  let relay = await startRelay({ leaseMs: 300, secretFile });
-  const relays = [relay];
-  t.after(() => Promise.all(relays.map((r) => r.stop())));
-  withRelayEnv(t, relay);
-  const target = await echoServer(t);
-  const handle = handleFor(t, await hostRelay.openForward({}));
-  handle.attach({ host: '127.0.0.1', port: target });
-  const parked = async () => (await relayCall(relay, 'GET', P.health)).body.parked;
-  await waitFor(async () => (await parked()) === 4);
-  for (let cycle = 0; cycle < 2; cycle++) {
-    const port = relay.port;
-    await relay.stop();
-    await waitFor(() => handle.state === 'down', { timeout: 3000 });
-    relay = await startRelay({ leaseMs: 300, secretFile, listenPort: port });
-    relays.push(relay);
-    await waitFor(() => handle.state === 'up', { timeout: 3000 });
-  }
-  await waitFor(async () => (await parked()) === 4, { timeout: 3000 });
-  await new Promise((r) => setTimeout(r, 1500)); // past every re-park floor and backoff
-  assert.equal(await parked(), 4);
-});
-
-// Invariant: the control listener is never LAN-reachable — a wildcard or a non-loopback advertised listen address is refused before any socket, and loopback+loopback starts.
-test('R9: the relay refuses a wildcard or an advertised non-loopback --listen before binding, and starts on loopback', async (t) => {
-  if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const secret = ['--secret-file', path.join(dir, 'secret')];
-  const wildcard = await runRelay(['--listen', '0.0.0.0:0', '--advertise', '127.0.0.1', ...secret]);
+  const { root } = await hubRoot(t);
+  const common = ['--projects-root', root];
+  const wildcard = await runRelay(['--listen', '0.0.0.0:0', '--advertise', '127.0.0.1', ...common]);
   assert.notEqual(wildcard.code, 0);
   assert.match(wildcard.stderr, /is a wildcard address/);
-  const sameAsAdvertised = await runRelay(['--listen', '192.0.2.10:0', '--advertise', '192.0.2.10', ...secret]);
+  const sameAsAdvertised = await runRelay(['--listen', '192.0.2.10:0', '--advertise', '192.0.2.10', ...common]);
   assert.notEqual(sameAsAdvertised.code, 0);
   assert.match(sameAsAdvertised.stderr, /is also an advertised address/);
   assert.doesNotMatch(sameAsAdvertised.stderr, /cannot listen|Errno/, 'refused by the guard, not by a failed bind');
-  const loopback = await relayFor(t, {});
-  assert.match(loopback.output().stdout, /code-hub-relay listening on 127\.0\.0\.1:\d+/);
-});
-
-// Invariant: the running relay also refuses a non-loopback --listen equal to the default-route address, even with --advertise naming another address.
-test('R9d: the relay refuses a --listen equal to the probed default-route address', async (t) => {
-  if (!requirePython(t)) return;
   // The probe seam aims the route lookup at one of this host's own addresses,
   // whose source address is that address itself.
   const own = Object.values(os.networkInterfaces()).flat().find((ni) => ni?.family === 'IPv4' && !ni.internal)?.address;
-  if (!own) { t.skip('this host has no non-loopback IPv4 address to probe'); return; }
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const r = await runRelay(['--listen', `${own}:0`, '--advertise', '127.0.0.1', '--secret-file', path.join(dir, 'secret')],
-    { env: { CODEHUB_RELAY_PROBE_DEST: `${own}:9` } });
-  assert.notEqual(r.code, 0);
-  assert.match(r.stderr, /default-route \(LAN\) address/);
-  assert.equal(r.stdout, '', 'it never listened');
-});
-
-// Invariant: a busy requested port is refused with port_in_use, and openForward falls back to a free port, saying so.
-test('R10: a busy requested port is 409 port_in_use; openForward falls back with portFallback', async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000 });
-  withRelayEnv(t, relay);
-  const busy = net.createServer();
-  await new Promise((r) => busy.listen(0, '127.0.0.1', r));
-  t.after(() => busy.close());
-  const port = busy.address().port;
-  const res = await relayCall(relay, 'POST', P.forwards, { port });
-  assert.equal(res.status, 409);
-  assert.equal(res.body.code, PROTOCOL.errorCodes.portInUse);
-  const handle = handleFor(t, await hostRelay.openForward({ port }));
-  assert.equal(handle.portFallback, true);
-  assert.notEqual(handle.port, port);
-  assert.equal(await canConnect(handle.port), true);
-});
-
-// Invariant: after a relay restart the handle goes down, then re-creates its forward on the same port and reports both changes.
-test('R11: a relay restart takes the handle down and back up on the same forward port', async (t) => {
-  if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const secretFile = path.join(dir, 'secret');
-  const first = await startRelay({ leaseMs: 300, secretFile });
-  t.after(() => first.stop());
-  withRelayEnv(t, first);
-  const changes = [];
-  const handle = handleFor(t, await hostRelay.openForward({ onChange: () => changes.push(handle.state) }));
-  const port = handle.port;
-  await first.stop();
-  await waitFor(() => handle.state === 'down', { timeout: 3000 });
-  const second = await startRelay({ leaseMs: 300, secretFile, listenPort: first.port });
-  t.after(() => second.stop());
-  await waitFor(() => handle.state === 'up', { timeout: 3000 });
-  assert.equal(handle.port, port);
-  assert.deepEqual(changes, ['down', 'up']);
-  assert.equal(await canConnect(port), true);
-});
-
-// Invariant: the secret is created on first run, reused afterwards, and never logged.
-test('R12: the secret file is created, reused, and never printed', async (t) => {
-  if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const secretFile = path.join(dir, 'nested', 'secret');
-  const first = await startRelay({ secretFile });
-  await relayCall(first, 'POST', P.forwards, {});
-  await first.stop('SIGTERM');
-  const second = await startRelay({ secretFile });
-  await second.stop('SIGTERM');
-  assert.equal(second.secret, first.secret);
-  for (const r of [first, second]) {
-    const { stdout, stderr } = r.output();
-    assert.ok(!stdout.includes(first.secret) && !stderr.includes(first.secret), 'secret not in the output');
-    assert.ok(stderr.includes(secretFile), 'the file path is logged instead');
+  if (own) {
+    const route = await runRelay(['--listen', `${own}:0`, '--advertise', '127.0.0.1', ...common], { env: { CODEHUB_RELAY_PROBE_DEST: `${own}:9` } });
+    assert.notEqual(route.code, 0);
+    assert.match(route.stderr, /default-route \(LAN\) address/);
+    assert.equal(route.stdout, '', 'it never listened');
   }
+  const loopback = await relayFor(t, { projectsRoot: root });
+  assert.match(loopback.output().stdout, /code-hub-relay listening on 127\.0\.0\.1:\d+/);
 });
 
-// Invariant: resources are bounded — parked accepts per forward and forwards per relay are capped with 429.
-test('R13: the parked-accept cap and the forward cap answer 429', async (t) => {
+const hostFileIn = (root) => path.join(root, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.relayFile);
+const exists = (p) => fs.access(p).then(() => true, () => false);
+
+// Invariant (S7): with no flags the relay finds code-hub's store by walking up
+// from its own script — never from the working directory; --projects-root
+// overrides it; finding none fails naming where it looked and the flag.
+test('V14: discovery walks up from the script, --projects-root overrides, and none found fails clearly', async (t) => {
   if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 10000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  const results = [];
-  for (let i = 0; i < 17; i++) parkAccept(relay, fwd.id).then((r) => results.push(r), () => {});
-  await waitFor(() => results.length === 1);
-  assert.deepEqual([results[0].upgraded, results[0].status], [false, 429]);
-  await new Promise((r) => setTimeout(r, 100));
-  assert.equal(results.length, 1, 'the other 16 stay parked');
-  for (let i = 1; i < 64; i++) assert.equal((await relayCall(relay, 'POST', P.forwards, {})).status, 201);
-  assert.equal((await relayCall(relay, 'POST', P.forwards, {})).status, 429);
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-discover-'));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const plugin = path.join(tmp, 'root', '.plugins', 'code-hub', 'relay');
+  await fs.mkdir(plugin, { recursive: true });
+  for (const f of ['relay.py', 'protocol.json']) await fs.copyFile(path.join(REPO_ROOT, 'relay', f), path.join(plugin, f));
+  await fs.mkdir(path.join(tmp, 'root', '.code-hub'));
+  const decoy = path.join(tmp, 'decoy');
+  await fs.mkdir(path.join(decoy, '.code-hub'), { recursive: true });
+
+  const found = await startRelay({ relayDir: plugin, cwd: decoy });
+  t.after(() => found.stop());
+  await waitFor(() => exists(hostFileIn(path.join(tmp, 'root'))));
+  assert.equal(await exists(hostFileIn(decoy)), false, 'never the working directory\'s store');
+  await found.stop('SIGTERM');
+
+  const other = path.join(tmp, 'other');
+  await fs.mkdir(path.join(other, '.code-hub'), { recursive: true });
+  const overridden = await startRelay({ relayDir: plugin, cwd: decoy, projectsRoot: other });
+  t.after(() => overridden.stop());
+  await waitFor(() => exists(hostFileIn(other)));
+  await overridden.stop('SIGTERM');
+
+  const lonely = path.join(tmp, 'lonely', 'relay');
+  await fs.mkdir(lonely, { recursive: true });
+  for (const f of ['relay.py', 'protocol.json']) await fs.copyFile(path.join(REPO_ROOT, 'relay', f), path.join(lonely, f));
+  const none = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1'], { relayDir: lonely, cwd: decoy });
+  assert.notEqual(none.code, 0);
+  assert.ok(none.stderr.includes(path.join(tmp, 'lonely')), none.stderr);
+  assert.ok(none.stderr.includes(tmp), 'names the searched dirs');
+  assert.match(none.stderr, /--projects-root/);
+});
+
+// Invariant (S2/S7): the relay file names where the relay really listens and
+// which process wrote it, is written atomically, is removed on a clean exit,
+// and is left alone once another relay has taken it over.
+test('V15: host.json carries the real port and pid, goes on SIGTERM, and stays when overwritten', { skip: process.platform === 'win32' ? 'POSIX signals only' : false }, async (t) => {
+  if (!requirePython(t)) return;
+  const { root } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root });
+  const host = JSON.parse(await fs.readFile(hostFileIn(root), 'utf8'));
+  assert.deepEqual(host, { protocolVersion: PROTOCOL.protocolVersion, listen: `127.0.0.1:${relay.port}`, pid: relay.proc.pid });
+  assert.deepEqual((await fs.readdir(path.dirname(hostFileIn(root)))).filter((n) => n.endsWith('.tmp')), []);
+  relay.proc.kill('SIGTERM');
+  await relay.exited;
+  assert.equal(relay.proc.exitCode, 0);
+  assert.equal(await exists(hostFileIn(root)), false);
+  assert.equal(await canConnect(relay.port), false);
+
+  const second = await relayFor(t, { projectsRoot: root });
+  const taken = JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, listen: '127.0.0.1:1', pid: second.proc.pid + 100000 });
+  await fs.writeFile(hostFileIn(root), taken);
+  second.proc.kill('SIGTERM');
+  await second.exited;
+  assert.equal(await fs.readFile(hostFileIn(root), 'utf8'), taken);
+});
+
+// Invariant (S5): the secret is read on every handshake — a relay started
+// before code-hub ever wrote it waits instead of failing, and a regenerated
+// secret applies to the very next connection.
+test('V16: a relay started before the secret exists waits for it, and picks up a regenerated one', async (t) => {
+  if (!requirePython(t)) return;
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await fs.mkdir(path.join(root, '.code-hub'));
+  const relay = await relayFor(t, { projectsRoot: root });
+  await waitFor(() => /waiting for code-hub to create .*relay\.json/.test(relay.output().stderr));
+  const early = await relayLogin(relay.port, 'z'.repeat(43));
+  assert.deepEqual([early.reply.t, early.reply.code], [F.error, E.noSecret]);
+  await relayStore.ensureSecret();
+  const secret = await relaySecret(root);
+  const s = await relayLogin(relay.port, secret);
+  assert.equal(s.reply.t, F.welcome);
+  s.socket.destroy();
+  const hubFile = path.join(root, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile);
+  await fs.writeFile(hubFile, 'not json');
+  await relayStore.ensureSecret(); // replaces the invalid file with a fresh secret
+  const fresh = await relaySecret(root);
+  assert.notEqual(fresh, secret);
+  const old = await relayLogin(relay.port, secret);
+  assert.deepEqual([old.reply.t, old.reply.code], [F.error, E.authFailed]);
+  const now = await relayLogin(relay.port, fresh);
+  assert.equal(now.reply.t, F.welcome);
+  now.socket.destroy();
 });
 
 // Every string literal's text in JS source — '…', "…" and template text
-// outside ${} — with comments skipped.
+// outside ${} — with comments skipped, and with the code just before it.
 function jsStringLiterals(src) {
   const out = [];
   let i = 0;
   const readQuoted = (q) => {
+    const before = src.slice(Math.max(0, i - 24), i);
     let buf = '';
     for (i += 1; src[i] !== q; i += 1) buf += src[i] === '\\' ? src[++i] : src[i];
     i += 1;
-    out.push(buf);
+    out.push({ text: buf, before });
   };
   const readTemplate = () => {
     let buf = '';
     for (i += 1; src[i] !== '`'; i += 1) {
       if (src[i] === '\\') { buf += src[++i]; continue; }
-      if (src[i] === '$' && src[i + 1] === '{') { out.push(buf); buf = ''; i += 2; code('}'); i -= 1; continue; }
+      if (src[i] === '$' && src[i + 1] === '{') { out.push({ text: buf, before: '' }); buf = ''; i += 2; code('}'); i -= 1; continue; }
       buf += src[i];
     }
     i += 1;
-    out.push(buf);
+    out.push({ text: buf, before: '' });
   };
   // Scan code until the unmatched `close` (or the end).
   const code = (close) => {
@@ -404,6 +567,17 @@ function jsStringLiterals(src) {
       const c = src[i];
       if (c === '/' && src[i + 1] === '/') { const nl = src.indexOf('\n', i); i = nl < 0 ? src.length : nl; continue; }
       if (c === '/' && src[i + 1] === '*') { i = src.indexOf('*/', i + 2) + 2; continue; }
+      if (c === '/' && /[=(,:!&|?{};]\s*$/.test(src.slice(Math.max(0, i - 8), i))) {
+        // A regex literal: skip it (character classes may hold quotes).
+        let inClass = false;
+        for (i += 1; i < src.length && (inClass || src[i] !== '/'); i += 1) {
+          if (src[i] === '\\') { i += 1; continue; }
+          if (src[i] === '[') inClass = true;
+          if (src[i] === ']') inClass = false;
+        }
+        i += 1;
+        continue;
+      }
       if (c === '\'' || c === '"') { readQuoted(c); continue; }
       if (c === '`') { readTemplate(); continue; }
       if (c === '{') depth += 1;
@@ -415,65 +589,90 @@ function jsStringLiterals(src) {
   return out;
 }
 
-const restatements = (src) => jsStringLiterals(src).flatMap((lit) => PROTOCOL_IDS.filter((id) => lit.includes(id)).map((id) => ({ lit, id })));
+// Every identifier protocol.json defines for both sides to read.
+const PROTOCOL_IDS = [
+  ...Object.values(PROTOCOL.frames), ...Object.values(PROTOCOL.roles), ...Object.values(PROTOCOL.scopes),
+  ...Object.values(PROTOCOL.macLabels), ...Object.values(PROTOCOL.errorCodes), ...Object.values(PROTOCOL.rendezvous),
+];
+// A literal restates an identifier by equalling it; one that isn't a plain
+// word (an error code, a label, a file name) also by containing it. An event
+// name passed to .on/.once/.off/.emit is Node's vocabulary, not the protocol's.
+const EVENT_ARG = /\.(on|once|off|emit|removeListener|prependListener)\(\s*$/;
+const restatements = (src) => jsStringLiterals(src)
+  .filter((lit) => !EVENT_ARG.test(lit.before))
+  .flatMap((lit) => PROTOCOL_IDS
+    .filter((id) => lit.text === id || (/[^a-z]/.test(id) && lit.text.includes(id)))
+    .map((id) => ({ lit: lit.text, id })));
 
-// Invariant: protocol identifiers have a single source on the Node side — src/hostRelay.js reads them from protocol.json and never restates one.
-test('R14: src/hostRelay.js restates no protocol identifier', () => {
+// Invariant (S5): protocol identifiers have a single source on the code-hub
+// side — the relay modules read them from protocol.json and restate none.
+test('V17: the code-hub relay modules restate no protocol identifier', () => {
   const planted = [
-    "const a = '/v1/forwards/' + id; // '/v1/health' named in a comment",
-    '/* "port_in_use" in a block comment */ const b = `${x}code-hub-relay/1`;',
-    'const c = "no_lan_address"; const d = { port }; const e = `ok ${ "/v1/health" } done`;',
+    "const a = { t: 'hello' }; // 'auth' named in a comment",
+    '/* "bad_frame" in a block comment */ const b = `x ${y} relay.json`;',
+    "socket.on('data', f); const c = `role ${'control'}`; const d = 'code-hub-relay/2 hub' + x; const e = /'ping'/;",
+    "const g = 'no_lan_address: busy'; const h = 'lan';",
   ].join('\n');
-  assert.deepEqual(restatements(planted).map((r) => r.id).sort(), ['/v1/forwards', '/v1/health', 'code-hub-relay/1', 'no_lan_address']);
-  const src = readFileSync(path.join(REPO_ROOT, 'src', 'hostRelay.js'), 'utf8');
-  assert.ok(jsStringLiterals(src).length > 10, 'the scanner sees the file\'s literals');
-  assert.deepEqual(restatements(src), []);
+  assert.deepEqual(restatements(planted).map((r) => r.id).sort(), ['code-hub-relay/2 hub', 'control', 'hello', 'lan', 'no_lan_address', 'relay.json']);
+  for (const file of ['hostRelay.js', 'relaySession.js', 'relayStore.js', 'loopbackMirror.js']) {
+    const src = readFileSync(path.join(REPO_ROOT, 'src', file), 'utf8');
+    assert.ok(jsStringLiterals(src).length > 0, `the scanner sees ${file}'s literals`);
+    assert.deepEqual(restatements(src), [], file);
+  }
 });
 
-// Invariant: a probe result the relay must not advertise refuses the start (wired through the probe seam, host-independent).
-test('R15: a loopback route-probe answer refuses the start with "no LAN address to advertise (loopback)"', async (t) => {
+// Invariant (S10): scope confinement on the real relay — a loopback pair is
+// reachable on 127.0.0.1 only, a LAN pair on the advertised address only.
+test('V18: loopback scope binds 127.0.0.1 only, lan scope the advertised address only', async (t) => {
   if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const r = await runRelay(['--listen', '127.0.0.1:0', '--secret-file', path.join(dir, 'secret')], { env: { CODEHUB_RELAY_PROBE_DEST: '127.0.0.1:9' } });
-  assert.notEqual(r.code, 0);
-  assert.match(r.stderr, /no LAN address to advertise \(loopback\)/);
-  assert.equal(r.stdout, '', 'it never listened');
+  if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
+  const { root, secret } = await hubRoot(t);
+  const relay = await relayFor(t, { projectsRoot: root, advertise: ALT_LOOPBACK });
+  const s = await control(t, relay, secret);
+  const [p1, p2] = [await freePort(ALT_LOOPBACK), await freePort()];
+  const status = await sendPorts(s, [{ port: p1, scope: SCOPES.lan }, { port: p2, scope: SCOPES.loopback }]);
+  assert.deepEqual(status.addresses, [ALT_LOOPBACK]);
+  const h1 = entryFor(status, p1, SCOPES.lan).hostPort;
+  const h2 = entryFor(status, p2, SCOPES.loopback).hostPort;
+  assert.equal(await canConnect(h2, '127.0.0.1'), true);
+  assert.equal(await canConnect(h2, ALT_LOOPBACK), false);
+  assert.equal(await canConnect(h1, ALT_LOOPBACK), true);
+  assert.equal(await canConnect(h1, '127.0.0.1'), false);
 });
 
-// Invariant: an out-of-date deployed relay copy is detected — a protocol mismatch fails the relay on the share, never the share.
-test('R16: a relay speaking another protocol version fails the share\'s relay with the mismatch text', async (t) => {
+// Invariant (S5): pending host clients are capped per port and per session;
+// one over either cap is cut at once, while those within it stay claimable.
+test('V19: the incoming caps cut excess clients at once and keep the rest claimable', async (t) => {
   if (!requirePython(t)) return;
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-relay-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  await fs.copyFile(path.join(REPO_ROOT, 'relay', 'relay.py'), path.join(dir, 'relay.py'));
-  await fs.writeFile(path.join(dir, 'protocol.json'), JSON.stringify({ ...PROTOCOL, protocolVersion: 2 }));
-  const relay = await relayFor(t, { relayDir: dir, leaseMs: 5000 });
-  withRelayEnv(t, relay);
-  await assert.rejects(hostRelay.openForward({}), /relay speaks protocol 2, this code-hub speaks 1 — update the relay\/ copy on the host/);
-
-  process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
-  process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
-  const root = await mkRoot();
-  t.after(() => rmRoot(root));
-  await mkProject(root, 'app', { start: fakeAppCmd() });
-  await appManager.init();
-  t.after(() => appManager.stop('app').catch(() => {}));
-  await appManager.start('app');
-  const shared = await appManager.share('app', { mode: 'lan', tls: false });
-  assert.equal(shared.relay.state, 'failed');
-  assert.match(shared.relay.error, /relay speaks protocol 2, this code-hub speaks 1/);
-  await waitFor(async () => (await healthForwards(relay)) === 0, { timeout: 2000 });
-});
-
-// Invariant: SIGTERM is a clean shutdown — exit code 0 and every forward port closed.
-test('R17: SIGTERM exits 0 and closes the forward ports', { skip: process.platform === 'win32' ? 'POSIX signals only' : false }, async (t) => {
-  if (!requirePython(t)) return;
-  const relay = await relayFor(t, { leaseMs: 5000 });
-  const { body: fwd } = await relayCall(relay, 'POST', P.forwards, {});
-  assert.equal(await canConnect(fwd.port), true);
-  relay.proc.kill('SIGTERM');
-  await relay.exited;
-  assert.equal(relay.proc.exitCode, 0);
-  assert.equal(await canConnect(fwd.port), false);
+  const { root, secret } = await hubRoot(t);
+  const relayDir = await patchedRelayDir(t, { maxIncomingPerPort: 2, maxIncomingTotal: 3 });
+  const relay = await relayFor(t, { projectsRoot: root, relayDir, acceptWaitMs: 5000 });
+  const s = await control(t, relay, secret);
+  const [a, b] = [await freePort(), await freePort()];
+  const status = await sendPorts(s, [{ port: a, scope: SCOPES.loopback }, { port: b, scope: SCOPES.loopback }]);
+  const [ha, hb] = [entryFor(status, a, SCOPES.loopback).hostPort, entryFor(status, b, SCOPES.loopback).hostPort];
+  const conns = [];
+  const pending = async (hostPort) => {
+    const c = await tcpConnect(hostPort);
+    t.after(() => c.destroy());
+    const f = await nextFrame(s, { incoming: true });
+    assert.equal(f.t, F.incoming);
+    conns.push({ client: c, conn: f.conn });
+  };
+  const cut = async (hostPort) => {
+    const opened = Date.now();
+    const { closedAt } = await collect(await tcpConnect(hostPort));
+    assert.ok(closedAt - opened < 1500, `cut after ${closedAt - opened}ms, not at the accept wait`);
+  };
+  await pending(ha);
+  await pending(ha);
+  await cut(ha); // the per-port cap
+  await pending(hb);
+  await cut(hb); // the session cap
+  const first = conns[0];
+  const got = collect(first.client);
+  const claim = await relayLogin(relay.port, secret, { role: ROLES.data, session: s.reply.session, conn: first.conn });
+  assert.equal(claim.reply.t, F.welcome);
+  claim.socket.end('claimed');
+  assert.equal((await got).data, 'claimed');
 });

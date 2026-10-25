@@ -175,9 +175,11 @@ function withTimeout(promise, ms, where) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+// `allowHalfOpen`: a data connection carries one client's TCP stream, whose
+// half-close (FIN after its last request byte) must not cut the reply.
 function connect(host, port) {
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port });
+    const socket = net.connect({ host, port, allowHalfOpen: true });
     const timer = setTimeout(() => {
       socket.destroy();
       reject(relayError(`connecting to the relay at ${host}:${port} timed out after ${CONNECT_TIMEOUT_MS}ms`, 'timeout'));
@@ -300,7 +302,7 @@ export function openData({ host, port, secret, limiter, session, conn, target, o
   const closer = { close() { closed = true; end(); } };
   dialAndAuth({ host, port, limiter, secret, role: ROLES.data, session, conn, isCancelled: () => closed }).then(({ socket, head }) => {
     if (closed) { socket.destroy(); return; }
-    const up = net.connect(target.port, target.host);
+    const up = net.connect({ port: target.port, host: target.host, allowHalfOpen: true });
     sockets.add(socket);
     sockets.add(up);
     for (const s of [socket, up]) { s.on('error', end); s.on('close', end); }
