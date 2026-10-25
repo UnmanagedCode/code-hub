@@ -6,6 +6,9 @@
 //   silent        never pings and never answers a ping
 //   autoStatus    answer every ports frame with a status binding each pair (default on)
 //   dataDelayMs   hold each data handshake this long before the welcome
+//   statusDelayMs hold each status this long (they still go out in order)
+// A bound pair's host port is 50000 + the number of the ports frame answered,
+// so a test can tell which answer a host port came from.
 import net from 'node:net';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -14,7 +17,7 @@ import { RELAY_PROTOCOL as P, protoMac, frameStream, relaySecret } from '../help
 
 const send = (socket, frame) => { if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`); };
 
-export async function startFakeRelay({ root, impostor = false, impostorData = false, silent = false, autoStatus = true, dataDelayMs = 0, version = P.protocolVersion } = {}) {
+export async function startFakeRelay({ root, impostor = false, impostorData = false, silent = false, autoStatus = true, dataDelayMs = 0, statusDelayMs = 0, version = P.protocolVersion } = {}) {
   const secret = await relaySecret(root);
   const fake = {
     accepted: [], // accept times
@@ -62,6 +65,7 @@ export async function startFakeRelay({ root, impostor = false, impostorData = fa
     socket.on('close', () => { c.closed = true; });
     fake.controls.push(c);
     send(socket, { t: P.frames.welcome, mac: impostor ? 'f'.repeat(64) : proof, session: id, addresses: ['127.0.0.1'] });
+    let answered = Promise.resolve();
     for (;;) {
       let f;
       try { f = await frames.next(60000); } catch { return; }
@@ -70,12 +74,12 @@ export async function startFakeRelay({ root, impostor = false, impostorData = fa
       if (f.t === P.frames.ping && !silent) send(socket, { t: P.frames.pong });
       if (f.t === P.frames.ports) {
         c.ports.push(f.ports);
-        if (autoStatus) {
-          send(socket, {
-            t: P.frames.status, addresses: ['127.0.0.1'],
-            ports: f.ports.map((e) => ({ ...e, hostPort: e.port, fallback: false })),
-          });
-        }
+        const n = c.ports.length;
+        const status = {
+          t: P.frames.status, addresses: ['127.0.0.1'],
+          ports: f.ports.map((e) => ({ ...e, hostPort: 50000 + n, fallback: false })),
+        };
+        if (autoStatus) answered = answered.then(() => new Promise((r) => setTimeout(r, statusDelayMs))).then(() => send(socket, status));
       }
     }
   });

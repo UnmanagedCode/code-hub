@@ -42,8 +42,16 @@ let connecting = false;
 let dirty = false;
 let session = null; // { token, id, send, close, dial: { host, port }, secret }
 const limiter = createLimiter(PROTOCOL.maxHubHandshakes);
-const exposures = new Map(); // pair key → Set of handles, oldest first
+// pair key → Set of handles, oldest first; the set's `since` is the number of
+// the first ports frame of this session that carried the pair.
+const exposures = new Map();
 let statuses = new Map(); // pair key → the relay's status entry
+// Ports frames sent and status frames received this session. The relay answers
+// each ports frame with one status, in order, so status number n answers ports
+// frame n — and a pair's entry counts only from the frame that carried it on,
+// never from an answer about an earlier exposure of the same pair.
+let portsSent = 0;
+let statusesSeen = 0;
 const pipes = new Set(); // data-connection closers of the current session
 const statusWaiters = new Set();
 
@@ -106,6 +114,8 @@ export function addresses() {
 
 function dropSessionState() {
   statuses = new Map();
+  portsSent = 0;
+  statusesSeen = 0;
   currentAddresses = [];
   for (const p of [...pipes]) p.close();
   pipes.clear();
@@ -172,6 +182,7 @@ async function evaluate() {
     session = { ...opened, token, dial: { host: dial, port: host.listenPort }, secret };
     attempts = 0;
     currentAddresses = opened.addresses;
+    for (const set of exposures.values()) set.since = 1;
     console.error(`[hostRelay] connected to the relay at ${dial}:${host.listenPort} (session ${opened.id})`);
     setState('up', null);
     sendPorts();
@@ -210,12 +221,14 @@ function applyStatus(f) {
   if (f.addresses.length > PROTOCOL.maxAddresses || !f.addresses.every((a) => typeof a === 'string' && net.isIPv4(a))) {
     throw new Error('a status frame carries malformed addresses');
   }
+  statusesSeen += 1;
   const next = new Map();
   for (const e of f.ports) {
     checkShape(e, e && typeof e === 'object' && 'code' in e ? REFUSED_SHAPE : BOUND_SHAPE, 'a status entry');
     if (!inPortRange(e.port) || !SCOPE_VALUES.has(e.scope)) throw new Error('a status entry names an invalid port or scope');
     if ('code' in e ? !ERROR_CODE_VALUES.has(e.code) : (e.hostPort < 1 || e.hostPort > 65535)) throw new Error('a status entry is malformed');
-    next.set(pairKey(e.port, e.scope), e);
+    const key = pairKey(e.port, e.scope);
+    if (exposures.get(key)?.since <= statusesSeen) next.set(key, e);
   }
   statuses = next;
   currentAddresses = f.addresses;
@@ -240,6 +253,7 @@ function onIncoming(f) {
 
 function sendPorts() {
   if (state !== 'up' || !session) return;
+  portsSent += 1;
   const ports = [...exposures.values()].map((set) => {
     const { port, scope } = set.values().next().value;
     return { port, scope };
@@ -293,7 +307,7 @@ export function expose(port, scope, target, onChange = () => {}) {
   const key = pairKey(port, scope);
   const h = { key, port, scope, target, onChange, last: null };
   const isNew = !exposures.has(key);
-  if (isNew) exposures.set(key, new Set());
+  if (isNew) exposures.set(key, Object.assign(new Set(), { since: portsSent + 1 }));
   exposures.get(key).add(h);
   h.last = snapshot(h);
   if (isNew) sendPorts();
@@ -312,6 +326,7 @@ export function expose(port, scope, target, onChange = () => {}) {
       const set = exposures.get(key);
       if (!set?.delete(h) || set.size) return;
       exposures.delete(key);
+      statuses.delete(key);
       sendPorts();
     },
   };

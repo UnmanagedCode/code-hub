@@ -253,6 +253,34 @@ test('H10: an incoming for an unexposed pair is ignored', async (t) => {
   assert.deepEqual(fake.dataAuths.map((d) => d.conn), ['i'.repeat(16)]);
 });
 
+// Invariant (S3): a pair withdrawn and exposed again (an app restarted on the
+// same port) never reports a host port the relay gave its earlier exposure —
+// neither one cached before, nor one in an answer still in flight.
+test('H11: a re-exposed pair reports only the host port bound for it, never a stale one', async (t) => {
+  const root = await setup(t);
+  for (const statusDelayMs of [0, 150]) {
+    const fake = await fakeFor(t, root, { statusDelayMs });
+    await hostRelay.init();
+    await waitFor(() => hostRelay.status().state === 'up');
+    const before = fake.controls.at(-1).ports.length;
+    const first = hostRelay.expose(40031, SCOPES.loopback, { host: '127.0.0.1', port: 40031 });
+    if (!statusDelayMs) await waitFor(() => first.hostPort() !== null);
+    const stale = 50000 + before + 1;
+    first.close();
+    const again = exposeFor(t, 40031, SCOPES.loopback).handle;
+    const seen = new Set();
+    const sampler = setInterval(() => seen.add(again.hostPort()), 1);
+    await waitFor(() => again.hostPort() !== null);
+    clearInterval(sampler);
+    seen.add(again.hostPort());
+    assert.ok(!seen.has(stale), `reported the stale host port (delay ${statusDelayMs})`);
+    assert.equal(again.hostPort(), 50000 + before + 3, 'the answer to the frame that re-exposed it');
+    again.close();
+    hostRelay.stop();
+    await fake.close();
+  }
+});
+
 // Invariant (S5): code-hub alone can never trip the relay's cap on
 // unauthenticated connections — its own bound is below the cap, and a burst of
 // incoming frames never has more than that many handshakes in flight, yet all

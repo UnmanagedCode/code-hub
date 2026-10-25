@@ -288,23 +288,27 @@ function funnelBlockedBy(id) {
 }
 
 // The loopback mirror set is derived from the store each mutation persists:
-// every running app but the always-on host conductor (code-hub never started
-// it). Also run when a child exits (see runner.onExit below), so a crash
-// drops its mirror without waiting for a persist.
+// every ready app but the always-on host conductor (code-hub never started
+// it). Also run when a start's readiness settles (see start()) and when a
+// child exits (see runner.onExit below), so a crash drops its mirror without
+// waiting for a persist.
 async function persist() {
   syncMirrors();
   await state.save(store);
 }
 
-function appAlive(rec) {
+// Mirrored only once ready, never while starting: where the host's loopback is
+// the app's own (a host-network container), a relay listener bound first would
+// take the app's port before the app could.
+function appMirrorable(rec) {
   const rt = runner.runtime(rec.id);
-  if (rt) return rt.status === 'starting' || rt.status === 'ready';
-  return state.pidAlive(rec.pid); // adopted after a restart: no runtime
+  if (rt) return rt.status === 'ready';
+  return state.pidAlive(rec.pid); // adopted after a restart: no runtime, already listening
 }
 
 function syncMirrors() {
   loopbackMirror.sync(Object.values(store.apps)
-    .filter((rec) => !isHostConductorId(rec.id) && appAlive(rec))
+    .filter((rec) => !isHostConductorId(rec.id) && appMirrorable(rec))
     .map((rec) => ({ id: rec.id, port: rec.port })));
 }
 
@@ -553,6 +557,7 @@ export async function start(id) {
   // visible, so no listing can show it `starting` with nothing to wait on.
   store.apps[id] = rec;
   trackTransition(id, rec, { settled: proc.settled, wantsAutoShare, readConfig });
+  proc.settled.then(() => syncMirrors());
   await persist();
   return { ...rec, urls: urlsFor(id, port) };
 }
