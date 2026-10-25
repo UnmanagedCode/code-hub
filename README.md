@@ -68,6 +68,7 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 | Auto-start / auto-share | off | per-app (main checkouts only; the always-on host code-conductor takes `autoShare` only), in the card's **Settings** dialog, or `PUT /api/apps/:id/settings` (`autoStart`, `autoShare`) |
 | Runtime state | `<projectsRoot>/.code-hub/state.json` | — |
 | Machine-local registrations | `<projectsRoot>/.code-hub/registrations.json` | — |
+| Host-relay rendezvous (shared secret, relay address) | `<projectsRoot>/.code-hub/relay/` (`relay.json` written by code-hub, `host.json` by the relay; dir `0700`) | the relay's `--projects-root` |
 | App settings (default share login, fixed port, auto-start, auto-share) | `<projectsRoot>/.code-hub/app-settings.json` (mode `0600`, plaintext; migrated once at startup from an older `share-defaults.json`) | — |
 
 ## Trust model & limitations
@@ -78,7 +79,7 @@ For a sibling dir you don't want to (or can't) add a `.hub.json` to, register it
 - **A default share password is stored in plaintext** in `<projectsRoot>/.code-hub/app-settings.json`, protected only by its `0600` file mode. `GET /api/apps/:id/settings` never returns it, but while a share seeded from it is live, `GET /api/apps` serves that share's real password (as `tunnel.password`, which Copy uses) — the on-screen mask is a shoulder-surfing measure, not a security boundary. See `docs/protocol.md` ("App settings").
 - **A live share's Edit never changes the stored default login**, and the default can't be pinned from a live share: to keep a share's generated password as the default, type it into **Settings**.
 - **Auto-share at boot can open a public share unattended.** An app ticked for both auto-start and auto-share is shared as code-hub boots — for cloudflared or tailscale, at a public URL — with nobody at the UI. So is the always-on host code-conductor when ticked for auto-share, on every code-hub boot. An app code-hub *adopts* at boot (still running from before the restart) is never auto-shared.
-- **No periodic refresh.** Changes nothing in the page caused — an app crashing later, a funnel dying, the outdated pill, new projects or worktrees, the availability badges, a start from another tab or by MCP — show on the next **Refresh** or tab return.
+- **No periodic refresh.** Changes nothing in the page caused — an app crashing later, a funnel dying, the outdated pill, new projects or worktrees, the availability badges, a start from another tab or by MCP, the host relay connecting or dropping (which changes share URLs and Start URLs; `GET /api/apps` reflects it within seconds) — show on the next **Refresh** or tab return.
 - **Tailscale Funnel shares** carry two limitations worth knowing before you hand the URL out:
   - **The URL is stable, not immutable.** It is the node's MagicDNS name, so it survives code-hub restarts and machine reboots — that stability is the entire reason this mode exists next to cloudflared. But it is the node's *identity*, and identity can churn: if the node ever re-registers under a name already taken in the tailnet (a container or VM rebuild is the usual cause), Tailscale appends a numeric suffix and the URL changes. This machine is already `code-conductor-1.tailb09348.ts.net` — the `-1` is exactly that having happened once. code-hub re-reads the current name from `tailscale status` on every share, so a rename yields a correct new URL rather than a stale one, but a link handed out before the rename is dead.
   - **One tailscale share at a time.** Funnel publishes on port 443 of the node, a machine-wide resource, so a second tailscale share is refused with `409` naming the app currently holding it. Unshare that one first. (LAN and cloudflared shares are unaffected and can run alongside it.)
@@ -102,16 +103,18 @@ When embedded, code-hub surfaces the host `code-conductor` checkout as an **alwa
 
 ## Host relay (code-hub in Docker)
 
-In a **bridge-networked container**, a LAN share's URL is the container's bridge address, which no other device can reach. The **host relay** (`relay/relay.py` + `relay/protocol.json`, Python ≥3.9, standard library only) runs on the Docker host and exposes the share on the host's real LAN address; with `CODEHUB_RELAY_URL` and `CODEHUB_RELAY_SECRET` set in code-hub's environment, a LAN share shows the host URL instead. TLS and the auth gate stay end to end inside code-hub, and a relay problem never fails the share — it falls back to the container's own addresses and says why. No child code-hub runs inherits the two relay variables, even when a login profile exports them — hygiene, not a boundary against a process of the same user (`docs/host-relay.md` → Limitations). Without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
+In a **bridge-networked container**, a LAN share's URL is the container's bridge address, which no other device can reach, and no app port is published to the host. The **host relay** (`relay/relay.py` + `relay/protocol.json`, Python ≥3.9, standard library only) runs on the Docker host and fixes both, with **no configuration**:
+
+- **LAN shares** appear on the host's LAN address; TLS and the auth gate stay end to end inside code-hub.
+- **Every running app is mirrored on the host's `127.0.0.1`** once it is ready, and its Start URL shows that address while mirrored.
 
 ```sh
-python3 relay/relay.py                           # Docker Desktop (Windows: py -3 relay\relay.py)
-python3 relay/relay.py --listen 172.17.0.1:7077  # native Linux Docker
-# then, for code-hub: CODEHUB_RELAY_URL=http://host.docker.internal:7077
-#                     CODEHUB_RELAY_SECRET=<contents of ~/.code-hub-relay/secret>
+python3 relay/relay.py      # from the code-hub checkout, on the host (Windows: py -3 relay\relay.py)
 ```
 
-Setup per platform, `--advertise`, secret provisioning, all flags, a systemd unit, the security model and limitations: `docs/host-relay.md`.
+No env and no flags: the relay finds code-hub's store by walking up from its own directory, and the two meet through `<projectsRoot>/.code-hub/relay/` — code-hub writes the shared secret there, the relay writes its listen address — whatever the start order. code-hub dials out and holds one mutually authenticated session (the secret never crosses the wire); the host listeners live exactly as long as that session. A relay problem never fails a share — it falls back to the container's own addresses and says why; without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
+
+Per-platform setup, discovery, `--advertise`, all flags, a systemd unit, the security model and limitations: `docs/host-relay.md`.
 
 ## Testing
 
@@ -139,7 +142,7 @@ RUN_REAL_TAILSCALE=1 npm test     # also runs the real-tailscale smoke tests —
 - `docs/features.md` — UI and user-facing features
 - `docs/protocol.md` — `.hub.json` schema + HTTP API
 - `docs/architecture.md` — modules, process/state lifecycle, test patterns
-- `docs/host-relay.md` — the host relay for code-hub in a bridge-networked container: setup, flags, security model, limits
+- `docs/host-relay.md` — the host relay for code-hub in a bridge-networked container (LAN shares on the host's LAN, apps mirrored on its loopback): setup, discovery, flags, security model, limits
 
 ## License
 
