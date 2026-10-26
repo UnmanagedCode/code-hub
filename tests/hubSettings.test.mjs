@@ -79,19 +79,18 @@ test('concurrent updates land in order', async (t) => {
   assert.deepEqual(reread(), { bridgeFallback: false });
 });
 
-// Invariant (test harness): a hub-settings read at any moment while mkRoot()
-// runs — what a late callback of the previous test does — can't leave the new
-// root reading the default: the root's file is complete before PROJECTS_ROOT
-// names it, and the cache is dropped once it does.
-test('mkRoot: reads racing it never cache the default for the new root', async (t) => {
+// Invariant (test harness): hub-settings reads racing mkRoot() — what a late
+// callback of the previous test does — never leave the new root on the
+// default: once mkRoot() returns, the new root reads the fallback off.
+test('mkRoot: a read racing it never leaves the new root on the default', async (t) => {
   let done = false;
-  const reads = [];
-  const poll = () => { if (done) return; reads.push(hubSettings.get()); setImmediate(poll); };
+  let polls = 0;
+  const poll = () => { if (done) return; hubSettings.get(); polls++; setImmediate(poll); };
   poll();
   const root = await mkRoot();
   done = true;
   t.after(() => rmRoot(root));
-  assert.ok(reads.length > 1, 'reads interleaved with mkRoot');
+  assert.ok(polls > 1, 'reads interleaved with mkRoot');
   assert.equal(process.env.PROJECTS_ROOT, root);
   assert.deepEqual(hubSettings.get(), { bridgeFallback: false });
 });

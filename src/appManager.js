@@ -726,9 +726,9 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
       return await op.done;
     } finally {
       if (sharing.get(id) === op) sharing.delete(id);
-      // A share that didn't commit — in any mode: a tunnel or tailscale
-      // re-share tears the LAN share down before it can fail — hands the
-      // address back to the forwarder.
+      // A share that didn't commit hands the address back to the forwarder —
+      // in any mode, since a tunnel or tailscale re-share may have already torn
+      // the previous LAN share down before failing.
       syncExposures();
     }
   }

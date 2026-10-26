@@ -18,7 +18,15 @@ async function guard(t) {
     t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias here, or /proc is unavailable`);
     return false;
   }
-  t.after(() => bridgeForward.reset());
+  // Every server created during the test — the forwarders included — is closed
+  // after it if still listening: a forwarder whose entry is already gone (a
+  // close that lost a race with its bind) is out of reset()'s reach, and would
+  // keep the runner alive past a failure.
+  const created = t.mock.method(net, 'createServer');
+  t.after(() => {
+    bridgeForward.reset();
+    for (const c of created.mock.calls) if (c.result?.listening) c.result.close();
+  });
   t.mock.method(console, 'error', () => {});
   return true;
 }
