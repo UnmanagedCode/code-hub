@@ -6,7 +6,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { startAuthProxy } from '../src/authproxy.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
-import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
+import { existsSync } from 'node:fs';
+import { ALT_LOOPBACK, altLoopbackBindable, listeningAddrs } from './helpers.mjs';
 
 // A tiny raw upstream: serves "ok" for normal requests, and on a WS-style
 // upgrade replies 101 then echoes bytes. Lets us prove the auth gate + the
@@ -454,7 +455,13 @@ test('a pinned port already held rejects with EADDRINUSE and leaves nothing list
     () => startAuthProxy(up.port, { host: ['127.0.0.1', ALT_LOOPBACK], port }),
     (e) => e.code === 'EADDRINUSE',
   );
-  // 127.0.0.1:port must be free again — nothing was leaked.
+  // Nothing was leaked: this process holds no listener on 127.0.0.1:port.
+  // Read from /proc where there is one — a bind probe would also fail when
+  // another process of the parallel suite has since taken the freed port.
+  if (existsSync(`/proc/${process.pid}/net/tcp`)) {
+    assert.ok(!(await listeningAddrs(process.pid)).has(`127.0.0.1:${port}`));
+    return;
+  }
   const probe = net.createServer();
   await new Promise((resolve, reject) => {
     probe.once('error', reject);

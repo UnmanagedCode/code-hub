@@ -597,10 +597,12 @@ test('init() during a share\'s post-commit persist kills that share\'s child', a
 // called with that record, it closes it.
 test('teardownShare with a replaced record leaves the current record\'s share live', async (t) => {
   await boot(t);
-  const old = await appManager.start('app');
+  await appManager.start('app');
+  const old = appManager._record('app');
   await appManager.awaitSettled('app');
   await appManager.stop('app');
-  const current = await appManager.start('app');
+  await appManager.start('app');
+  const current = appManager._record('app');
   await appManager.awaitSettled('app');
   const shared = await appManager.share('app', { mode: 'lan', tls: false });
   appManager._teardownShare('app', old);

@@ -3,7 +3,6 @@ import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
 import { createReadyMatcher } from './readyWhen.js';
-import { childEnv, UNSET_RELAY_ENV } from './childEnv.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
@@ -15,6 +14,13 @@ const SPAWN_SETTLE_MS = 400; // window to catch a fast EADDRINUSE crash before c
 // adopted after a restart have no entry here (we can't recapture their
 // stdout) and are treated as already-ready by the app manager.
 const children = new Map(); // id → { proc, pgid, status, error, output, total }
+
+// Called with the app id whenever a child this process spawned exits, for any
+// reason — a crash, the app stopping on its own, or a kill.
+const exitListeners = new Set();
+export function onExit(listener) {
+  exitListeners.add(listener);
+}
 
 export function runtime(id) {
   const c = children.get(id);
@@ -41,11 +47,9 @@ function settle(c, status, error = null) {
 // Spawn the manifest's blocking start command in its OWN process group
 // (detached ⇒ child is group leader ⇒ pgid === pid), with PORT injected.
 function spawnChild(app, port) {
-  // The relay variables are stripped from the env (childEnv) and unset again
-  // after the login shell's profiles ran (UNSET_RELAY_ENV).
-  const proc = spawn('bash', ['-lc', UNSET_RELAY_ENV + app.manifest.start], {
+  const proc = spawn('bash', ['-lc', app.manifest.start], {
     cwd: app.path,
-    env: childEnv({ PORT: String(port) }),
+    env: { ...process.env, PORT: String(port) },
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -60,6 +64,9 @@ function spawnChild(app, port) {
     // Exit before readiness = crash; after = the app stopped on its own.
     if (c.status === 'starting') settle(c, 'crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
     else if (c.status === 'ready') c.status = 'exited';
+    for (const listener of exitListeners) {
+      try { listener(app.id); } catch (e) { console.error(`[runner] exit listener failed: ${e.message}`); }
+    }
   });
   proc.on('error', (e) => settle(c, 'crashed', e.message));
 

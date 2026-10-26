@@ -18,6 +18,8 @@ export interface RelayInfo {
   port: number | null;
   requestedPort: number | null;
   portFallback: boolean;
+  /** While `down`: what code-hub is waiting on — reconnect attempts, a change of the relay's host.json, or the relay binding the port. */
+  recovery?: 'retrying' | 'relay-file' | 'binding' | null;
 }
 
 /** A live share: `app.tunnel` from the listing, or the one-time `POST …/share` response. */

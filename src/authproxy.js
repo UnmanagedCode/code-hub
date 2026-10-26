@@ -252,6 +252,12 @@ export async function startAuthProxy(targetPort, { username = 'hub', password = 
     // toggle. The caller (appManager) persists the new state and only
     // allows this for LAN shares (tunnel is always gated).
     setAuth(enabled) { currentAuth = !!enabled; },
+    // Swaps the certificate for new TLS connections — no restart, so the
+    // share URL/token/proxy port never change. A no-op for a plain-HTTP proxy.
+    setTls({ key, cert }) {
+      if (!tls) return;
+      for (const s of servers) s.setSecureContext({ key, cert });
+    },
     close() {
       for (const s of servers) s.close();
       for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }

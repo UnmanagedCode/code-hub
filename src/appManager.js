@@ -9,8 +9,10 @@ import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
 import * as tailscale from './tailscale.js';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, routeUrls, localIPv4s, runningInContainer, bridgeOnlyLan } from './net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, localIPv4s, runningInContainer, bridgeOnlyLan } from './net.js';
 import * as hostRelay from './hostRelay.js';
+import * as loopbackMirror from './loopbackMirror.js';
+import { appUrls } from './appUrls.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
 import { startAuthProxy } from './authproxy.js';
@@ -31,6 +33,9 @@ let store = { apps: {} };
 const proxies = new Map();
 // proxy → the running record it was committed for (see teardownShare).
 const proxyOwner = new WeakMap();
+// A LAN share's host-relay exposure, keyed by app id beside its proxy (and
+// owner-checked with it): closed whenever the proxy is.
+const relayHandles = new Map();
 
 // Ids whose live proxy holds the app's stored default password: added when
 // share() seeds from it; removed by a password edit or teardownShare. Drives
@@ -83,15 +88,16 @@ export async function init() {
   for (const [id, rec] of Object.entries(discarded.apps)) if (rec.tunnel) killShareChild(id, rec.tunnel);
   for (const proxy of proxies.values()) proxy.close();
   proxies.clear();
+  for (const handle of relayHandles.values()) handle.close();
+  relayHandles.clear();
   defaultPasswordShares.clear();
   qrCache.clear();
   store = await state.load();
   // reconcile drops records whose app pid is dead — which, for an app that
   // died in the same window code-hub did, would delete the only record of a
-  // still-running share child — and clears every LAN tunnel, which would drop
-  // the only record of its host-relay forward. It hands those back instead of
-  // stranding them (see state.reconcile) and they are released here, BEFORE
-  // the sweep below, because their records no longer hold them to be swept.
+  // still-running share child. It hands those back instead of stranding them
+  // (see state.reconcile) and they are killed here, BEFORE the sweep below,
+  // because their records no longer hold them to be swept.
   const { strandedShares } = await state.reconcile(store);
   for (const { id, tunnel: t } of strandedShares) killShareChild(id, t, { verify: true });
   // A persisted share from before a restart points at an auth proxy that no
@@ -154,13 +160,13 @@ export async function init() {
         id: HOST_CONDUCTOR_ID, project: HOST_CONDUCTOR_ID, path: appPath,
         isWorktree: false, branch: null,
         pid: null, pgid: null, port,
-        urls: enumerateUrls(port),
         startedSha: null, startedAt: null, tunnel: null,
       };
       mutated = true;
     }
   }
   if (mutated) await persist();
+  else syncMirrors();
 }
 
 // THE authority for "which app holds the node's Tailscale Funnel". Funnel
@@ -196,12 +202,10 @@ let funnelSlot = null;
 // one app and unsharing A then sharing B.
 let expiringFunnelPid = null;
 
-// SIGTERM the child publishing a share, dispatching on its kind — or, for a
-// LAN share, release its host-relay forward (a LAN share has no child). Split
-// out of teardownShare so init() can also kill a child whose record reconcile
-// already dropped — at that point there is no record left to tear down, only a
-// pid or a forward id. Releasing a forward never blocks: at boot it is a
-// fire-and-forget DELETE, with the relay's lease as the backstop.
+// SIGTERM the child publishing a share, dispatching on its kind (a LAN share
+// has none). Split out of teardownShare so init() can also kill a child whose
+// record reconcile already dropped — at that point there is no record left to
+// tear down, only a pid.
 //
 // `verify` guards the ONLY case where the pid did not come from a child we
 // spawned in this process: pids read back from state.json can have been
@@ -209,11 +213,7 @@ let expiringFunnelPid = null;
 // on an unresponsive one, SIGKILL) an unrelated process group on the user's
 // machine. See tailscale.looksLikeFunnel.
 function killShareChild(id, t, { verify = false } = {}) {
-  if (!t) return;
-  if (t.kind === 'lan') {
-    if (t.relay?.forwardId) hostRelay.release(t.relay.forwardId);
-    return;
-  }
+  if (!t || t.kind === 'lan') return;
   if (t.kind === 'tailscale') {
     if (verify && !tailscale.looksLikeFunnel(t.pid)) {
       console.error(`[appManager] ${id}: persisted funnel pid ${t.pid} is not a tailscale funnel (recycled?) — not signalling it`);
@@ -227,8 +227,8 @@ function killShareChild(id, t, { verify = false } = {}) {
   }
 }
 
-// Tear down a share: close the auth proxy (if any) and kill the child that
-// publishes it. Leaves rec.tunnel null. Safe to call when nothing is shared.
+// Tear down a share: close the auth proxy (if any) and its host-relay exposure,
+// and kill the child that publishes it. Leaves rec.tunnel null. Safe to call when nothing is shared.
 // A tailscale funnel runs in the foreground, so SIGTERM is the whole teardown
 // — the CLI removes its own funnel config on exit (see src/tailscale.js).
 //
@@ -251,6 +251,8 @@ function teardownShare(id, rec, opts) {
   const proxy = proxies.get(id);
   if (!proxy || !rec || proxyOwner.get(proxy) === rec) {
     if (proxy) { proxy.close(); proxies.delete(id); }
+    relayHandles.get(id)?.close();
+    relayHandles.delete(id);
     defaultPasswordShares.delete(id);
     qrCache.delete(id);
   }
@@ -285,8 +287,39 @@ function funnelBlockedBy(id) {
   return funnelSlot.id === id ? null : funnelSlot.id;
 }
 
+// The loopback mirror set is derived from the store each mutation persists:
+// every ready app but the always-on host conductor (code-hub never started
+// it). Also run when a start's readiness settles (see start()), when a child
+// exits (see runner.onExit below), so a crash drops its mirror without waiting
+// for a persist, and when a host client finds a mirrored port refusing. An
+// ADOPTED app (no child of ours to exit) that dies is noticed by either that
+// refusal or a listing (list() prunes its record, and the persist re-syncs).
 async function persist() {
+  syncMirrors();
   await state.save(store);
+}
+
+// Mirrored only once ready, never while starting: where the host's loopback is
+// the app's own (a host-network container), a relay listener bound first would
+// take the app's port before the app could.
+function appMirrorable(rec) {
+  const rt = runner.runtime(rec.id);
+  if (rt) return rt.status === 'ready';
+  return state.pidAlive(rec.pid); // adopted after a restart: no runtime, already listening
+}
+
+function syncMirrors() {
+  loopbackMirror.sync(Object.values(store.apps)
+    .filter((rec) => !isHostConductorId(rec.id) && appMirrorable(rec))
+    .map((rec) => ({ id: rec.id, port: rec.port })), syncMirrors);
+}
+
+runner.onExit(() => syncMirrors());
+
+// The URLs of a running app's route: through the host loopback mirror first
+// while there is one (see appUrls).
+function urlsFor(id, port, routePath = '/') {
+  return appUrls({ port, routePath, lanIps: localIPv4s(), hostLoopbackPort: loopbackMirror.hostPort(id) });
 }
 
 // Append the share token as a query param so opening/scanning the link
@@ -296,14 +329,6 @@ async function persist() {
 function withToken(url, token) {
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}__hubauth=${encodeURIComponent(token)}`;
-}
-
-// A LAN share's relay state as the API shows it: everything but the forward
-// id, which only code-hub itself needs (to release the forward).
-function publicRelay(relay) {
-  if (!relay) return null;
-  const { forwardId: _omit, ...rest } = relay;
-  return rest;
 }
 
 // In-memory QR cache keyed by app id. The QR's only inputs are
@@ -349,7 +374,7 @@ export async function list() {
     let port, urls, startedSha, tunnelInfo = null;
 
     if (rec) {
-      port = rec.port; urls = rec.urls; startedSha = rec.startedSha;
+      port = rec.port; urls = urlsFor(base.id, rec.port); startedSha = rec.startedSha;
       // username/password come from the live proxy (proxies map), never
       // from rec.tunnel — that's how the password persists across a page
       // reload (in-memory, for the share's lifetime) without ever touching
@@ -382,7 +407,7 @@ export async function list() {
           proxyPort: rec.tunnel.proxyPort ?? null,
           fixedPortFallback: rec.tunnel.fixedPortFallback === true,
           fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
-          relay: publicRelay(rec.tunnel.relay),
+          relay: rec.tunnel.relay ?? null,
           containerInternal: rec.tunnel.containerInternal === true,
           auth, tls: rec.tunnel.tls === true,
           // `password` is the real value (the UI's Copy needs it); this flag
@@ -421,12 +446,12 @@ export async function list() {
     const branch = base.isWorktree ? (sourceMissing ? (rec?.branch ?? null) : await currentBranch(base.path)) : null;
     const commitAt = sourceMissing ? null : await lastCommitAt(base.path);
 
-    // Named routes from the manifest, else a single implicit route at `/`
-    // (backward compatible). URLs are enumerated live from the running port.
+    // Named routes from the manifest, else a single implicit route at `/`.
+    // URLs are derived live from the running port and the loopback mirror.
     const routeDefs = base.manifest?.routes ?? [{ name: base.manifest?.name ?? base.id, path: '/' }];
     const routes = routeDefs.map((r) => ({
       name: r.name, path: r.path,
-      urls: port ? routeUrls(port, r.path) : [],
+      urls: port ? urlsFor(base.id, port, r.path) : [],
     }));
 
     return {
@@ -525,7 +550,6 @@ export async function start(id) {
     id, project: app.project, path: app.path,
     isWorktree: app.isWorktree, branch: app.isWorktree ? await currentBranch(app.path) : null,
     pid: proc.pid, pgid: proc.pgid, port, fixedPort,
-    urls: enumerateUrls(port),
     startedSha: await headSha(app.path),
     startedAt: proc.startedAt,
     tunnel: null,
@@ -535,8 +559,9 @@ export async function start(id) {
   // visible, so no listing can show it `starting` with nothing to wait on.
   store.apps[id] = rec;
   trackTransition(id, rec, { settled: proc.settled, wantsAutoShare, readConfig });
+  proc.settled.then(() => syncMirrors());
   await persist();
-  return rec;
+  return { ...rec, urls: urlsFor(id, port) };
 }
 
 // The stored auto-share config of `id` as autoRun reads it: applies to a main
@@ -702,36 +727,27 @@ async function shareRecord(id, op, { mode, auth, tls }) {
     const useTls = tls; // validateShareOptions defaults it to on; the UI/API `tls` flag overrides
     const scheme = useTls ? 'https' : 'http';
     const lanIps = localIPv4s({ lanFallback: true }); // one list for the cert SAN and the bind hosts
-    const bridgeOnly = bridgeOnlyLan(lanIps, runningInContainer());
-    // With a host relay configured (code-hub in a bridge-networked container),
-    // the share is also exposed on the host's LAN address through a relay
-    // forward. Any relay failure is reported on the share and never fails it:
-    // the share goes on as an ordinary LAN share.
-    let forward = null;
-    let relayFailure = null;
+    // In a container, the share is also exposed on the host's LAN address
+    // through the host relay (see hostRelay.js), whenever a relay session is
+    // up — now or later. A relay problem is reported on the share and never
+    // fails it: the share goes on as an ordinary LAN share.
+    const relayed = runningInContainer();
+    const bridgeOnly = bridgeOnlyLan(lanIps, relayed);
+    let handle = null;
     let onRelayChange = () => {}; // set once the share commits
-    if (hostRelay.relayConfig()) {
-      try {
-        forward = await hostRelay.openForward({ port: rec.fixedPort ?? undefined, onChange: (c) => onRelayChange(c) });
-      } catch (e) {
-        relayFailure = { state: 'failed', error: e.message, forwardId: null, port: null, requestedPort: rec.fixedPort ?? null, portFallback: false };
-        console.error(`[appManager] ${id}: host relay unavailable — ${e.message}; sharing on the container's addresses only`);
-      }
-    }
     let proxy = null;
     let fixedPortFallback = false;
     let fixedPortHolder = null;
     try {
       // Self-signed cert covering the LAN IPs, the relay's advertised host IPs
       // and loopback, generated per share and held in memory only (via the
-      // proxy) — nothing on disk. Browsers show a one-time "not private"
-      // warning (self-signed); documented as a limitation.
+      // proxy) — nothing on disk; regenerated when the relay advertises an
+      // address it lacks. Browsers show a one-time "not private" warning
+      // (self-signed); documented as a limitation.
       let tlsOpt = null;
-      if (useTls) {
-        const ipAddresses = [...new Set([...lanIps, ...(forward?.addresses ?? []), '127.0.0.1'])];
-        const { key, cert } = generateSelfSigned({ ipAddresses, dnsNames: ['localhost'] });
-        tlsOpt = { key, cert };
-      }
+      const sanIps = new Set([...lanIps, ...hostRelay.addresses(), '127.0.0.1']);
+      const makeCert = () => generateSelfSigned({ ipAddresses: [...sanIps], dnsNames: ['localhost'] });
+      if (useTls) tlsOpt = makeCert();
       // Same-port LAN share: measured on Linux, a proxy CAN bind
       // <lanIp>:<fixedPort> while the app holds 127.0.0.1:<fixedPort>, but NOT
       // while the app holds the wildcard (SO_REUSEADDR doesn't permit
@@ -779,6 +795,11 @@ async function shareRecord(id, op, { mode, auth, tls }) {
         }
       }
       if (!proxy) proxy = await startAuthProxy(rec.port, { ...credOpts(creds), host: '0.0.0.0', auth, tls: tlsOpt });
+      if (relayed) {
+        const target = { host: proxy.hosts[0] === '0.0.0.0' ? '127.0.0.1' : proxy.hosts[0], port: proxy.port };
+        handle = hostRelay.expose(proxy.port, hostRelay.SCOPES.lan, target, () => onRelayChange());
+        await handle.ready;
+      }
       if (!committable()) throw abandoned(id, op);
       // Drop the loopback entry — it's not reachable from another device, and in
       // the fixed-port case that's load-bearing rather than cosmetic: the proxy
@@ -787,44 +808,45 @@ async function shareRecord(id, op, { mode, auth, tls }) {
       const loopbackPrefix = `${scheme}://localhost:`;
       const containerUrls = enumerateUrls(proxy.port, { lanFallback: true, scheme }).filter((u) => !u.startsWith(loopbackPrefix));
       // Where the share is reachable right now: the host's addresses while the
-      // relay forward is up, else the container's own (today's LAN share).
+      // relay has its port bound, else the container's own.
       const reach = () => {
-        const relay = forward
-          ? { state: forward.state, error: forward.error, forwardId: forward.id, port: forward.port, requestedPort: forward.requestedPort, portFallback: forward.portFallback }
-          : relayFailure;
-        const urls = relay?.state === 'up' ? forward.addresses.map((ip) => `${scheme}://${ip}:${forward.port}`) : containerUrls;
+        const relay = handle?.info() ?? null;
+        const urls = relay?.state === 'up' ? hostRelay.addresses().map((ip) => `${scheme}://${ip}:${relay.port}`) : containerUrls;
         const url = urls[0] ?? `${scheme}://localhost:${proxy.port}`; // no LAN interface found
         return { url, urls, relay, containerInternal: relay?.state !== 'up' && bridgeOnly };
       };
       const tunnelRec = { kind: 'lan', ...reach(), pid: null, proxyPort: proxy.port, auth, tls: useTls, fixedPortFallback, fixedPortHolder };
-      forward?.attach({ host: proxy.hosts[0] === '0.0.0.0' ? '127.0.0.1' : proxy.hosts[0], port: proxy.port });
       // The commit: plain assignments only, so nothing can throw past this point
       // and leave a committed share behind the catch below.
       proxies.set(id, proxy);
       proxyOwner.set(proxy, rec);
+      if (handle) relayHandles.set(id, handle);
       markDefault();
       rec.tunnel = tunnelRec;
-      if (forward) {
-        // A relay state change (down, re-created) re-points the share's URLs —
-        // only while this record still holds this forward. The QR follows the
-        // URL through cachedQrSvg's key.
-        onRelayChange = ({ prevId }) => {
-          if (store.apps[id] !== rec || rec.tunnel?.relay?.forwardId !== prevId) return;
-          Object.assign(rec.tunnel, reach());
-          persist().catch((e) => console.error(`[appManager] ${id}: persisting a relay change failed — ${e.message}`));
-        };
-      }
+      // A relay change (session up or lost, port bound, addresses changed)
+      // re-points the share's URLs — only while this record still holds this
+      // share. The QR follows the URL through cachedQrSvg's key; a new
+      // advertised address joins the certificate's SAN.
+      onRelayChange = () => {
+        if (store.apps[id] !== rec || rec.tunnel !== tunnelRec) return;
+        const missing = hostRelay.addresses().filter((ip) => !sanIps.has(ip));
+        if (useTls && missing.length) {
+          for (const ip of missing) sanIps.add(ip);
+          proxy.setTls(makeCert());
+        }
+        Object.assign(rec.tunnel, reach());
+        persist().catch((e) => console.error(`[appManager] ${id}: persisting a relay change failed — ${e.message}`));
+      };
     } catch (e) {
       // Any throw before the commit — the abandon path included — closes what
-      // this share started: its proxy, and a forward that would otherwise keep
-      // renewing with nothing able to release it.
+      // this share started: its proxy and its host-relay exposure.
       proxy?.close();
-      forward?.close();
+      handle?.close();
       throw e;
     }
     await persist();
     const { url, urls, relay, containerInternal } = rec.tunnel;
-    const common = { kind: 'lan', url, urls, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, relay: publicRelay(relay), containerInternal };
+    const common = { kind: 'lan', url, urls, tls: useTls, proxyPort: proxy.port, fixedPortFallback, fixedPortHolder, relay, containerInternal };
     if (!auth) {
       // Nothing to authenticate — but a QR of the plain URL is still a
       // handy scan-to-open shortcut.
@@ -1063,8 +1085,10 @@ export async function clearAppSettings(id) {
   return { id, ...appSettings.describe(undefined) };
 }
 
-// Test seam: teardownShare itself, for its record-scoping.
+// Test seams: teardownShare itself, for its record-scoping, and the stored
+// record it scopes to (start() answers with a view of it, not the record).
 export { teardownShare as _teardownShare };
+export function _record(id) { return store.apps[id]; }
 
 // Long-poll for a client: resolves when `id`'s start transition (readiness,
 // plus its auto-share) has finished, or at autoRun's cap.

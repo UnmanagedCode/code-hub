@@ -1,5 +1,4 @@
 import { spawn, execFile } from 'node:child_process';
-import { childEnv } from './childEnv.js';
 
 // Binary is overridable so tests can inject a fake that prints a canned URL.
 function bin() {
@@ -17,7 +16,7 @@ export const PROBE_TIMEOUT_MS = 5000;
 // overruns is killed and counts as not runnable). Not cached — cheap enough.
 export function available({ timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    execFile(bin(), ['--version'], { timeout: timeoutMs, killSignal: 'SIGKILL', env: childEnv() }, (err) => resolve(!err));
+    execFile(bin(), ['--version'], { timeout: timeoutMs, killSignal: 'SIGKILL' }, (err) => resolve(!err));
   });
 }
 
@@ -31,7 +30,6 @@ export function startTunnel(port) {
     try {
       proc = spawn(bin(), ['tunnel', '--url', `http://localhost:${port}`], {
         detached: true,
-        env: childEnv(),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (e) {
