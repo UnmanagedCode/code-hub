@@ -1484,8 +1484,11 @@ test('fixed-port LAN share: a THIRD-PARTY listener on the LAN port must not be b
   const { server, base } = await boot(root);
   t.after(async () => { await appManager.stop('app').catch(() => {}); server.close(); await rmRoot(root); });
 
-  await j(base, 'POST', '/api/apps/app/start');
-  await waitFor(async () => ['ready', 'running'].includes((await appStatus(base)).status));
+  const started = await j(base, 'POST', '/api/apps/app/start');
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  let last = null;
+  await waitFor(async () => ['ready', 'running'].includes((last = await appStatus(base)).status))
+    .catch((e) => { throw new Error(`${e.message}: app status ${last?.status}, error ${JSON.stringify(last?.error ?? null)}`); });
 
   // An unrelated process grabs the fixed port on a LAN address AFTER the app
   // started (start()'s 0.0.0.0 probe proved it free machine-wide before that,

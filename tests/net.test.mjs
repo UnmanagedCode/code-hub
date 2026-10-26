@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import os from 'node:os';
 import cp from 'node:child_process';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, waitForPort, parseLanIPv4s, localIPv4s, bridgeOnlyLan } from '../src/net.js';
+import {
+  allocatePort, isPortFree, probeWildcardHold, enumerateUrls, waitForPort, parseLanIPv4s, localIPv4s, bridgeOnlyLan,
+  bridgeIPv4, _setContainerProbe, _setLocalIPv4sProbe,
+} from '../src/net.js';
 import { ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
 
 test('allocatePort returns a bindable, currently-unused port', async () => {
@@ -287,4 +290,26 @@ test('bridgeOnlyLan truth table', () => {
     [[], true, false],
   ];
   for (const [ips, inContainer, want] of cases) assert.equal(bridgeOnlyLan(ips, inContainer), want, `${ips} in container: ${inContainer}`);
+});
+
+// Invariant (bridge fallback): bridgeIPv4() is exactly the existing container +
+// bridge-only check over the local addresses — the first address when it holds,
+// null otherwise — with no further detection of its own.
+test('bridgeIPv4: the first local address only in a container whose addresses are all bridge-pool', (t) => {
+  let ips = [];
+  _setLocalIPv4sProbe(() => ips);
+  t.after(() => { _setLocalIPv4sProbe(null); _setContainerProbe(null); });
+  _setContainerProbe(() => false);
+  ips = ['172.17.0.2'];
+  assert.equal(bridgeIPv4(), null, 'not in a container');
+  _setContainerProbe(() => true);
+  assert.equal(bridgeIPv4(), '172.17.0.2');
+  ips = ['172.17.0.2', '172.18.0.3'];
+  assert.equal(bridgeIPv4(), '172.17.0.2', 'the first of several bridge addresses');
+  ips = ['192.168.1.5'];
+  assert.equal(bridgeIPv4(), null, 'a non-bridge address');
+  ips = ['172.17.0.2', '192.168.1.5'];
+  assert.equal(bridgeIPv4(), null, 'mixed');
+  ips = [];
+  assert.equal(bridgeIPv4(), null, 'no address');
 });

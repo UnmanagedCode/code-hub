@@ -6,6 +6,8 @@
 // URLs means something.
 //
 // FAKE_CLOUDFLARED_MODE=hang: `--version` never answers (a wedged binary).
+// FAKE_CLOUDFLARED_MODE=fail: `tunnel` exits 1 before any URL (a tunnel that
+//   can't come up), while `--version` still passes.
 // FAKE_CLOUDFLARED_PID_LOG: append this tunnel child's pid (one per line) as it
 //   starts, so a test can count the children a share started and check each
 //   one is alive or dead.
@@ -24,6 +26,10 @@ if (args[0] === '--version') {
   }
 } else if (args[0] === 'tunnel') {
   process.on('SIGTERM', () => process.exit(0));
+  if (process.env.FAKE_CLOUDFLARED_MODE === 'fail') {
+    process.stderr.write('failed to request quick Tunnel\n');
+    process.exit(1);
+  }
   if (process.env.FAKE_CLOUDFLARED_PID_LOG) appendFileSync(process.env.FAKE_CLOUDFLARED_PID_LOG, `${process.pid}\n`);
   const gate = process.env.FAKE_CLOUDFLARED_GATE;
   while (gate && !existsSync(gate)) await new Promise((r) => setTimeout(r, 20));

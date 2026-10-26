@@ -5,6 +5,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api } from '@/lib/api';
 import { applyCredSave, planCredSave, stepRequest, type SaveStep } from '@/lib/shareSave';
 import { credDraftFor, pruneDrafts } from '@/lib/shareState';
+import type { HubSettingsPatch } from '@/lib/hubSettingsForm';
 import type { SettingsPatch } from '@/lib/settingsForm';
 import { useApps, type AppsFeed } from '@/lib/useApps';
 import type { CredDraft, ShareKind, ShareState, Tunnel } from '@/lib/types';
@@ -31,6 +32,8 @@ export interface Hub extends AppsFeed {
   saveEdit: (id: string, shared: Tunnel, kind: ShareKind) => Promise<void>;
   /** PUTs the app's settings, then reloads the listing. Throws to its caller, which shows the error in place. */
   saveSettings: (id: string, body: SettingsPatch) => Promise<void>;
+  /** PUTs the hub-wide settings, then reloads the listing. Throws to its caller, like `saveSettings`. */
+  saveHubSettings: (body: HubSettingsPatch) => Promise<void>;
   dismissError: (id: string) => void;
   toggleExpanded: (project: string) => void;
 }
@@ -149,6 +152,10 @@ export function HubProvider({ children }: { children: ReactNode }) {
     }),
     saveSettings: async (id: string, body: SettingsPatch) => {
       await api(appPath(id, 'settings'), json('PUT', body));
+      await refresh();
+    },
+    saveHubSettings: async (body: HubSettingsPatch) => {
+      await api('api/hub-settings', json('PUT', body));
       await refresh();
     },
     dismissError: (id: string) => setActionError((m) => omit(m, id)),

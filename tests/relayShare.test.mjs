@@ -10,7 +10,7 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
-import { _setContainerProbe } from '../src/net.js';
+import { _setContainerProbe, _setBridgeProbe } from '../src/net.js';
 import { storeRoot } from '../src/projects.js';
 import {
   requirePython, startRelay, canConnect, waitFor, relaySecret, RELAY_PROTOCOL as P,
@@ -29,6 +29,7 @@ async function boot(t, { ids = ['app'], interfaces } = {}) {
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   if (interfaces) t.mock.method(os, 'networkInterfaces', () => interfaces);
   _setContainerProbe(() => true);
+  _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');
   relayStore._setHostPollMs(50);
   const root = await mkRoot();
@@ -41,6 +42,7 @@ async function boot(t, { ids = ['app'], interfaces } = {}) {
     for (const id of ids) await appManager.stop(id).catch(() => {});
     hostRelay.stop();
     _setContainerProbe(null);
+    _setBridgeProbe(null);
     hostRelay._setLoopbackDialHost(null);
     server.close();
     await rmRoot(root);
@@ -174,6 +176,7 @@ async function bootAt(t, root) {
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   process.env.PROJECTS_ROOT = root;
   _setContainerProbe(() => true);
+  _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');
   relayStore._setHostPollMs(50);
   await mkProject(root, 'app', { start: fakeAppCmd() });
@@ -185,6 +188,7 @@ async function bootAt(t, root) {
     await appManager.stop('app').catch(() => {});
     hostRelay.stop();
     _setContainerProbe(null);
+    _setBridgeProbe(null);
     hostRelay._setLoopbackDialHost(null);
     server.close();
     await rmRoot(root);

@@ -164,6 +164,22 @@ function fallbackLanIPv4s() {
   return ips;
 }
 
+function interfaceIPv4s() {
+  const ips = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list ?? []) {
+      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
+    }
+  }
+  return ips;
+}
+let interfaceIPv4sProbe = interfaceIPv4s;
+
+// Test seam: replace the os.networkInterfaces()-derived list localIPv4s()
+// starts from (`null` restores the real one), so app URLs, share binds and the
+// cert SAN all see the same addresses.
+export function _setLocalIPv4sProbe(fn) { interfaceIPv4sProbe = fn ?? interfaceIPv4s; }
+
 // Non-internal IPv4 addresses the machine exposes (LAN access from a phone).
 // The `ip`/`ifconfig` shell-out fallback only runs when `lanFallback` is true —
 // it's for the LAN-share path (appManager.js), which needs a real LAN IP to
@@ -172,13 +188,7 @@ function fallbackLanIPv4s() {
 // Single source of truth for local IPs — used by both URL enumeration and the
 // self-signed cert's subjectAltName.
 export function localIPv4s({ lanFallback = false } = {}) {
-  const ips = new Set();
-  const ifaces = os.networkInterfaces();
-  for (const list of Object.values(ifaces)) {
-    for (const ni of list ?? []) {
-      if (ni.family === 'IPv4' && !ni.internal) ips.add(ni.address);
-    }
-  }
+  const ips = new Set(interfaceIPv4sProbe());
   if (ips.size === 0 && lanFallback) {
     for (const ip of fallbackLanIPv4s()) ips.add(ip);
   }
@@ -207,6 +217,20 @@ export function bridgeOnlyLan(ips, inContainer) {
     return a === 172 && b >= 16 && b <= 31;
   });
 }
+
+// The container bridge address the no-relay fallback forwards apps on
+// (bridgeForward.js): the first local IPv4, when code-hub runs in a container
+// and its addresses look bridge-only (the bridgeOnlyLan heuristic) — else null.
+const realBridgeProbe = (ips) => bridgeOnlyLan(ips, runningInContainer());
+let bridgeProbe = realBridgeProbe;
+export function bridgeIPv4() {
+  const ips = localIPv4s();
+  return bridgeProbe(ips) ? (ips[0] ?? null) : null;
+}
+
+// Test seam: replace the bridge-only decision bridgeIPv4() makes over the
+// local addresses (`null` restores the real one).
+export function _setBridgeProbe(fn) { bridgeProbe = fn ?? realBridgeProbe; }
 
 // Every URL that serves an app bound to `port`: the `localhost` loopback name
 // plus each non-internal IPv4 (see localIPv4s). Only one loopback URL is

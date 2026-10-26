@@ -1,5 +1,6 @@
 import { useId } from 'react';
 import { RefreshCwIcon } from 'lucide-react';
+import { HubSettingsDialog } from '@/components/HubSettingsDialog';
 import { Button } from '@/components/ui/button';
 import { NativeSelect } from '@/components/ui/native-select';
 import { useHub } from '@/hub';
@@ -19,9 +20,12 @@ export function Toolbar({ sort, onSort }: { sort: SortKey; onSort: (s: SortKey) 
           {SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
         </NativeSelect>
       </div>
-      <Button variant="ghost" size="icon" aria-label="Refresh" onClick={() => void hub.refresh()}>
-        <RefreshCwIcon className={cn(hub.fetching && 'animate-spin motion-reduce:animate-none')} aria-hidden />
-      </Button>
+      <div className="flex items-center gap-1">
+        <HubSettingsDialog />
+        <Button variant="ghost" size="icon" aria-label="Refresh" onClick={() => void hub.refresh()}>
+          <RefreshCwIcon className={cn(hub.fetching && 'animate-spin motion-reduce:animate-none')} aria-hidden />
+        </Button>
+      </div>
     </div>
   );
 }

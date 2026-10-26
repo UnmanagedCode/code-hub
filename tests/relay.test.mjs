@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
-import { _setContainerProbe } from '../src/net.js';
+import { _setContainerProbe, _setBridgeProbe } from '../src/net.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
 import {
   REPO_ROOT, RELAY_PROTOCOL as PROTOCOL, requirePython, startRelay, runRelay, patchedRelayDir, canConnect, waitFor,
@@ -374,9 +374,10 @@ test('V11: a second control session replaces the first', async (t) => {
 // Code-hub's own relay client in this process, against relay files under `root`.
 function hubInProcess(t) {
   _setContainerProbe(() => true);
+  _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');
   relayStore._setHostPollMs(50);
-  t.after(() => { hostRelay.stop(); _setContainerProbe(null); hostRelay._setLoopbackDialHost(null); });
+  t.after(() => { hostRelay.stop(); _setContainerProbe(null); _setBridgeProbe(null); hostRelay._setLoopbackDialHost(null); });
 }
 
 // Invariant (S5): bytes pass through untouched — TLS ends at the origin (its
@@ -516,7 +517,7 @@ test('V16: a relay started before the secret exists waits for it, and picks up a
   if (!requirePython(t)) return;
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await fs.mkdir(path.join(root, '.code-hub'));
+  await fs.mkdir(path.join(root, '.code-hub'), { recursive: true });
   const relay = await relayFor(t, { projectsRoot: root });
   await waitFor(() => /waiting for code-hub to create .*relay\.json/.test(relay.output().stderr));
   const early = await relayLogin(relay.port, 'z'.repeat(43));

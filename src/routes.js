@@ -27,6 +27,7 @@ export function buildRoutes() {
   r.delete('/apps/:id/settings', wrap((req) => appManager.clearAppSettings(req.params.id)));
   r.get('/apps/:id/settled', wrap((req) => appManager.awaitSettled(req.params.id)));
   r.delete('/apps/:id/share', wrap((req) => appManager.unshare(req.params.id)));
+  r.put('/hub-settings', wrap((req) => appManager.setHubSettings(req.body)));
 
   // MCP tool-call bridge for code-conductor: unlike wrap()'s statusCode
   // convention, tool-level outcomes (unknown tool, bad args, already-running)

@@ -30,6 +30,7 @@ export const app = (over: Partial<App> = {}): App => ({
 export const listing = (apps: App[], over: Partial<AppsResponse> = {}): AppsResponse => ({
   cloudflaredAvailable: true,
   tailscaleAvailable: false,
+  hubSettings: { bridgeFallback: true },
   apps,
   ...over,
 });

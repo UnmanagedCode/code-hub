@@ -53,6 +53,21 @@ Per-app settings (`src/appSettings.js`): the default login a **new** share of th
 - **Not auto-deleted** when an app is unregistered or removed; `DELETE …/settings` clears a stale entry.
 - **Migration from `share-defaults.json`** (`migrateLegacyFile()`, first thing in `appManager.init()`): `share-defaults.json` present and `app-settings.json` absent → renamed to `app-settings.json` (contents unchanged — its `username`/`password` entries are valid entries here, with both toggles off) and chmodded `0600`. Both present → neither is touched, `app-settings.json` is used, and a `console.warn` names both paths. Otherwise nothing happens. Idempotent.
 
+## Hub settings: `hub-settings.json` (`<projectsRoot>/.code-hub/hub-settings.json`)
+
+Hub-wide settings (`src/hubSettings.js`, filename `HUB_SETTINGS_FILENAME`). Managed via `PUT /api/hub-settings` (below), which the UI's toolbar **Hub settings** dialog uses; the current values ride on every `GET /api/apps` as `hubSettings`.
+
+- **Shape:** `{ "bridgeFallback": boolean }`.
+
+  | Field | Default (file or key absent) | Meaning |
+  |---|---|---|
+  | `bridgeFallback` | `true` | open each ready app at the container's bridge address through an in-process forwarder (see "`urls`" under the `App` shape) |
+
+- **Invalid file:** unreadable, invalid JSON, not a JSON object, or a non-boolean `bridgeFallback` → a `console.warn` naming the path (never quoting the parse error) and the defaults. The file is left as it is.
+- **Read once per path** and cached: a **hand edit takes effect on the next code-hub start**. `PUT /api/hub-settings` updates the cache and applies at once.
+- **Writes:** serialised in-process; tmp file → rename, mode `0644` (nothing secret).
+- No migration: an absent file means the defaults.
+
 ## In-memory registration (process-lifetime only, never persisted)
 
 Same schema/validation as `registrations.json`, but held in a module-level `Map` (`registerInMemory`/`unregisterInMemory` in `src/projects.js`) instead of on disk — it is never read from or written to `registrations.json`. Precedence for a dir with no `.hub.json`: in-memory wins over a disk registry entry for the same id; a real `.hub.json` still wins over either. Apps sourced this way carry `source: "memory"`. Not exposed via `register_app`/`unregister_app` — those tools remain disk-only. Currently used for exactly one purpose: `appManager.init()` registers the host `code-conductor` checkout this way when code-hub runs embedded (see `docs/architecture.md`), since the conductor carries no `.hub.json` of its own.
@@ -93,7 +108,7 @@ Surfaces the projects code-conductor knows about that code-hub's own filesystem 
 | Method + path | Body | Response |
 |---|---|---|
 | `GET /api/health` | — | `{ ok: true }` — cheap liveness probe, independent of `appManager` |
-| `GET /api/apps` | — | `{ cloudflaredAvailable, tailscaleAvailable, apps: [App] }` |
+| `GET /api/apps` | — | `{ cloudflaredAvailable, tailscaleAvailable, hubSettings: { bridgeFallback }, apps: [App] }` (`hubSettings`: see "Hub settings" above) |
 | `POST /api/apps/:id/start` | — | running record (`409` already running, or the app has a fixed port (its Settings `port`, else its manifest's) that is already in use — it never falls back to a free one) |
 | `POST /api/apps/:id/stop` | — | `{ id, status: "stopped" }` |
 | `POST /api/apps/:id/restart` | — | running record |
@@ -105,6 +120,7 @@ Surfaces the projects code-conductor knows about that code-hub's own filesystem 
 | `PUT /api/apps/:id/settings` | `{ username?, password?, autoStart?, autoShare?, port? }`, at least one — per field: absent = keep. `username`/`password`: `null` = clear, non-empty string = set (trimmed). `autoStart`: boolean (`false` clears). `autoShare`: `null` = clear, else `{ mode, auth?, tls? }`. `port`: `null` = clear, else an integer `1024`–`65535` | the `GET` shape after the update (`400` body not an object, none of the five keys, an empty/whitespace/non-string login field, a non-boolean `autoStart`, a `port` that is not `null` or an integer in range, an `autoShare` that isn't an object or `null` or that `POST …/share` would refuse (same message), or a toggle or port enabled for a worktree, or `autoStart: true` or a port for the host code-conductor — nothing is written; `404` unknown app). Clearing every field deletes the entry |
 | `DELETE /api/apps/:id/settings` | — | `{ id, username: null, hasPassword: false, autoStart: false, autoShare: null, port: null }` — idempotent, and **never `404`s**, so an entry for a removed app can still be cleared |
 | `GET /api/apps/:id/settled` | — | `{ id, settled: boolean }`, a **long-poll**: answers once the app's latest start transition is over — readiness settled (`ready` or `crashed`), plus the auto-share that follows it when ticked; for the always-on host code-conductor, its boot auto-share; a start tracked while waiting (a restart) is waited for too — `settled: true`; or at the server cap (`SETTLE_WAIT_MS` in `src/autoRun.js`) with `settled: false`. With nothing in flight (stopped, adopted, settled) it answers at once with `settled: true`. Never `404`s. The UI opens at most one per transition and reloads the listing once when it answers |
+| `PUT /api/hub-settings` | `{ bridgeFallback: boolean }` — exactly that key | `{ bridgeFallback }` after the update, applied to every app's forwarder at once (`400` body not an object, any other key, or a non-boolean `bridgeFallback` — nothing is written) |
 
 `id` is the app id: a main checkout's directory basename, or `<project>:<key>` for a worktree (composed by `worktreeId()` in `src/projects.js`, the only place it is built). Worktree keys are scoped per project by code-conductor, so the `<project>:` qualifier is what keeps two projects' same-named worktrees distinct. **`:` is reserved**, which is what makes the id injective. Any directory name feeding an id is refused if it contains one: a root directory (else `a:b` and worktree `a/b` claim the same id) and a worktree's `<project>` or `<key>` (else `.worktrees/a/b:c` and `.worktrees/a:b/c` both claim `a:b:c`). code-hub **enforces this over its own id namespace** rather than assuming code-conductor keeps `:` out of a project name or key: such a directory is not served, and the refusal is logged (`console.warn`, naming the directory) whenever it cost something servable and silent when it cost nothing. `register_app` likewise rejects a `:`-bearing id that matches no worktree, naming the reservation rather than claiming the directory doesn't exist. The id is **opaque** — never split back apart — and always a single path segment: `:` is a legal `pchar`, so `/api/apps/:id/*` matches it either encoded or raw. The UI sends it `encodeURIComponent`'d (`:` → `%3A`), which is the right practice for an opaque id and what the tests exercise.
 
@@ -178,7 +194,27 @@ The TLS cert's SAN covers the relay's advertised addresses; one advertised after
 }
 ```
 
-`urls` (top level) is the list of base URLs, primary first: `http://localhost:<port>` — or, while code-hub runs in a container and the app is **mirrored on the Docker host's loopback** by the host relay, `http://127.0.0.1:<host port>` in its place (the host port may differ from `port` when that was busy on the host) — then `http://<lan ip>:<port>` per LAN IP. Each `routes[].urls` is those bases with the route `path` appended (`/` keeps the clean base form). Both are derived live on every listing (never persisted) and populated only while the app is running. An app is mirrored once it is `ready` (or adopted and alive), never while `starting`; the always-on host conductor never is.
+`urls` (top level) is the list of base URLs, primary first, then `http://<lan ip>:<port>` per LAN IP. The primary is decided in one place (`appUrls()` in `src/appUrls.js`, shared by HTTP and MCP), first match wins:
+
+| Primary | When |
+|---|---|
+| `http://127.0.0.1:<host port>` | code-hub runs in a container and the app is **mirrored on the Docker host's loopback** by the host relay (the host port may differ from `port` when that was busy on the host) |
+| `http://<bridge ip>:<port>` | the **bridge-address fallback** holds for the app (below); the bridge IP is then dropped from the LAN entries that follow, so it is listed once |
+| `http://localhost:<port>` | otherwise |
+
+Each `routes[].urls` is those bases with the route `path` appended (`/` keeps the clean base form). Both are derived live on every listing (never persisted) and populated only while the app is running. An app is mirrored once it is `ready` (or adopted and alive), never while `starting`; the always-on host conductor never is. `start`/`restart` answer before readiness, so their `urls` start with `localhost` either way.
+
+**Bridge-address fallback** (`src/bridgeForward.js`). An app gets a plain TCP forwarder — no TLS, no login — bound on the container's bridge IP at the app's own port, forwarding to `127.0.0.1:<port>`, while all of these hold: `hubSettings.bridgeFallback` is on; code-hub runs in a container whose local IPv4s are all in `172.16.0.0/12` (`bridgeIPv4()` in `src/net.js`; the bridge IP is the first of them, and only it is bound, never `0.0.0.0`); the app is not the always-on host conductor; the app is `ready` (or adopted and alive); and no LAN share holds it (below). The forwarder doesn't depend on the host relay: it stays bound while the mirror is up, and only the primary URL moves. The bind's outcome, and the bridge URL it offers — the primary unless a mirror outranks it:
+
+| Bind result | Bridge URL offered | Log (`console.error`) |
+|---|---|---|
+| listening | `http://<bridge ip>:<port>`, through the forwarder | — |
+| `EADDRINUSE` — presumably the app itself holds the address (it bound `0.0.0.0` or the bridge IP); no forwarder | `http://<bridge ip>:<port>`, the app directly | `[bridgeForward] <id>: <ip>:<port> is already taken — presumably by the app itself; showing it directly` |
+| any other error; no forwarder | none — the primary is the mirror's or `localhost` | `[bridgeForward] <id>: could not bind <ip>:<port> — <message>; no bridge URL for it` |
+
+A failed bind never fails or delays a start, and is **never retried** while the app's record, port and bridge IP stand; a stop, restart, LAN share/unshare or a setting toggle re-evaluates it.
+
+**A LAN share displaces the forwarder.** From the moment a LAN share of the app starts (before it binds anything) until it ends, the app has no forwarder and no bridge URL: its primary is the mirror URL when one is bound, else `localhost` (the share's own URLs are the reachable ones). The loopback mirror is never displaced. A fixed-port LAN share of a loopback-only app therefore binds `<bridge ip>:<port>` itself, gated. Unsharing, re-sharing as `tunnel`/`tailscale` (whether that re-share succeeds or fails), or a LAN share that fails, is cancelled or is abandoned reopens it. `tunnel` and `tailscale` shares leave it up.
 
 **`alwaysOn`.** When code-hub runs embedded as a code-conductor plugin (`CONDUCTOR_PLUGIN_ID` + `CONDUCTOR_URL` env vars present — see `docs/architecture.md`), the main `code-conductor` checkout is reported `alwaysOn: true, status: "running"` with no real pid to track, and `POST /api/apps/code-conductor/start`, `.../stop`, and `.../restart` all reply `409`. `POST .../share` still works — it targets the port parsed from `CONDUCTOR_URL` — and so does its `autoShare` setting, which shares it at every code-hub boot (`autoStart: true` is a `400`; see "App settings"). The checkout's `path` (and its git info) comes from the `CONDUCTOR_PROJECT_DIR` env var the conductor injects, which **may live outside the scanned `PROJECTS_ROOT`** — so the app surfaces even with a custom conductor root; older conductors that don't inject it fall back to discovering a `code-conductor/` dir under the root. This never applies to `code-conductor:<key>` worktrees (always ordinary apps) or when running standalone — though such a worktree may still surface via manifest inheritance from the parent whenever its worktrees are under the root, **including for an out-of-root checkout** (for a local-system project cc roots worktrees at `<projectsRoot>/.worktrees/` wherever the checkout lives; see "Worktree manifest inheritance").
 

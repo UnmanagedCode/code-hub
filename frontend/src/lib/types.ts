@@ -89,9 +89,16 @@ export interface App {
   alwaysOn: boolean;
 }
 
+/** Hub-wide settings (`PUT api/hub-settings`). */
+export interface HubSettings {
+  /** Open each running app at the container's bridge address when no host relay mirrors it. */
+  bridgeFallback: boolean;
+}
+
 export interface AppsResponse {
   cloudflaredAvailable: boolean;
   tailscaleAvailable: boolean;
+  hubSettings: HubSettings;
   apps: App[];
 }
 
