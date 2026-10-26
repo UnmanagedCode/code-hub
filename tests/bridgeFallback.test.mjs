@@ -384,3 +384,61 @@ test('L5: a tunnel share leaves the forwarder up; a LAN share re-shared as a tun
   await waitFor(() => holdsBridge(port), { timeout: 2000 });
   assert.equal(await get(port), 200);
 });
+
+// Invariant: a tailscale share binds nothing on the bridge address and leaves
+// the forwarder up, like a tunnel share.
+test('L5b: a tailscale share leaves the forwarder up', async (t) => {
+  const booted = await boot(t);
+  if (!booted) return;
+  const { base } = booted;
+  const port = await startApp(base);
+  const s = await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale' });
+  assert.equal(s.status, 200, JSON.stringify(s.body));
+  assert.equal(await holdsBridge(port), true);
+  assert.equal(await get(port), 200);
+  assert.equal((await listed(base)).urls[0], bridgeUrl(port));
+});
+
+// Invariant: a re-share away from LAN that fails — after it has already torn
+// the LAN share down — hands the bridge address back to the forwarder, in
+// both non-LAN modes.
+test('L6: a failed tunnel or tailscale re-share of a LAN share reopens the forwarder', async (t) => {
+  const booted = await boot(t);
+  if (!booted) return;
+  const { base } = booted;
+  const port = await startApp(base);
+  t.after(() => { delete process.env.FAKE_CLOUDFLARED_MODE; delete process.env.FAKE_TAILSCALE_MODE; });
+  for (const [mode, env, value] of [['tunnel', 'FAKE_CLOUDFLARED_MODE', 'fail'], ['tailscale', 'FAKE_TAILSCALE_MODE', 'denied']]) {
+    assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false })).status, 200, mode);
+    assert.equal(await holdsBridge(port), false, mode);
+    process.env[env] = value;
+    const failed = await j(base, 'POST', '/api/apps/app/share', { mode });
+    delete process.env[env];
+    assert.ok(failed.status >= 400, `${mode}: ${JSON.stringify(failed.body)}`);
+    assert.equal((await listed(base)).tunnel, null, mode);
+    assert.equal(await holdsBridge(port), true, mode);
+    assert.equal(await get(port), 200, mode);
+    assert.equal((await listed(base)).urls[0], bridgeUrl(port), mode);
+  }
+});
+
+// Invariant: displacement is per record — a LAN share still in flight for a
+// stopped record doesn't keep the restarted record's forwarder closed.
+test('L7: a parked LAN share of the old record leaves the new record\'s forwarder up', async (t) => {
+  const booted = await boot(t);
+  if (!booted) return;
+  const { base } = booted;
+  await startApp(base);
+  const hold = holdShareAtSettingsRead(t);
+  const sharing = j(base, 'POST', '/api/apps/app/share', { mode: 'lan', tls: false });
+  await hold.parked;
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  await j(base, 'GET', '/api/apps/app/settled');
+  const port = restarted.body.port;
+  assert.equal(await holdsBridge(port), true, 'the new record is forwarded while the old share is parked');
+  assert.equal(await get(port), 200);
+  hold.release();
+  assert.equal((await sharing).status, 409);
+  assert.equal(await holdsBridge(port), true);
+});

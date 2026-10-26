@@ -16,13 +16,9 @@ async function freshRoot(t) {
 const file = () => path.join(storeRoot(), hubSettings.HUB_SETTINGS_FILENAME);
 const exists = (p) => fs.access(p).then(() => true, () => false);
 
-// Re-read the file from disk: get() caches per path, so point it at another
-// root and back.
-async function reread(t, root) {
-  const other = await mkRoot({ bridgeFallback: true });
-  t.after(() => rmRoot(other));
-  hubSettings.get();
-  process.env.PROJECTS_ROOT = root;
+// Re-read the file from disk: get() caches it.
+function reread() {
+  hubSettings._reset();
   return hubSettings.get();
 }
 
@@ -36,10 +32,10 @@ test('an absent file reads as the defaults', async (t) => {
 // Invariant: an update persists — a fresh read from disk returns it — and
 // answers with the new settings.
 test('an update round-trips through the file', async (t) => {
-  const root = await freshRoot(t);
+  await freshRoot(t);
   assert.deepEqual(await hubSettings.update({ bridgeFallback: false }), { bridgeFallback: false });
   assert.deepEqual(hubSettings.get(), { bridgeFallback: false });
-  assert.deepEqual(await reread(t, root), { bridgeFallback: false });
+  assert.deepEqual(reread(), { bridgeFallback: false });
   assert.deepEqual(JSON.parse(await fs.readFile(file(), 'utf8')), { bridgeFallback: false });
 });
 
@@ -57,13 +53,13 @@ test('an invalid body is a 400 and writes nothing', async (t) => {
 // Invariant: a broken file never breaks code-hub — it reads as the defaults,
 // with a warning naming the file.
 test('an invalid file warns and reads as the defaults', async (t) => {
-  const root = await freshRoot(t);
+  await freshRoot(t);
   const warn = t.mock.method(console, 'warn', () => {});
   await fs.mkdir(storeRoot(), { recursive: true });
   for (const raw of ['{ broken', '[]', '{"bridgeFallback":"off"}']) {
     await fs.writeFile(file(), raw);
     const before = warn.mock.callCount();
-    assert.deepEqual(await reread(t, root), { bridgeFallback: true }, raw);
+    assert.deepEqual(reread(), { bridgeFallback: true }, raw);
     assert.equal(warn.mock.callCount(), before + 1, raw);
     assert.ok(warn.mock.calls.at(-1).arguments[0].includes(file()), raw);
   }
@@ -72,7 +68,7 @@ test('an invalid file warns and reads as the defaults', async (t) => {
 // Invariant: concurrent updates land one at a time, in call order — the file
 // and the cache both end on the last one.
 test('concurrent updates land in order', async (t) => {
-  const root = await freshRoot(t);
+  await freshRoot(t);
   const results = await Promise.all([
     hubSettings.update({ bridgeFallback: false }),
     hubSettings.update({ bridgeFallback: true }),
@@ -80,5 +76,22 @@ test('concurrent updates land in order', async (t) => {
   ]);
   assert.deepEqual(results.map((r) => r.bridgeFallback), [false, true, false]);
   assert.deepEqual(hubSettings.get(), { bridgeFallback: false });
-  assert.deepEqual(await reread(t, root), { bridgeFallback: false });
+  assert.deepEqual(reread(), { bridgeFallback: false });
+});
+
+// Invariant (test harness): a hub-settings read at any moment while mkRoot()
+// runs — what a late callback of the previous test does — can't leave the new
+// root reading the default: the root's file is complete before PROJECTS_ROOT
+// names it, and the cache is dropped once it does.
+test('mkRoot: reads racing it never cache the default for the new root', async (t) => {
+  let done = false;
+  const reads = [];
+  const poll = () => { if (done) return; reads.push(hubSettings.get()); setImmediate(poll); };
+  poll();
+  const root = await mkRoot();
+  done = true;
+  t.after(() => rmRoot(root));
+  assert.ok(reads.length > 1, 'reads interleaved with mkRoot');
+  assert.equal(process.env.PROJECTS_ROOT, root);
+  assert.deepEqual(hubSettings.get(), { bridgeFallback: false });
 });

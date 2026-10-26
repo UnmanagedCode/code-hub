@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { WORKTREES_DIRNAME, storeRoot } from '../src/projects.js';
+import { WORKTREES_DIRNAME, STORE_DIRNAME, storeRoot } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import * as appSettings from '../src/appSettings.js';
+import * as hubSettings from '../src/hubSettings.js';
 import { HUB_SETTINGS_FILENAME } from '../src/hubSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,13 +65,20 @@ export function altLoopbackBindable() {
 // The bridge-address fallback is turned off in it unless `bridgeFallback` is
 // true (then no hub-settings file is written, so the default applies): run in a
 // bridge container, an app's URLs would otherwise depend on the host's network.
+// The file is complete before PROJECTS_ROOT names the root — a late callback of
+// the previous test (an app exit, a settle) may read the hub settings at any
+// await — and the settings cache is dropped once it does.
 export async function mkRoot({ bridgeFallback = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-test-'));
-  process.env.PROJECTS_ROOT = root;
   if (!bridgeFallback) {
-    await fs.mkdir(storeRoot(), { recursive: true });
-    await fs.writeFile(path.join(storeRoot(), HUB_SETTINGS_FILENAME), JSON.stringify({ bridgeFallback: false }));
+    const store = path.join(root, STORE_DIRNAME);
+    await fs.mkdir(store, { recursive: true });
+    const tmp = path.join(store, `.${HUB_SETTINGS_FILENAME}.tmp`);
+    await fs.writeFile(tmp, JSON.stringify({ bridgeFallback: false }));
+    await fs.rename(tmp, path.join(store, HUB_SETTINGS_FILENAME));
   }
+  process.env.PROJECTS_ROOT = root;
+  hubSettings._reset();
   return root;
 }
 

@@ -263,8 +263,9 @@ test('M7: no mirror while starting; every readiness kind reaches ready and is mi
 
 // Invariant (bridge fallback): the mirror beats the bridge address for the
 // Start URL, and the forwarder doesn't depend on the relay — it stays bound
-// while the mirror is up, and when the relay goes the Start URL falls back to
-// it with no re-bind.
+// while the mirror is up, through a re-derivation of the exposures made while
+// mirrored, and when the relay goes the Start URL falls back to it with no
+// re-bind.
 test('M9: the mirror outranks the bridge forwarder, which outlives the relay unchanged', async (t) => {
   if (!requirePython(t)) return;
   if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
@@ -281,9 +282,36 @@ test('M9: the mirror outranks the bridge forwarder, which outlives the relay unc
   assert.equal((await listedApp(base)).urls[0], `http://127.0.0.1:${h}`);
   assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`));
   assert.equal(bridgeBinds(), 1);
+  await appManager.setHubSettings({ bridgeFallback: true }); // re-derives the exposures with the mirror bound
+  assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`), 'still forwarded while mirrored');
+  assert.equal(bridgeBinds(), 1, 'never re-bound');
   await relay.stop('SIGKILL');
   await waitFor(async () => (await listedApp(base)).urls[0] === `http://${ALT_LOOPBACK}:${port}`, { timeout: 3000 });
   assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`));
   assert.equal(bridgeBinds(), 1, 'never re-bound');
   assert.deepEqual(await get(port, ALT_LOOPBACK), { status: 200, body: 'ok' });
+});
+
+// Invariant (bridge fallback): a LAN share displaces only the bridge
+// forwarder, never the loopback mirror — a LAN-shared app's Start URL stays the
+// mirror while one is bound, and is localhost (not the bridge address) once
+// the relay is gone.
+test('M10: a LAN-shared app keeps its mirror as the Start URL; without the relay it is localhost', async (t) => {
+  if (!requirePython(t)) return;
+  if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
+  const { base, relay } = await boot(t);
+  _setLocalIPv4sProbe(() => [ALT_LOOPBACK]);
+  _setBridgeProbe(() => true);
+  t.after(() => { _setLocalIPv4sProbe(null); bridgeForward.reset(); });
+  await appManager.setHubSettings({ bridgeFallback: true });
+  await startApp();
+  const h = await mirrorPort(base);
+  const { port } = await listedApp(base);
+  assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`));
+  await appManager.share('app', { mode: 'lan', tls: false });
+  assert.ok(!(await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`), 'the forwarder is displaced');
+  assert.equal((await listedApp(base)).urls[0], `http://127.0.0.1:${h}`);
+  assert.equal(loopbackMirror.hostPort('app'), h, 'the mirror is not displaced');
+  await relay.stop('SIGKILL');
+  await waitFor(async () => (await listedApp(base)).urls[0] === `http://localhost:${port}`, { timeout: 3000 });
 });

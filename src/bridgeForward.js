@@ -7,14 +7,14 @@ import net from 'node:net';
 // app's own port — bound on that one address only, never 0.0.0.0. The set is
 // derived from appManager's store on every change (see syncExposures there);
 // nothing is persisted, and the address shows up in the app's URLs live (see
-// appUrls.js).
+// appUrls.js), as the primary unless a loopback mirror outranks it.
 //
 // A bind that fails is never retried while the entry's (port, host) stands:
-// EADDRINUSE means the app itself holds that address (it bound 0.0.0.0 or the
-// bridge address), so the address is shown as is (`direct`); any other error
-// leaves the app on its localhost URL (`failed`). Only removing the entry and
-// re-creating it binds again — so the forwarder can never take the address
-// during the moment a reloading app has let go of it.
+// EADDRINUSE presumably means the app itself holds that address (it bound
+// 0.0.0.0 or the bridge address), so the address is offered as is (`direct`);
+// any other error offers no bridge address at all (`failed`). Only removing the
+// entry and re-creating it binds again — so the forwarder can never take the
+// address during the moment a reloading app has let go of it.
 const UPSTREAM_HOST = '127.0.0.1';
 const entries = new Map(); // app id → { port, host, state, server, pairs, closed }
 
@@ -85,7 +85,7 @@ function open(id, port, host) {
       console.error(`[bridgeForward] ${id}: ${host}:${port} is already taken — presumably by the app itself; showing it directly`);
     } else {
       entry.state = 'failed';
-      console.error(`[bridgeForward] ${id}: could not bind ${host}:${port} — ${e.message}; the Start URL stays on localhost`);
+      console.error(`[bridgeForward] ${id}: could not bind ${host}:${port} — ${e.message}; no bridge URL for it`);
     }
   });
   server.listen(port, host);

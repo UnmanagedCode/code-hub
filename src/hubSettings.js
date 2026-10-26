@@ -54,6 +54,9 @@ export function get() {
   return { ...cache.settings };
 }
 
+// Test seam: drop the cache, so the next get() reads the file.
+export function _reset() { cache = null; }
+
 function invalid(message) {
   const e = new Error(message);
   e.statusCode = 400;

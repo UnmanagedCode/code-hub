@@ -159,7 +159,7 @@ WantedBy=multi-user.target
 - **The secret lives in the container's store**, readable by code-hub's user and anything running as it.
 - **A `docker0` `--listen` is reachable from a LAN neighbour that adds a route** to it (the weak host model); there the challenge-response is the gate.
 - **Loopback mirrors have no login**: any local process or user on the host can reach a mirrored app, like any local dev server.
-- **The no-relay bridge-address fallback has no login either**, and it is reachable by anything that can route to the container's bridge network — the host and its other containers. It works only on a native-Linux Docker host in practice. Turn it off in **Hub settings** where that matters.
+- **The no-relay bridge-address fallback has no login either**, and it is reachable by anything that can route to the container's bridge network — the host and its other containers. The exposure stays while a relay is up: a mirror only moves the Start URL, the forwarder stays bound. It covers every ready app except the always-on host code-conductor and an app while it has a LAN share. It works only on a native-Linux Docker host in practice. Turn it off in **Hub settings** where that matters.
 - **The panel updates on Refresh**, not live.
 - **Untested in CI**: Docker Desktop's `host.docker.internal` → host loopback path on macOS/Windows, the `docker0` default and gateway fallback on a real native-Linux Docker host, a second real LAN device, and Ctrl-C on Windows.
 - **Python 3.9 compatibility is checked statically** (the tests parse the source for 3.7 syntax and scan for 3.10+ APIs); run the relay tests with `CODEHUB_PYTHON=python3.9` to check it for real.

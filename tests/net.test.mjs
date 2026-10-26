@@ -304,6 +304,8 @@ test('bridgeIPv4: the first local address only in a container whose addresses ar
   assert.equal(bridgeIPv4(), null, 'not in a container');
   _setContainerProbe(() => true);
   assert.equal(bridgeIPv4(), '172.17.0.2');
+  ips = ['172.17.0.2', '172.18.0.3'];
+  assert.equal(bridgeIPv4(), '172.17.0.2', 'the first of several bridge addresses');
   ips = ['192.168.1.5'];
   assert.equal(bridgeIPv4(), null, 'a non-bridge address');
   ips = ['172.17.0.2', '192.168.1.5'];

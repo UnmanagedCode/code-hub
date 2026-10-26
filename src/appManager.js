@@ -294,8 +294,8 @@ function funnelBlockedBy(id) {
 // conductor (code-hub never started it). Also run when a start's readiness
 // settles (see start()), when a child exits (see runner.onExit below), so a
 // crash drops its exposures without waiting for a persist, when a host client
-// finds a mirrored port refusing, when a LAN share starts or ends without
-// committing (see shareNow), and when the hub settings change. An ADOPTED app
+// finds a mirrored port refusing, when a LAN share starts, when any share ends
+// (see shareNow), and when the hub settings change. An ADOPTED app
 // (no child of ours to exit) that dies is noticed by either that refusal or a
 // listing (list() prunes its record, and the persist re-syncs).
 async function persist() {
@@ -726,8 +726,10 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
       return await op.done;
     } finally {
       if (sharing.get(id) === op) sharing.delete(id);
-      // One that didn't commit hands the address back to the forwarder.
-      if (op.lan) syncExposures();
+      // A share that didn't commit — in any mode: a tunnel or tailscale
+      // re-share tears the LAN share down before it can fail — hands the
+      // address back to the forwarder.
+      syncExposures();
     }
   }
 }
