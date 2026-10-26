@@ -23,7 +23,7 @@ import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOS
 import * as conductorProjects from './conductorProjects.js';
 import * as appSettings from './appSettings.js';
 import * as autoRun from './autoRun.js';
-import { validateShareOptions } from './shareOptions.js';
+import { validateShareOptions, FUNNEL_PORTS } from './shareOptions.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
 // sync on every mutation. This module is the single source of truth for
@@ -73,7 +73,7 @@ export async function init() {
   // share state may outlive this point: kill the share children of the
   // records being discarded (one still inside its post-commit persist isn't
   // on disk yet, so the sweep below would never see it) — which also releases
-  // a committed funnel slot — and close every proxy (teardownShare is
+  // its committed funnel slot — and close every proxy (teardownShare is
   // record-scoped and would skip one committed for a record that no longer
   // exists). A share still in flight is left to abandon itself: its record no
   // longer exists, so it can't commit, and it keeps its `sharing` entry and
@@ -171,38 +171,40 @@ export async function init() {
   else syncExposures();
 }
 
-// THE authority for "which app holds the node's Tailscale Funnel". Funnel
-// occupies port 443 machine-wide, so exactly one can exist, and every 409 is
-// derived from this — nothing scans the app records for a holder. Two sources
-// of truth is precisely what went wrong before: any site that dropped a record
-// without telling the slot left it naming a share that no longer existed,
-// wedging the feature until a restart.
+// THE authority for "which app holds which Tailscale Funnel port". Funnel
+// serves a fixed set of public ports (shareOptions.FUNNEL_PORTS), and tailscaled
+// lets exactly one funnel hold each, so there is one slot per port and every
+// per-port 409 is derived from this — nothing scans the app records for a
+// holder. Two sources of truth is precisely what went wrong before: any site
+// that dropped a record without telling the slot left it naming a share that
+// no longer existed, wedging that port until a restart.
 //
-//   { id, pid, pending }
+//   Funnel port → { id, pid, pending }
 //     pending — the share is still coming up: no pid yet, no record yet.
-//               share() claims this SYNCHRONOUSLY before its first await,
+//               share() claims its port SYNCHRONOUSLY before its first await,
 //               because rec.tunnel isn't written until the funnel is up (up to
-//               the full readiness backstop), so two concurrent requests would
-//               otherwise both pass any records-based check. A pending slot
-//               blocks its OWN app too — a second concurrent share of A would
-//               orphan the first one's proxy and funnel child.
+//               the full readiness backstop), so two concurrent requests for
+//               one port would otherwise both pass any records-based check. A
+//               pending slot blocks its OWN app too — a second concurrent share
+//               of A would orphan the first one's proxy and funnel child.
 //     pid     — the funnel child this slot names, once it is up.
 //
 // Released precisely when the child it NAMES is killed (see killShareChild),
-// never on an id match: share() claims the slot and then tears down that same
-// app's previous funnel, so an id-keyed release would drop the claim it just
-// made. Keying on pid makes teardownShare the single release point, which is
-// what lets "route every record-dropping site through teardownShare" close the
-// whole class rather than three instances of it.
-let funnelSlot = null;
+// never on an id or port match: share() claims a slot and then tears down that
+// same app's previous funnel — on this port or another — so an id-keyed
+// release would drop the claim it just made. Keying on pid makes teardownShare
+// the single release point, which is what lets "route every record-dropping
+// site through teardownShare" close the whole class rather than three
+// instances of it.
+const funnelSlots = new Map();
 
-// pid of the most recently SIGTERMed tailscale funnel, while it may still be
-// exiting. The CLI reverts the node's WHOLE serve config when it exits, not
-// just its own registration, so a funnel spawned while an older one is still
-// shutting down can have its URL torn out from under it moments later. The
-// next tailscale share waits this out (see share()). Covers both re-sharing
-// one app and unsharing A then sharing B.
-let expiringFunnelPid = null;
+// pids of SIGTERMed tailscale funnels that may still be exiting. Until one is
+// gone, tailscaled still holds its Funnel port and refuses a new funnel there,
+// so the next tailscale share waits all of them out (see share()) — bounded by
+// waitForExit's timeout, and with no need to know which port each one held.
+// Covers re-sharing one app, moving it to another port, and unsharing A then
+// sharing B.
+const expiringFunnelPids = new Set();
 
 // SIGTERM the child publishing a share, dispatching on its kind (a LAN share
 // has none). Split out of teardownShare so init() can also kill a child whose
@@ -221,9 +223,11 @@ function killShareChild(id, t, { verify = false } = {}) {
       console.error(`[appManager] ${id}: persisted funnel pid ${t.pid} is not a tailscale funnel (recycled?) — not signalling it`);
     } else {
       tailscale.stopFunnel(t.pid);
-      if (t.pid) expiringFunnelPid = t.pid;
+      if (t.pid) expiringFunnelPids.add(t.pid);
     }
-    if (funnelSlot && !funnelSlot.pending && funnelSlot.pid === t.pid) funnelSlot = null;
+    for (const [port, slot] of funnelSlots) {
+      if (!slot.pending && slot.pid === t.pid) funnelSlots.delete(port);
+    }
   } else {
     tunnel.stopTunnel(t.pid);
   }
@@ -237,13 +241,13 @@ function killShareChild(id, t, { verify = false } = {}) {
 // EVERY site that drops or replaces a record carrying a share must come
 // through here — init's sweep, list()'s prune and reap, stop(), start()'s
 // replacement of a dead app's record, unshare(). That is the single-authority
-// rule that keeps funnelSlot from ever naming a share that no longer exists.
+// rule that keeps funnelSlots from ever naming a share that no longer exists.
 //
 // Synchronous, so the in-memory maps are consistent the instant it returns.
 // The SIGTERM it sends is NOT awaited, though, so the killed child may still
 // be exiting afterwards — which matters only for tailscale, where a lingering
-// exit would revert the node's serve config: `expiringFunnelPid` records it
-// and the next tailscale share waits for it.
+// funnel still holds its Funnel port: `expiringFunnelPids` records it and the
+// next tailscale share waits for it.
 //
 // Record-scoped: the live proxy (and the id-keyed state that describes it) is
 // touched only when it belongs to `rec`, so a caller holding a stopped or
@@ -262,15 +266,20 @@ function teardownShare(id, rec, opts) {
   if (rec) rec.tunnel = null;
 }
 
-// Free the slot when the funnel it names has died on its own (an OOM kill, a
-// stray kill) — refusing every other app on behalf of a funnel that no longer
-// exists would wedge the feature until a restart. A pending claim is never
-// stale: its share() call is still running.
-function reapFunnelSlot() {
-  if (!funnelSlot || funnelSlot.pending || state.pidAlive(funnelSlot.pid)) return;
-  const rec = store.apps[funnelSlot.id];
-  if (rec?.tunnel) teardownShare(funnelSlot.id, rec); // drops the stale URL/creds/QR too
-  funnelSlot = null;
+// Free every slot whose funnel has died on its own (an OOM kill, a stray
+// kill) — refusing every other app on behalf of a funnel that no longer exists
+// would wedge that port until a restart. A pending claim is never stale: its
+// share() call is still running. Returns whether it tore a share down (the
+// caller persists).
+function reapFunnelSlots() {
+  let toreDown = false;
+  for (const [port, slot] of funnelSlots) {
+    if (slot.pending || state.pidAlive(slot.pid)) continue;
+    const rec = store.apps[slot.id];
+    if (rec?.tunnel?.pid === slot.pid) { teardownShare(slot.id, rec); toreDown = true; } // drops the stale URL/creds/QR too
+    funnelSlots.delete(port);
+  }
+  return toreDown;
 }
 
 function tailscaleUnavailable() {
@@ -279,14 +288,23 @@ function tailscaleUnavailable() {
   return e;
 }
 
-// Which app blocks a tailscale share of `id`, or null when nothing does.
-// Reads funnelSlot ONLY. A slot held by this same app does not block — that is
-// a re-share, which replaces it.
-function funnelBlockedBy(id) {
-  reapFunnelSlot();
-  if (!funnelSlot) return null;
-  if (funnelSlot.pending) return funnelSlot.id; // blocks everyone (its own app can't get here: share() serialises an app's shares)
-  return funnelSlot.id === id ? null : funnelSlot.id;
+// Which app blocks a tailscale share of `id` on `funnelPort`, or null when
+// nothing does. Reads funnelSlots ONLY. A slot held by this same app does not
+// block — that is a re-share, which replaces it.
+function funnelBlockedBy(id, funnelPort) {
+  reapFunnelSlots();
+  const slot = funnelSlots.get(funnelPort);
+  if (!slot) return null;
+  if (slot.pending) return slot.id; // blocks everyone (its own app can't get here: share() serialises an app's shares)
+  return slot.id === id ? null : slot.id;
+}
+
+// Every Funnel port and the app holding it (a pending claim included), or null
+// when free — the listing's `funnelPorts`. Reaps dead holders first, so a
+// funnel that died on its own reads as free; `toreDown` tells list() to persist.
+function funnelOccupancy() {
+  const toreDown = reapFunnelSlots();
+  return { toreDown, ports: FUNNEL_PORTS.map((port) => ({ port, holder: funnelSlots.get(port)?.id ?? null })) };
 }
 
 // The loopback mirror set and the bridge forwarder set are derived from the
@@ -404,11 +422,11 @@ export async function list() {
       // magic-link. Omitted for a no-auth share (no token path) or a gone proxy.
       // A tailscale funnel that died on its own (OOM kill, a stray kill) leaves
       // a record advertising a public URL that answers nothing — and keeps
-      // refusing every other app's tailscale share on behalf of a holder that
-      // holds nothing. Reap it on the listing that notices, before anything is
-      // built from it. (A LAN share has pid null by design and a cloudflared
-      // tunnel is untouched here — only the tailscale slot has a machine-wide
-      // consequence worth a per-listing probe.)
+      // refusing every other app's tailscale share on its Funnel port on behalf
+      // of a holder that holds nothing. Reap it on the listing that notices,
+      // before anything is built from it. (A LAN share has pid null by design
+      // and a cloudflared tunnel is untouched here — only a Funnel port slot has
+      // a machine-wide consequence worth a per-listing probe.)
       if (rec.tunnel?.kind === 'tailscale' && !state.pidAlive(rec.tunnel.pid)) {
         teardownShare(base.id, rec); mutated = true;
       }
@@ -423,6 +441,7 @@ export async function list() {
         tunnelInfo = {
           url, kind: rec.tunnel.kind, urls: rec.tunnel.urls ?? null,
           proxyPort: rec.tunnel.proxyPort ?? null,
+          funnelPort: rec.tunnel.funnelPort ?? null,
           fixedPortFallback: rec.tunnel.fixedPortFallback === true,
           fixedPortHolder: rec.tunnel.fixedPortHolder ?? null,
           relay: rec.tunnel.relay ?? null,
@@ -450,8 +469,9 @@ export async function list() {
           // Tear the share down BEFORE dropping the record: the record holds
           // the only copy of the share child's pid, so deleting it first would
           // strand that child with nothing left able to kill it — a tailscale
-          // funnel would keep 443 published in front of a proxy that is about
-          // to close, and would block every other app's share forever.
+          // funnel would keep its Funnel port published in front of a proxy that
+          // is about to close, and would block every other app's share on that
+          // port forever.
           teardownShare(base.id, rec);
           autoRun.forget(base.id);
           delete store.apps[base.id]; mutated = true;
@@ -504,10 +524,14 @@ export async function list() {
     if (byId.has(id)) continue; // already built above
     entries.push(await build({ ...rec, manifest: null, manifestError: null }, rec));
   }
+  // After the build loop (which reaps its own records' dead funnels) and before
+  // the persist, so a reap here is saved too.
+  const occupancy = funnelOccupancy();
+  if (occupancy.toreDown) mutated = true;
   if (mutated) await persist();
 
   entries.sort((a, b) => a.id.localeCompare(b.id));
-  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), hubSettings: hubSettings.get(), apps: entries };
+  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), funnelPorts: occupancy.ports, hubSettings: hubSettings.get(), apps: entries };
 }
 
 async function findDiscovered(id) {
@@ -527,10 +551,10 @@ export async function start(id) {
   }
   // Past that guard the app's pid is dead, but its SHARE child may not be:
   // the record below is overwritten wholesale with `tunnel: null`, which would
-  // drop the only reference to a live funnel — orphaning it on 443 and leaving
-  // the slot naming an app with no share, blocking every future tailscale
-  // share until a restart. Same single-authority rule as every other site that
-  // drops a record: tear the share down first.
+  // drop the only reference to a live funnel — orphaning it on its Funnel port
+  // and leaving that slot naming an app with no share, blocking every future
+  // tailscale share there until a restart. Same single-authority rule as every
+  // other site that drops a record: tear the share down first.
   if (existing?.tunnel) teardownShare(id, existing);
   const app = await findDiscovered(id);
   // A read error other than a missing file propagates and refuses the start:
@@ -654,8 +678,9 @@ export async function restart(id) {
 // - 'tailscale': a Tailscale Funnel points at the auth proxy, publishing the
 //   node's MagicDNS name (https://<machine>.<tailnet>.ts.net) — public, and
 //   unlike cloudflared's random hostname it is stable across restarts. Always
-//   gated. Funnel occupies port 443 machine-wide, so only ONE tailscale share
-//   can exist at a time (409 naming the holder).
+//   gated. Each runs on one public Funnel port (`funnelPort`, one of
+//   FUNNEL_PORTS, default 443; any port but 443 appears in the URL), and a port
+//   holds ONE tailscale share at a time (409 naming the holder and the port).
 // For a gated share, a fresh token is generated per share; the username and
 // password are the app's stored default share login where set (see
 // appSettings.js — each field falls back independently to 'hub' / a random
@@ -701,8 +726,8 @@ function abandoned(id, op) {
   return e;
 }
 
-async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
-  ({ mode, auth, tls } = validateShareOptions({ mode, auth, tls }));
+async function shareNow(id, { mode = 'tunnel', auth, tls, funnelPort } = {}) {
+  ({ mode, auth, tls, funnelPort } = validateShareOptions({ mode, auth, tls, funnelPort }));
   for (;;) {
     const rec = store.apps[id];
     const alwaysOn = isHostConductorId(id);
@@ -721,7 +746,7 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
     // a fixed-port share binds that very address. server.close() releases the
     // listening socket synchronously, so it is free by the share's first bind.
     if (op.lan) syncExposures();
-    op.done = shareRecord(id, op, { mode, auth, tls });
+    op.done = shareRecord(id, op, { mode, auth, tls, funnelPort });
     try {
       return await op.done;
     } finally {
@@ -740,7 +765,7 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
 // a share abandoned meanwhile closes what it started instead of committing.
 // Teardown of a previous share is record-scoped (see teardownShare), so an
 // abandoned share running it touches nothing of a newer record's.
-async function shareRecord(id, op, { mode, auth, tls }) {
+async function shareRecord(id, op, { mode, auth, tls, funnelPort }) {
   const { rec } = op;
   const committable = () => store.apps[id] === rec && !op.cancelled;
   // Read BEFORE the mode branches: the tailscale branch's slot claim must have
@@ -884,39 +909,40 @@ async function shareRecord(id, op, { mode, auth, tls }) {
   }
 
   if (mode === 'tailscale') {
-    const blocker = funnelBlockedBy(id);
+    const blocker = funnelBlockedBy(id, funnelPort);
     if (blocker) {
       // No claim is made on this path, so this await races nothing — and
       // "tailscale isn't available" is the more actionable message when both
       // are true, so it is reported in preference to the 409.
       if (!(await tailscale.available())) throw tailscaleUnavailable();
       // Always another app's: shares of one app run one at a time (share()).
-      const e = new Error(`'${blocker}' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide, so only one is possible at a time; unshare it first`);
+      const e = new Error(`'${blocker}' already has a tailscale share on Funnel port ${funnelPort} — unshare it, or share on another port`);
       e.statusCode = 409; throw e;
     }
-    // Claim the slot SYNCHRONOUSLY — no await between the check above and
-    // this line, so two concurrent requests cannot both get here.
-    const prior = funnelSlot; // null, or this app's own held slot (a re-share)
-    funnelSlot = { id, pid: null, pending: true };
+    // Claim the port's slot SYNCHRONOUSLY — no await between the check above
+    // and this line, so two concurrent requests for it cannot both get here.
+    const prior = funnelSlots.get(funnelPort) ?? null; // null, or this app's own held slot (a re-share)
+    funnelSlots.set(funnelPort, { id, pid: null, pending: true });
     let committed = false;
     try {
       if (!(await tailscale.available())) throw tailscaleUnavailable();
-      teardownShare(id, rec); // replace any existing share
+      // Replace any existing share. Its funnel, on this port or another, frees
+      // its slot by pid as it is killed (see killShareChild).
+      teardownShare(id, rec);
 
-      // A funnel still shutting down reverts the node's WHOLE serve config
-      // when it finally exits, which would silently take the new funnel's URL
-      // with it. Wait it out rather than racing it.
-      if (expiringFunnelPid) {
-        await tailscale.waitForExit(expiringFunnelPid);
-        expiringFunnelPid = null;
-      }
+      // A funnel still shutting down holds its Funnel port until it is gone,
+      // and tailscaled refuses a new funnel there meanwhile. Wait every such
+      // funnel out rather than racing it.
+      const expiring = [...expiringFunnelPids];
+      await Promise.all(expiring.map((pid) => tailscale.waitForExit(pid)));
+      for (const pid of expiring) expiringFunnelPids.delete(pid);
 
       // No `tls` option: tailscaled terminates TLS on-machine and forwards plain
       // HTTP here, exactly as cloudflared does (see authproxy.js).
       const proxy = await startAuthProxy(rec.port, credOpts(creds));
       let url, pid;
       try {
-        ({ url, pid } = await tailscale.startFunnel(proxy.port));
+        ({ url, pid } = await tailscale.startFunnel(proxy.port, funnelPort));
       } catch (e) {
         proxy.close(); // don't leak the proxy if the funnel failed to come up
         throw e;
@@ -929,25 +955,25 @@ async function shareRecord(id, op, { mode, auth, tls }) {
       // attach a LIVE public funnel to an object the store no longer holds:
       // referenced by nothing, so unshare/stop cannot reach it, never persisted
       // so a restart loses it entirely, and — being alive — never reaped by
-      // funnelBlockedBy, which would 409 every future share on every app.
+      // funnelBlockedBy, which would 409 every future share on its port.
       if (!committable()) {
         tailscale.stopFunnel(pid);
-        expiringFunnelPid = pid;
+        expiringFunnelPids.add(pid);
         proxy.close();
         throw abandoned(id, op);
       }
       proxies.set(id, proxy);
       proxyOwner.set(proxy, rec);
       markDefault();
-      rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true };
-      funnelSlot = { id, pid, pending: false };
+      rec.tunnel = { kind: 'tailscale', url, pid, proxyPort: proxy.port, auth: true, funnelPort };
+      funnelSlots.set(funnelPort, { id, pid, pending: false });
       // Past this point the funnel is up and recorded, so the slot names
       // reality: a later failure (persist, QR render) must NOT hand it back.
       committed = true;
       await persist();
 
       const authUrl = withToken(url, proxy.token);
-      return { kind: 'tailscale', url, auth: true, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
+      return { kind: 'tailscale', url, funnelPort, auth: true, authUrl, username: proxy.username, password: proxy.password, passwordIsDefault: defaultPasswordShares.has(id), qrSvg: await cachedQrSvg(id, { url, authUrl }) };
     } catch (e) {
       // Hand the slot back to whoever held it, if their funnel survived this
       // attempt: a refusal thrown BEFORE teardownShare (an unavailable daemon)
@@ -956,7 +982,12 @@ async function shareRecord(id, op, { mode, auth, tls }) {
       // old funnel is gone — torn down above, or it was never there — free it.
       // Once `committed`, neither applies: THIS flight's funnel is live and
       // recorded, so the slot already names reality and must be left alone.
-      if (!committed) funnelSlot = (prior && !prior.pending && state.pidAlive(prior.pid)) ? prior : null;
+      // Only this port's slot is touched: a slot this app holds on another
+      // port is released by its own funnel's teardown, or not at all.
+      if (!committed) {
+        if (prior && !prior.pending && state.pidAlive(prior.pid)) funnelSlots.set(funnelPort, prior);
+        else funnelSlots.delete(funnelPort);
+      }
       throw e;
     }
   }

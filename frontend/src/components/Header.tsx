@@ -1,11 +1,33 @@
-import { Badge } from '@/components/ui/badge';
+import { Badge, badgeVariants } from '@/components/ui/badge';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useHub } from '@/hub';
+import { funnelOccupancy } from '@/lib/funnelPorts';
+import type { FunnelPort } from '@/lib/types';
 
 const Availability = ({ name, available }: { name: string; available: boolean }) => (
   <Badge variant={available ? 'success' : 'outline'} title={`${name} availability`}>
     {available ? `${name} ✓` : `no ${name}`}
   </Badge>
 );
+
+/** Tailscale is available: how many Funnel ports are in use, listed per port on hover (`title`) and on tap/click. */
+function FunnelBadge({ funnelPorts }: { funnelPorts: FunnelPort[] }) {
+  const o = funnelOccupancy(funnelPorts);
+  const rows = o.rows.map((r) => r.text);
+  return (
+    <Popover>
+      <PopoverTrigger className={badgeVariants({ variant: 'success' })} title={rows.join("\n")}>
+        tailscale ✓ {o.label}
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-auto p-3">
+        <p className="mb-1 text-xs font-medium">Funnel ports</p>
+        <ul className="flex flex-col gap-0.5 font-mono text-xs">
+          {rows.map((text) => <li key={text}>{text}</li>)}
+        </ul>
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 export function Header() {
   const { data } = useHub();
@@ -20,7 +42,7 @@ export function Header() {
       {data && (
         <div className="flex gap-1.5">
           <Availability name="cloudflared" available={data.cloudflaredAvailable} />
-          <Availability name="tailscale" available={data.tailscaleAvailable} />
+          {data.tailscaleAvailable ? <FunnelBadge funnelPorts={data.funnelPorts} /> : <Availability name="tailscale" available={false} />}
         </div>
       )}
     </header>

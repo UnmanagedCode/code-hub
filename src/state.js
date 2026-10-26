@@ -7,7 +7,9 @@ import { storeRoot } from './projects.js';
 // stopped after its source/worktree has been deleted. Shape:
 //   { apps: { <id>: RunningRecord } }
 // RunningRecord = { id, project, path, isWorktree, branch, pid, pgid, port,
-//                   fixedPort, startedSha, startedAt, tunnel: {pid,url}|null }
+//                   fixedPort, startedSha, startedAt, tunnel: Tunnel|null }
+// Tunnel = { kind, url, pid, proxyPort, auth, ... } — per kind; a tailscale
+// share's is { kind: 'tailscale', url, pid, proxyPort, auth: true, funnelPort }.
 const STATE_FILENAME = 'state.json';
 
 function stateFile() {
@@ -65,10 +67,10 @@ export function pidAlive(pid) {
 // `strandedShares` is `[{ id, tunnel }]` for every share this drops or clears
 // whose child pid is still ALIVE. The record was the only thing holding that
 // pid, so after the delete no code-hub path could kill it — for a tailscale
-// funnel that means a public URL left serving 443 in front of a proxy that no
-// longer exists. This module can't kill them itself (it doesn't know a share's
-// kind, and must not grow a dependency on the integrations to find out), so it
-// hands them back and the caller tears them down. The invariant callers must
+// funnel that means a public URL left serving its Funnel port in front of a
+// proxy that no longer exists. This module can't kill them itself (it doesn't
+// know a share's kind, and must not grow a dependency on the integrations to
+// find out), so it hands them back and the caller tears them down. The invariant callers must
 // uphold: no path drops a record carrying a LIVE share pid without first
 // killing it.
 export async function reconcile(state) {

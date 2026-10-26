@@ -2,9 +2,9 @@ import { expect, test } from 'vitest';
 import {
   resolveOpenUrl, resolveQrSvg, mergeSharePatch, resolveFixedPortNotice, resolveCredNote,
   PASSWORD_MASK, credRowValues, pruneDrafts, credDraftFor, credPasswordPlaceholder, credPatchBody, credFieldsShown,
-  resolveTlsReshareNote, sharePanelView, shareModes, tlsChanging, qrImageSrc, resolveLanReachNotice, qrUseful,
+  resolveTlsReshareNote, sharePanelView, shareModes, shareChooserModes, tlsChanging, qrImageSrc, resolveLanReachNotice, qrUseful,
 } from './shareState';
-import type { App, RelayInfo, ShareState, Tunnel } from './types';
+import type { App, FunnelPort, RelayInfo, ShareState, Tunnel } from './types';
 import { app } from '@/test/fixtures';
 
 // These cover the client behaviors the server tests can't: how the share panel
@@ -138,6 +138,12 @@ test('resolveCredNote: a tailscale share names Tailscale, never "via public tunn
   expect(note).toMatch(/Tailscale Funnel/);
 });
 
+// Invariant: a tailscale share's note names its Funnel port, so a share on 8443 isn't mistaken for the default.
+test('resolveCredNote: a tailscale share with a funnelPort names the port', () => {
+  expect(resolveCredNote({ kind: 'tailscale', url: 'https://node.tailnet.ts.net:8443', auth: true, funnelPort: 8443 })).toMatch(/port 8443/);
+  expect(resolveCredNote({ kind: 'tailscale', url: 'https://node.tailnet.ts.net', auth: true, funnelPort: 443 })).toMatch(/port 443/);
+});
+
 test('resolveCredNote: a cloudflared tunnel share still reads "via public tunnel"', () => {
   expect(resolveCredNote({ kind: 'tunnel', url: 'https://x.trycloudflare.com', auth: true })).toBe('via public tunnel');
   // Kind absent (a pre-kind share response) keeps the historical default.
@@ -239,7 +245,7 @@ const appWith = (tunnel: Tunnel | null, port?: number, auto: Pick<App, 'autoShar
 // Invariant: the picker beats everything, then a share in flight, then a failed share — even over a
 // live app.tunnel, so the failure is seen — then nothing, and only then the live share.
 test('sharePanelView: choosing > loading > error (over a live tunnel) > none > active', () => {
-  expect(sharePanelView({ choosing: true }, appWith(LIVE), false)).toStrictEqual({ view: 'choosing' });
+  expect(sharePanelView({ choosing: true }, appWith(LIVE), false)).toStrictEqual({ view: 'choosing', funnel: false });
   expect(sharePanelView('loading', appWith(LIVE), false)).toStrictEqual({ view: 'loading' });
   expect(sharePanelView({ error: 'boom' }, appWith(LIVE), false)).toStrictEqual({ view: 'error', error: 'boom' });
   expect(sharePanelView(undefined, appWith(null), false)).toStrictEqual({ view: 'none' });
@@ -256,7 +262,7 @@ test('sharePanelView: autoPending and autoFailed precedence', () => {
   expect(sharePanelView(undefined, appWith(LIVE, undefined, failed), false).view).toBe('active');
   expect(sharePanelView({ error: 'boom' }, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'error', error: 'boom' });
   expect(sharePanelView('loading', appWith(null, undefined, failed), false)).toStrictEqual({ view: 'loading' });
-  expect(sharePanelView({ choosing: true }, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'choosing' });
+  expect(sharePanelView({ choosing: true }, appWith(null, undefined, pending), false)).toStrictEqual({ view: 'choosing', funnel: false });
 });
 
 // Invariant: the share response alone (no app.tunnel yet) is enough to show the live share, and its
@@ -422,3 +428,21 @@ test('sharePanelView: nulls qrSvg for a container-internal share and carries the
   expect(relayed.reachNotice?.level).toBe('note');
 });
 
+
+// Invariant: the picker disables tailscale exactly when every Funnel port is held by ANOTHER app — a port this app
+// holds stays a choice (a re-share) — and an unavailable tailscale keeps its own reason.
+test('shareChooserModes: tailscale is disabled only when every Funnel port is held by another app', () => {
+  const held = (holders: (string | null)[]): FunnelPort[] => [443, 8443, 10000].map((port, i) => ({ port, holder: holders[i] }));
+  const tailscale = (ports: FunnelPort[], available = true) => shareChooserModes(true, available, ports, 'me').find((m) => m.mode === 'tailscale')!.disabledReason;
+  expect(tailscale(held(['a', 'b', 'c']))).toBe('all Funnel ports in use');
+  expect(tailscale(held(['a', 'b', 'me']))).toBe(null);
+  expect(tailscale(held(['a', null, 'c']))).toBe(null);
+  expect(tailscale(held(['a', 'b', 'c']), false)).toBe('tailscale not available');
+  expect(shareChooserModes(true, true, held(['a', 'b', 'c']), 'me').filter((m) => m.mode !== 'tailscale')).toStrictEqual(shareModes(true, true).filter((m) => m.mode !== 'tailscale'));
+});
+
+// Invariant: the picker state carries whether its Funnel port row is open.
+test('sharePanelView: choosing reports whether the Funnel port row is open', () => {
+  expect(sharePanelView({ choosing: true, funnel: true }, appWith(null), false)).toStrictEqual({ view: 'choosing', funnel: true });
+  expect(sharePanelView({ choosing: true }, appWith(null), false)).toStrictEqual({ view: 'choosing', funnel: false });
+});

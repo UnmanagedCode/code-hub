@@ -2,7 +2,8 @@
 // and the auth-off merge are unit-testable without rendering. No dependencies,
 // no DOM access.
 
-import type { App, AppSettings, CredDraft, ShareKind, SharePatch, ShareState, Tunnel } from './types';
+import { funnelPortChoices } from './funnelPorts';
+import type { App, AppSettings, CredDraft, FunnelPort, ShareKind, SharePatch, ShareState, Tunnel } from './types';
 
 // The panel draws from two sources: `s` = the UI's share state for the app (the
 // one-time share() response, in-memory only — wiped on a full UI refresh) and
@@ -144,7 +145,9 @@ export function qrUseful(shared: Partial<Tunnel> | null | undefined): boolean {
 // through to the tunnel wording, which is the default for a share without a kind.
 export function resolveCredNote(shared: Partial<Tunnel>): string {
   const kind = (shared && shared.kind) || 'tunnel';
-  if (kind === 'tailscale') return 'via Tailscale Funnel — public URL';
+  if (kind === 'tailscale') {
+    return typeof shared.funnelPort === 'number' ? `via Tailscale Funnel · port ${shared.funnelPort} — public URL` : 'via Tailscale Funnel — public URL';
+  }
   if (kind !== 'lan') return 'via public tunnel';
   const authEnabled = shared.auth !== false;
   const lanTls = String(shared.url).startsWith('https:');
@@ -251,8 +254,18 @@ export function shareModes(cloudflaredAvailable: boolean, tailscaleAvailable: bo
   ];
 }
 
+// The share picker's modes for `appId`: `shareModes`, plus tailscale disabled
+// when every Funnel port is held by another app. Tailscale being unavailable
+// is the reason shown when both apply.
+export function shareChooserModes(cloudflaredAvailable: boolean, tailscaleAvailable: boolean, funnelPorts: FunnelPort[], appId: string): ShareMode[] {
+  const allHeld = funnelPortChoices(funnelPorts, appId).every((c) => c.disabledReason !== null);
+  return shareModes(cloudflaredAvailable, tailscaleAvailable).map((m) =>
+    m.mode === 'tailscale' && !m.disabledReason && allHeld ? { ...m, disabledReason: 'all Funnel ports in use' } : m);
+}
+
 export type SharePanelView =
-  | { view: 'choosing' }
+  /** The mode picker; `funnel` when its Funnel port row is open. */
+  | { view: 'choosing'; funnel: boolean }
   | { view: 'loading' }
   | { view: 'error'; error: string }
   /** An auto-share is running for this app's latest start. */
@@ -282,7 +295,7 @@ export type SharePanelView =
 // the live share, an auto-share in flight, a failed auto-share, or nothing.
 // `editing` is whether the app's Edit form is open.
 export function sharePanelView(s: ShareState | undefined, app: Pick<App, 'tunnel' | 'port' | 'autoShareStatus' | 'autoShareError'>, editing: boolean): SharePanelView {
-  if (s && typeof s === 'object' && 'choosing' in s) return { view: 'choosing' };
+  if (s && typeof s === 'object' && 'choosing' in s) return { view: 'choosing', funnel: !!s.funnel };
   if (s === 'loading') return { view: 'loading' };
   const shared = app.tunnel || (s && typeof s === 'object' && 'url' in s && s.url ? s : null);
   if (s && typeof s === 'object' && 'error' in s && s.error) return { view: 'error', error: s.error };

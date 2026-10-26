@@ -32,7 +32,7 @@ export const fakeTailscaleBin = path.join(FIXTURES, 'fake-tailscale.mjs');
 // a funnel before signalling it (pids can be recycled across a reboot), so a
 // generic process would — correctly — not be killed.
 export function spawnFakeFunnel(port = 39999, env = {}) {
-  return spawn(fakeTailscaleBin, ['funnel', '--bg=false', '--yes', `http://localhost:${port}`],
+  return spawn(fakeTailscaleBin, ['funnel', '--bg=false', '--yes', '--https=443', `http://localhost:${port}`],
     { detached: true, stdio: 'ignore', env: { ...process.env, ...env } });
 }
 
@@ -68,6 +68,11 @@ export function altLoopbackBindable() {
 // The file is complete before PROJECTS_ROOT names the root — a late callback of
 // the previous test (an app exit, a settle) may read the hub settings at any
 // await — and the settings cache is dropped once it does.
+//
+// Every fake tailscale funnel spawned while this root is current shares its
+// FAKE_TAILSCALE_PORT_DIR (see the fixture), so one funnel per Funnel port is
+// enforced per test, as tailscaled enforces it per node — and a funnel a
+// previous test left exiting can't hold a port in this one.
 export async function mkRoot({ bridgeFallback = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-test-'));
   if (!bridgeFallback) {
@@ -78,9 +83,15 @@ export async function mkRoot({ bridgeFallback = false } = {}) {
     await fs.rename(tmp, path.join(store, HUB_SETTINGS_FILENAME));
   }
   process.env.PROJECTS_ROOT = root;
+  process.env.FAKE_TAILSCALE_PORT_DIR = fakeTailscalePortDir(root);
   hubSettings._reset();
   return root;
 }
+
+// The fake tailscale's per-port claim dir for `root` (a dot-dir, so discovery
+// never lists it). Write a live pid into `<dir>/<port>` to hold that Funnel
+// port outside code-hub.
+export const fakeTailscalePortDir = (root) => path.join(root, '.fake-tailscale-ports');
 
 export async function rmRoot(root) {
   await fs.rm(root, { recursive: true, force: true });

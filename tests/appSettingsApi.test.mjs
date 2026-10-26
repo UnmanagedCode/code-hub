@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import https from 'node:https';
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
@@ -317,6 +318,47 @@ test('PUT then GET round-trips autoStart and autoShare; neither GET nor the list
   assert.ok(!JSON.stringify((await j(base, 'GET', '/api/apps')).body).includes('pw-secret'));
   assert.equal((await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tunnel', auth: false } })).status, 400);
   assert.deepEqual((await j(base, 'GET', '/api/apps/app/settings')).body, want);
+});
+
+const readStored = async () => JSON.parse(await fs.readFile(appSettings.appSettingsFile(), 'utf8'));
+
+// Invariant: a tailscale autoShare is stored with its Funnel port — the one
+// given, else the default 443 — and the endpoint reports what was stored.
+test('PUT autoShare tailscale stores funnelPort; omitted stores 443', async (t) => {
+  const { base } = await setup(t, { running: false });
+  const put = await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale', funnelPort: 8443 } });
+  assert.equal(put.status, 200);
+  assert.deepEqual(put.body.autoShare, { mode: 'tailscale', auth: true, funnelPort: 8443 });
+  assert.deepEqual((await readStored()).app.autoShare, { mode: 'tailscale', auth: true, funnelPort: 8443 });
+
+  const dflt = await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale' } });
+  assert.deepEqual(dflt.body.autoShare, { mode: 'tailscale', auth: true, funnelPort: 443 });
+  assert.deepEqual((await readStored()).app.autoShare, { mode: 'tailscale', auth: true, funnelPort: 443 });
+});
+
+// Invariant: a funnelPort outside the Funnel ports is refused before the file
+// is touched.
+test('an invalid autoShare funnelPort → 400, file untouched', async (t) => {
+  const { base } = await setup(t, { running: false });
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale', funnelPort: 10000 } });
+  const before = await fs.readFile(appSettings.appSettingsFile(), 'utf8');
+  for (const funnelPort of [8080, '443', null]) {
+    const res = await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale', funnelPort } });
+    assert.equal(res.status, 400, JSON.stringify(funnelPort));
+    assert.match(res.body.error, /'funnelPort' must be one of/);
+  }
+  assert.equal(await fs.readFile(appSettings.appSettingsFile(), 'utf8'), before);
+});
+
+// Invariant: an entry stored before tailscale auto-shares carried a port reads
+// as 443 in the listing and the settings endpoint alike.
+test('the listing describes a stored tailscale autoShare with no funnelPort as 443', async (t) => {
+  const { base } = await setup(t, { running: false });
+  await fs.mkdir(path.dirname(appSettings.appSettingsFile()), { recursive: true });
+  await fs.writeFile(appSettings.appSettingsFile(), JSON.stringify({ app: { autoShare: { mode: 'tailscale', auth: true } } }));
+  const want = { mode: 'tailscale', auth: true, funnelPort: 443 };
+  assert.deepEqual((await getApp(base)).settings.autoShare, want);
+  assert.deepEqual((await j(base, 'GET', '/api/apps/app/settings')).body.autoShare, want);
 });
 
 // Invariant: the toggles are main-checkout-only and refused for a worktree

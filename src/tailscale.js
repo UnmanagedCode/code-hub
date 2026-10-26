@@ -49,31 +49,35 @@ export async function available({ timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return typeof s?.Self?.DNSName === 'string' && s.Self.DNSName !== '';
 }
 
-// Publish localhost:<port> on the node's Tailscale Funnel and resolve once the
-// funnel is live. Returns { url, pid } — the caller persists the pid and tears
-// it down via stopFunnel.
+// Publish localhost:<port> on the node's Tailscale Funnel, on public port
+// `funnelPort` (one of shareOptions.FUNNEL_PORTS), and resolve once the funnel
+// is live. Returns { url, pid } — the caller persists the pid and tears it down
+// via stopFunnel.
 //
 // The URL is DERIVED from `tailscale status --json`, never scraped from the
 // CLI's output: a wording change in tailscale's banner can then only cost us a
-// readiness timeout with a clear message, never a wrong URL.
+// readiness timeout with a clear message, never a wrong URL. Port 443 is the
+// scheme default and carries no suffix; any other port appears in the URL.
 //
 // The process runs in the FOREGROUND (`--bg=false`, tailscale's own default).
-// That is what makes teardown "kill the process": the CLI owns the funnel
-// config for its own lifetime and removes it on exit, so there is no
-// off-command to run. `tailscale funnel reset` would clear the user's
-// unrelated `serve` config too, and a targeted `off` isn't in 1.102.3's help.
-// The flag is passed explicitly so a future default flip can't silently
-// background us. `--yes` keeps a non-TTY spawn from blocking on a prompt.
-export function startFunnel(port) {
+// That is what makes teardown "kill the process": each foreground CLI holds its
+// own session's entry in the node's serve config, and removes only that entry
+// on exit, so there is no off-command to run and funnels on different ports
+// coexist. `tailscale funnel reset` would clear the user's unrelated `serve`
+// config too. The flag is passed explicitly so a future default flip can't
+// silently background us. `--yes` keeps a non-TTY spawn from blocking on a
+// prompt. `--https` is passed even for 443 (the CLI's default), so the port is
+// always the one asked for.
+export function startFunnel(port, funnelPort) {
   return new Promise((resolve, reject) => {
     magicDnsName().then((name) => {
       if (!name) {
         return reject(new Error("tailscale is not ready — 'tailscale status' reports no MagicDNS name for this node"));
       }
-      const url = `https://${name}`;
+      const url = `https://${name}${funnelPort === 443 ? '' : `:${funnelPort}`}`;
       let proc;
       try {
-        proc = spawn(bin(), ['funnel', '--bg=false', '--yes', `http://localhost:${port}`], {
+        proc = spawn(bin(), ['funnel', '--bg=false', '--yes', `--https=${funnelPort}`, `http://localhost:${port}`], {
           detached: true,
           stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -102,9 +106,10 @@ export function startFunnel(port) {
       // that vanished between the two calls, resource exhaustion).
       proc.on('error', (e) => finish(reject, new Error(
         e.code === 'ENOENT' ? 'tailscale binary not found in PATH' : e.message)));
-      // The funnel being refused (ACL/nodeAttr missing, HTTPS off, 443 already
-      // funnelled outside code-hub) surfaces only as a nonzero exit, so carry
-      // tailscale's own words rather than inventing a cause.
+      // The funnel being refused (ACL/nodeAttr missing, HTTPS off, the Funnel
+      // port already served outside code-hub, or not allowed by the tailnet)
+      // surfaces only as a nonzero exit, so carry tailscale's own words rather
+      // than inventing a cause.
       proc.on('exit', (code) => finish(reject, new Error(
         `tailscale funnel exited (code=${code}) before the funnel came up: ${out.trim().split('\n')[0] || '(no output)'}`)));
 
@@ -151,9 +156,10 @@ export function stopFunnel(pid) {
 }
 
 // Wait for a SIGTERMed funnel child to actually be GONE, SIGKILLing the group
-// if it overstays. Callers need this because the CLI reverts the node's whole
-// serve config when it exits: spawning a replacement while the old one is
-// still shutting down means the old one's exit can revoke the new one's URL.
+// if it overstays. The CLI removes only its own session's serve config on
+// exit, but until it does tailscaled still holds that session's Funnel port
+// and refuses a new funnel on it — so a replacement spawned while the old one
+// is still shutting down fails instead of coming up.
 // Polls rather than awaiting an exit event — after a code-hub restart the
 // child is ours only by pid, there is no ChildProcess to listen to.
 export async function waitForExit(pid, { timeoutMs = EXIT_TIMEOUT_MS, intervalMs = 25 } = {}) {

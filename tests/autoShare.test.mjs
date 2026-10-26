@@ -104,27 +104,65 @@ test('MCP start_app on a ticked app shares it', async (t) => {
   assert.equal((await getApp(base)).tunnel?.kind, 'lan');
 });
 
-// Invariant: a funnel held by another app makes the auto-share fail visibly,
-// naming the holder, while the start stands and the holder's share is untouched.
+// Invariant: a Funnel port held by another app makes an auto-share onto that
+// port fail visibly, naming the holder and the port, while the start stands
+// and the holder's share is untouched.
 test('auto-share into a held tailscale funnel fails visibly; the start and the holder are unaffected', async (t) => {
   quiet(t);
   const { base } = await boot(t, ['holder', 'app']);
   await j(base, 'POST', '/api/apps/holder/start');
   await settled(base, 'holder');
-  assert.equal((await j(base, 'POST', '/api/apps/holder/share', { mode: 'tailscale' })).status, 200);
+  assert.equal((await j(base, 'POST', '/api/apps/holder/share', { mode: 'tailscale', funnelPort: 8443 })).status, 200);
   const held = (await getApp(base, 'holder')).tunnel;
 
-  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale' } });
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale', funnelPort: 8443 } });
   await j(base, 'POST', '/api/apps/app/start');
   await settled(base);
   const app = await getApp(base);
   assert.ok(['ready', 'running'].includes(app.status));
   assert.equal(app.tunnel, null);
   assert.equal(app.autoShareStatus, 'failed');
-  assert.match(app.autoShareError, /'holder' already has a tailscale share/);
+  assert.match(app.autoShareError, /'holder' already has a tailscale share on Funnel port 8443/);
   const after = (await getApp(base, 'holder')).tunnel;
   assert.equal(after.url, held.url);
   assert.equal(after.proxyPort, held.proxyPort);
+});
+
+// Invariant: an auto-share runs on its stored Funnel port, so it succeeds
+// beside another app's tailscale share on a different port.
+test('an auto-share on a free Funnel port succeeds while another app holds a different one', async (t) => {
+  const { base } = await boot(t, ['holder', 'app']);
+  await j(base, 'POST', '/api/apps/holder/start');
+  await settled(base, 'holder');
+  assert.equal((await j(base, 'POST', '/api/apps/holder/share', { mode: 'tailscale', funnelPort: 443 })).status, 200);
+
+  await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'tailscale', funnelPort: 10000 } });
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const app = await getApp(base);
+  assert.equal(app.autoShareStatus, null);
+  assert.equal(app.tunnel?.kind, 'tailscale');
+  assert.equal(app.tunnel.funnelPort, 10000);
+  assert.equal(app.tunnel.url, 'https://fake-node.example-tailnet.ts.net:10000');
+  assert.equal((await getApp(base, 'holder')).tunnel.funnelPort, 443);
+});
+
+// Invariant: a stored tailscale autoShare without a funnelPort (written before
+// the field existed) shares on 443, and reading it never rewrites the file.
+test('a stored tailscale autoShare with no funnelPort auto-shares on 443 and the settings file is not rewritten', async (t) => {
+  const { base } = await boot(t);
+  await fs.mkdir(storeRoot(), { recursive: true });
+  const file = path.join(storeRoot(), 'app-settings.json');
+  await fs.writeFile(file, JSON.stringify({ app: { autoShare: { mode: 'tailscale', auth: true } } }, null, 2), { mode: 0o600 });
+  const before = await fs.readFile(file);
+
+  await j(base, 'POST', '/api/apps/app/start');
+  await settled(base);
+  const app = await getApp(base);
+  assert.equal(app.tunnel?.kind, 'tailscale');
+  assert.equal(app.tunnel.funnelPort, 443);
+  assert.equal(app.tunnel.url, 'https://fake-node.example-tailnet.ts.net');
+  assert.deepEqual(await fs.readFile(file), before, 'the stored entry is byte-for-byte unchanged');
 });
 
 // Invariant: a share never runs against an app that did not become ready; the

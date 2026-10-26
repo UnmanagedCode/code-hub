@@ -34,6 +34,10 @@ export function mainCheckoutSettingsAllowed(app: Pick<App, 'isWorktree' | 'alway
 export const MIN_FIXED_PORT = 1024;
 export const MAX_FIXED_PORT = 65535;
 
+// The server's default is `DEFAULT_FUNNEL_PORT` in `src/shareOptions.js`; the list of Funnel ports comes from the
+// listing (`funnelPorts`).
+export const DEFAULT_FUNNEL_PORT = 443;
+
 export interface SettingsDraft {
   username: string;
   /** Typed to replace the stored password; blank keeps it. */
@@ -45,6 +49,8 @@ export interface SettingsDraft {
   /** LAN only, like `tls`. */
   auth: boolean;
   tls: boolean;
+  /** Tailscale only. */
+  funnelPort: number;
   /** The fixed port as typed; blank clears it. */
   port: string;
 }
@@ -69,6 +75,7 @@ export function settingsDraftFor(app: Pick<App, 'settings'>): SettingsDraft {
     mode: s.autoShare?.mode ?? 'lan',
     auth: s.autoShare?.auth ?? true,
     tls: s.autoShare?.tls ?? true,
+    funnelPort: s.autoShare?.funnelPort ?? DEFAULT_FUNNEL_PORT,
     port: s.port === null ? '' : String(s.port),
   };
 }
@@ -103,7 +110,7 @@ export function portNote(app: Pick<App, 'status' | 'port'>): string | null {
 }
 
 const sameAutoShare = (a: AutoShare, b: AutoShare | null) =>
-  !!b && a.mode === b.mode && a.auth === b.auth && (a.tls ?? null) === (b.tls ?? null);
+  !!b && a.mode === b.mode && a.auth === b.auth && (a.tls ?? null) === (b.tls ?? null) && (a.funnelPort ?? null) === (b.funnelPort ?? null);
 
 /**
  * The PUT body for what the draft changed, or null when nothing did. Both login fields are sent trimmed, as the server
@@ -127,11 +134,37 @@ export function settingsPatch(draft: SettingsDraft, app: Pick<App, 'settings' | 
   if (v.autoShare) {
     if (draft.autoShare) {
       const lan = draft.mode === 'lan';
-      const want: AutoShare = { mode: draft.mode, auth: lan ? draft.auth : true, ...(lan ? { tls: draft.tls } : {}) };
+      const want: AutoShare = {
+        mode: draft.mode,
+        auth: lan ? draft.auth : true,
+        ...(lan ? { tls: draft.tls } : {}),
+        ...(draft.mode === 'tailscale' ? { funnelPort: draft.funnelPort } : {}),
+      };
       if (!sameAutoShare(want, s.autoShare)) body.autoShare = want;
     } else if (s.autoShare) {
       body.autoShare = null;
     }
   }
   return Object.keys(body).length ? body : null;
+}
+
+/**
+ * The warning shown while the draft auto-shares via tailscale on a Funnel port another app also auto-shares on, or
+ * null. Only the first of them to start gets the port. Never blocks Save.
+ */
+export function autoShareClashWarning(
+  draft: Pick<SettingsDraft, 'autoShare' | 'mode' | 'funnelPort'>,
+  app: Pick<App, 'id'>,
+  apps: Pick<App, 'id' | 'settings'>[],
+): string | null {
+  if (!draft.autoShare || draft.mode !== 'tailscale') return null;
+  const clashing = apps
+    .filter((a) => a.id !== app.id && a.settings.autoShare?.mode === 'tailscale' && a.settings.autoShare.funnelPort === draft.funnelPort)
+    .map((a) => `'${a.id}'`);
+  if (!clashing.length) return null;
+  const who = clashing.join(', ');
+  const one = clashing.length === 1;
+  const verb = one ? 'also auto-shares' : 'also auto-share';
+  const losers = one ? "the other's auto-share fails" : "the others' auto-shares fail";
+  return `${who} ${verb} on Funnel port ${draft.funnelPort} — only the first to start gets it; ${losers}.`;
 }

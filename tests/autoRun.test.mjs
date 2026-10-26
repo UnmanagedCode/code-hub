@@ -41,7 +41,7 @@ test('settled crashed → no share → failed with the not-ready message', async
 test('a rejecting share marks failed with its message, and run resolves', async (t) => {
   quiet(t);
   const gen = autoRun.begin('held', { autoShare: true });
-  const msg = "'other' already has a tailscale share — Tailscale Funnel occupies port 443 machine-wide";
+  const msg = "'other' already has a tailscale share on Funnel port 443 — unshare it, or share on another port";
   const p = autoRun.run({ id: 'held', gen, settled: Promise.resolve('ready'), isCurrent: () => true, readConfig: async () => CFG, share: async () => { throw Object.assign(new Error(msg), { statusCode: 409 }); } });
   await assert.doesNotReject(p);
   assert.equal(autoRun.view('held').autoShareStatus, 'failed');

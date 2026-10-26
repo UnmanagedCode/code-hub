@@ -171,15 +171,56 @@ describe('Settings dialog', () => {
   });
 
   // Invariant: Save sends exactly the helper's patch in one PUT, then reloads the listing and closes.
-  it('tick auto-share, choose tailscale, Save → one PUT {autoShare:{mode:"tailscale",auth:true}}, a reload, closed', async () => {
+  it('tick auto-share, choose tailscale, Save → one PUT {autoShare:{mode:"tailscale",auth:true,funnelPort:443}}, a reload, closed', async () => {
     const { user, dialog, calls } = await openSettings([app({ id: 'web' })]);
     await user.click(within(dialog).getByRole('checkbox', { name: 'Share automatically when started' }));
     await user.click(within(dialog).getByRole('radio', { name: 'tailscale' }));
     const before = gets(calls);
     await user.click(within(dialog).getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-    expect(puts(calls)).toStrictEqual([{ method: 'PUT', url: 'api/apps/web/settings', body: { autoShare: { mode: 'tailscale', auth: true } } }]);
+    expect(puts(calls)).toStrictEqual([{ method: 'PUT', url: 'api/apps/web/settings', body: { autoShare: { mode: 'tailscale', auth: true, funnelPort: 443 } } }]);
     expect(gets(calls)).toBe(before + 1);
+  });
+
+  // Invariant: a tailscale auto-share offers one radio per Funnel port the listing reports, defaulting to :443, and
+  // the chosen port reaches the body.
+  it('choosing tailscale shows Funnel port radios defaulting to :443; picking :8443 saves funnelPort 8443', async () => {
+    const { user, dialog, calls } = await openSettings([app({ id: 'web' })]);
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Share automatically when started' }));
+    await user.click(within(dialog).getByRole('radio', { name: 'tailscale' }));
+    const group = within(dialog).getByRole('radiogroup', { name: 'Funnel port' });
+    const radios = within(group).getAllByRole('radio') as HTMLInputElement[];
+    expect(radios.map((r) => [r.labels?.[0]?.textContent, r.checked])).toStrictEqual([[':443', true], [':8443', false], [':10000', false]]);
+    await user.click(within(group).getByRole('radio', { name: ':8443' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(puts(calls)).toHaveLength(1));
+    expect(puts(calls)[0].body).toStrictEqual({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 8443 } });
+  });
+
+  // Invariant: picking a Funnel port another app auto-shares on warns, naming that app, while it is picked — and
+  // never blocks Save.
+  it('a port another app auto-shares on shows the inline warning naming it; Save still PUTs and closes', async () => {
+    const other = app({ id: 'api', settings: settings({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 8443 } }) });
+    const { user, dialog, calls } = await openSettings([app({ id: 'web' }), other]);
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Share automatically when started' }));
+    await user.click(within(dialog).getByRole('radio', { name: 'tailscale' }));
+    expect(within(dialog).queryByRole('alert')).toBeNull();
+    await user.click(within(dialog).getByRole('radio', { name: ':8443' }));
+    expect(within(dialog).getByRole('alert').textContent).toContain("'api'");
+    await user.click(within(dialog).getByRole('radio', { name: ':10000' }));
+    expect(within(dialog).queryByRole('alert')).toBeNull();
+    await user.click(within(dialog).getByRole('radio', { name: ':8443' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(puts(calls)).toStrictEqual([{ method: 'PUT', url: 'api/apps/web/settings', body: { autoShare: { mode: 'tailscale', auth: true, funnelPort: 8443 } } }]);
+  });
+
+  // Invariant: the Funnel port belongs to a tailscale auto-share only.
+  it('LAN shows no Funnel port radios', async () => {
+    const { user, dialog } = await openSettings([app({ id: 'web' })]);
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Share automatically when started' }));
+    expect((within(dialog).getByRole('radio', { name: 'LAN' }) as HTMLInputElement).checked).toBe(true);
+    expect(within(dialog).queryByRole('radiogroup', { name: 'Funnel port' })).toBeNull();
   });
 
   // Invariant: a LAN auto-share offers Authentication and TLS, and the TLS choice reaches the body.
