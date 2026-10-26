@@ -71,6 +71,18 @@ describe('content renders as text', () => {
   });
 });
 
+describe('route URLs', () => {
+  // Invariant: the backend decides the primary URL — here the bridge address — and the card opens it as given,
+  // listing only the other addresses beside it.
+  it('Open goes to the listing\'s first URL, and the rest show as secondary links', () => {
+    renderCard(app({ id: 'web', status: 'ready', routes: [{ name: 'Main', path: '/', urls: ['http://172.17.0.2:5000/', 'http://10.0.0.5:5000/'] }] }));
+    const routes = screen.getByRole('list', { name: 'Routes' });
+    expect(within(routes).getByRole('link', { name: 'Open' }).getAttribute('href')).toBe('http://172.17.0.2:5000/');
+    const hrefs = within(routes).getAllByRole('link').map((a) => a.getAttribute('href'));
+    expect(hrefs.filter((h) => h !== 'http://172.17.0.2:5000/')).toEqual(['http://10.0.0.5:5000/']);
+  });
+});
+
 describe('share panel', () => {
   const shared = (over: Partial<App> = {}) => app({
     id: 'web', status: 'running',

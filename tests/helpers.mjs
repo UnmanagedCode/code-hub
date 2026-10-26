@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { WORKTREES_DIRNAME, storeRoot } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import * as appSettings from '../src/appSettings.js';
+import { HUB_SETTINGS_FILENAME } from '../src/hubSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -60,9 +61,16 @@ export function altLoopbackBindable() {
 }
 
 // Fresh temp projects root; sets PROJECTS_ROOT so all modules resolve to it.
-export async function mkRoot() {
+// The bridge-address fallback is turned off in it unless `bridgeFallback` is
+// true (then no hub-settings file is written, so the default applies): run in a
+// bridge container, an app's URLs would otherwise depend on the host's network.
+export async function mkRoot({ bridgeFallback = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-test-'));
   process.env.PROJECTS_ROOT = root;
+  if (!bridgeFallback) {
+    await fs.mkdir(storeRoot(), { recursive: true });
+    await fs.writeFile(path.join(storeRoot(), HUB_SETTINGS_FILENAME), JSON.stringify({ bridgeFallback: false }));
+  }
   return root;
 }
 

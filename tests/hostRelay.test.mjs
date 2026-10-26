@@ -6,7 +6,7 @@ import { promises as fs } from 'node:fs';
 import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
 import { _setTimings } from '../src/relaySession.js';
-import { _setContainerProbe, parseDefaultGateway } from '../src/net.js';
+import { _setContainerProbe, _setBridgeProbe, parseDefaultGateway } from '../src/net.js';
 import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor, relaySecret } from './helpers.mjs';
 import { startFakeRelay } from './fixtures/fake-relay.mjs';
 
@@ -22,12 +22,14 @@ async function setup(t, { timings } = {}) {
   const root = await mkRoot();
   await relayStore.ensureSecret();
   _setContainerProbe(() => true);
+  _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');
   relayStore._setHostPollMs(50);
   if (timings) _setTimings(timings);
   t.after(async () => {
     hostRelay.stop();
     _setContainerProbe(null);
+    _setBridgeProbe(null);
     hostRelay._setLoopbackDialHost(null);
     _setTimings(null);
     await rmRoot(root);

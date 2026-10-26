@@ -9,9 +9,11 @@ import * as state from './state.js';
 import * as runner from './runner.js';
 import * as tunnel from './tunnel.js';
 import * as tailscale from './tailscale.js';
-import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, localIPv4s, runningInContainer, bridgeOnlyLan } from './net.js';
+import { allocatePort, isPortFree, probeWildcardHold, enumerateUrls, localIPv4s, runningInContainer, bridgeOnlyLan, bridgeIPv4 } from './net.js';
 import * as hostRelay from './hostRelay.js';
 import * as loopbackMirror from './loopbackMirror.js';
+import * as bridgeForward from './bridgeForward.js';
+import * as hubSettings from './hubSettings.js';
 import { appUrls } from './appUrls.js';
 import { qrSvg } from './qr.js';
 import { headSha, currentBranch, lastCommitAt } from './git.js';
@@ -166,7 +168,7 @@ export async function init() {
     }
   }
   if (mutated) await persist();
-  else syncMirrors();
+  else syncExposures();
 }
 
 // THE authority for "which app holds the node's Tailscale Funnel". Funnel
@@ -287,39 +289,55 @@ function funnelBlockedBy(id) {
   return funnelSlot.id === id ? null : funnelSlot.id;
 }
 
-// The loopback mirror set is derived from the store each mutation persists:
-// every ready app but the always-on host conductor (code-hub never started
-// it). Also run when a start's readiness settles (see start()), when a child
-// exits (see runner.onExit below), so a crash drops its mirror without waiting
-// for a persist, and when a host client finds a mirrored port refusing. An
-// ADOPTED app (no child of ours to exit) that dies is noticed by either that
-// refusal or a listing (list() prunes its record, and the persist re-syncs).
+// The loopback mirror set and the bridge forwarder set are derived from the
+// store each mutation persists: every ready app but the always-on host
+// conductor (code-hub never started it). Also run when a start's readiness
+// settles (see start()), when a child exits (see runner.onExit below), so a
+// crash drops its exposures without waiting for a persist, when a host client
+// finds a mirrored port refusing, when a LAN share starts or ends without
+// committing (see shareNow), and when the hub settings change. An ADOPTED app
+// (no child of ours to exit) that dies is noticed by either that refusal or a
+// listing (list() prunes its record, and the persist re-syncs).
 async function persist() {
-  syncMirrors();
+  syncExposures();
   await state.save(store);
 }
 
-// Mirrored only once ready, never while starting: where the host's loopback is
+// Exposed only once ready, never while starting: where the host's loopback is
 // the app's own (a host-network container), a relay listener bound first would
-// take the app's port before the app could.
+// take the app's port before the app could — and a bridge forwarder bound first
+// would take the bridge address from an app about to bind 0.0.0.0.
 function appMirrorable(rec) {
   const rt = runner.runtime(rec.id);
   if (rt) return rt.status === 'ready';
   return state.pidAlive(rec.pid); // adopted after a restart: no runtime, already listening
 }
 
-function syncMirrors() {
-  loopbackMirror.sync(Object.values(store.apps)
-    .filter((rec) => !isHostConductorId(rec.id) && appMirrorable(rec))
-    .map((rec) => ({ id: rec.id, port: rec.port })), syncMirrors);
+// A LAN share holds the app's bridge address — committed, or in flight for
+// this very record — so its forwarder stands aside: a fixed-port LAN share
+// binds that address itself, gated. Tunnel and tailscale shares bind nothing
+// there and leave the forwarder up.
+function lanShared(rec) {
+  const op = sharing.get(rec.id);
+  return rec.tunnel?.kind === 'lan' || (!!op?.lan && op.rec === rec);
 }
 
-runner.onExit(() => syncMirrors());
+function syncExposures() {
+  const exposed = Object.values(store.apps).filter((rec) => !isHostConductorId(rec.id) && appMirrorable(rec));
+  loopbackMirror.sync(exposed.map((rec) => ({ id: rec.id, port: rec.port })), syncExposures);
+  // The forwarders don't depend on the relay: with a mirror up, only the
+  // Start URL moves to it (see appUrls).
+  const host = hubSettings.get().bridgeFallback ? bridgeIPv4() : null;
+  bridgeForward.sync(exposed.filter((rec) => !lanShared(rec)).map((rec) => ({ id: rec.id, port: rec.port })), host);
+}
+
+runner.onExit(() => syncExposures());
 
 // The URLs of a running app's route: through the host loopback mirror first
-// while there is one (see appUrls).
+// while there is one, else the bridge address while the app is reachable
+// there (see appUrls).
 function urlsFor(id, port, routePath = '/') {
-  return appUrls({ port, routePath, lanIps: localIPv4s(), hostLoopbackPort: loopbackMirror.hostPort(id) });
+  return appUrls({ port, routePath, lanIps: localIPv4s(), hostLoopbackPort: loopbackMirror.hostPort(id), bridgeHost: bridgeForward.urlHost(id) });
 }
 
 // Append the share token as a query param so opening/scanning the link
@@ -489,7 +507,7 @@ export async function list() {
   if (mutated) await persist();
 
   entries.sort((a, b) => a.id.localeCompare(b.id));
-  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), apps: entries };
+  return { cloudflaredAvailable: await tunnel.available(), tailscaleAvailable: await tailscale.available(), hubSettings: hubSettings.get(), apps: entries };
 }
 
 async function findDiscovered(id) {
@@ -559,7 +577,7 @@ export async function start(id) {
   // visible, so no listing can show it `starting` with nothing to wait on.
   store.apps[id] = rec;
   trackTransition(id, rec, { settled: proc.settled, wantsAutoShare, readConfig });
-  proc.settled.then(() => syncMirrors());
+  proc.settled.then(() => syncExposures());
   await persist();
   return { ...rec, urls: urlsFor(id, port) };
 }
@@ -669,7 +687,8 @@ export async function share(id, opts) {
   return result;
 }
 
-// id → the share in flight: { rec, cancelled, done } (see share()).
+// id → the share in flight: { rec, lan, cancelled, done } (see share());
+// `lan` keeps the app's bridge forwarder closed while it runs (see lanShared).
 const sharing = new Map();
 
 function abandoned(id, op) {
@@ -696,13 +715,19 @@ async function shareNow(id, { mode = 'tunnel', auth, tls } = {}) {
       await inFlight.done.catch(() => {}); // a stopped/replaced record's share, being abandoned
       continue;
     }
-    const op = { rec, cancelled: false, done: null };
+    const op = { rec, lan: mode === 'lan', cancelled: false, done: null };
     sharing.set(id, op); // before shareRecord's first await
+    // A LAN share closes the app's bridge forwarder before it binds anything:
+    // a fixed-port share binds that very address. server.close() releases the
+    // listening socket synchronously, so it is free by the share's first bind.
+    if (op.lan) syncExposures();
     op.done = shareRecord(id, op, { mode, auth, tls });
     try {
       return await op.done;
     } finally {
       if (sharing.get(id) === op) sharing.delete(id);
+      // One that didn't commit hands the address back to the forwarder.
+      if (op.lan) syncExposures();
     }
   }
 }
@@ -1078,6 +1103,13 @@ export async function setAppSettings(id, body) {
     e.statusCode = 400; throw e;
   }
   return { id, ...(await appSettings.update(id, body)) };
+}
+
+// The hub-wide settings (see hubSettings.js), applied to the forwarders at once.
+export async function setHubSettings(body) {
+  await hubSettings.update(body);
+  syncExposures();
+  return hubSettings.get();
 }
 
 export async function clearAppSettings(id) {

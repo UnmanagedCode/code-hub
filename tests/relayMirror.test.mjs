@@ -8,7 +8,8 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
-import { _setContainerProbe } from '../src/net.js';
+import { _setContainerProbe, _setBridgeProbe, _setLocalIPv4sProbe } from '../src/net.js';
+import * as bridgeForward from '../src/bridgeForward.js';
 import { unregisterInMemory } from '../src/projects.js';
 import {
   requirePython, startRelay, canConnect, waitFor, useConductorOverlay, resetConductorOverlay,
@@ -27,6 +28,7 @@ async function boot(t, { ids = ['app'], manifests = {}, advertise = '127.0.0.1',
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   _setContainerProbe(() => true);
+  _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');
   relayStore._setHostPollMs(50);
   const root = await mkRoot();
@@ -40,6 +42,7 @@ async function boot(t, { ids = ['app'], manifests = {}, advertise = '127.0.0.1',
     for (const id of ids) await appManager.stop(id).catch(() => {});
     hostRelay.stop();
     _setContainerProbe(null);
+    _setBridgeProbe(null);
     hostRelay._setLoopbackDialHost(null);
     server.close();
     await rmRoot(root);
@@ -256,4 +259,31 @@ test('M7: no mirror while starting; every readiness kind reaches ready and is mi
     assert.equal((await listedApp(base, id)).status, 'ready', id);
     assert.deepEqual(await get(await mirrorPort(base, id)), { status: 200, body: 'ok' }, id);
   }
+});
+
+// Invariant (bridge fallback): the mirror beats the bridge address for the
+// Start URL, and the forwarder doesn't depend on the relay — it stays bound
+// while the mirror is up, and when the relay goes the Start URL falls back to
+// it with no re-bind.
+test('M9: the mirror outranks the bridge forwarder, which outlives the relay unchanged', async (t) => {
+  if (!requirePython(t)) return;
+  if (process.platform !== 'linux' || !(await altLoopbackBindable())) { t.skip(`${ALT_LOOPBACK} is not a bindable loopback alias on this host (Linux configures all of 127/8)`); return; }
+  const { base, relay } = await boot(t);
+  _setLocalIPv4sProbe(() => [ALT_LOOPBACK]);
+  _setBridgeProbe(() => true);
+  t.after(() => { _setLocalIPv4sProbe(null); bridgeForward.reset(); });
+  await appManager.setHubSettings({ bridgeFallback: true });
+  const listenSpy = t.mock.method(net.Server.prototype, 'listen');
+  const bridgeBinds = () => listenSpy.mock.calls.filter((c) => c.arguments[1] === ALT_LOOPBACK).length;
+  await startApp();
+  const h = await mirrorPort(base);
+  const { port } = await listedApp(base);
+  assert.equal((await listedApp(base)).urls[0], `http://127.0.0.1:${h}`);
+  assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`));
+  assert.equal(bridgeBinds(), 1);
+  await relay.stop('SIGKILL');
+  await waitFor(async () => (await listedApp(base)).urls[0] === `http://${ALT_LOOPBACK}:${port}`, { timeout: 3000 });
+  assert.ok((await listeningAddrs(process.pid)).has(`${ALT_LOOPBACK}:${port}`));
+  assert.equal(bridgeBinds(), 1, 'never re-bound');
+  assert.deepEqual(await get(port, ALT_LOOPBACK), { status: 200, body: 'ok' });
 });

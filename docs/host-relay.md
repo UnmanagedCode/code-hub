@@ -16,6 +16,8 @@ In a bridge-networked container:
 
 Without a relay, a LAN share from such a container is flagged container-internal: the share panel warns and hides the QR (see `docs/features.md`). cloudflared and Tailscale Funnel shares don't need the relay. A code-hub that is **not** in a container never dials a relay.
 
+**Without a relay: the bridge-address fallback.** Out of the box, code-hub forwards each ready app from the container's bridge address at the app's own port (a plain in-process forwarder: no TLS, no login) and makes that the Start URL, `http://<bridge ip>:<port>`. A browser on the Docker host can open it **only where the host routes to the bridge network — in practice a native-Linux Docker host**; Docker Desktop (macOS, Windows) and remote Docker hosts can't reach it, so run the relay there. While the relay mirrors an app, the mirror's URL wins; the forwarder stays up underneath. A LAN share of the app closes its forwarder until it ends. Turn the fallback off in the toolbar's **Hub settings** (`PUT /api/hub-settings`, `docs/protocol.md` → "Hub settings"); details in `docs/protocol.md` → "Bridge-address fallback".
+
 ## Requirements
 
 - Python **3.9 or newer**, standard library only — nothing to `pip install`. macOS's Command Line Tools `python3` (3.9) is enough.
@@ -157,6 +159,7 @@ WantedBy=multi-user.target
 - **The secret lives in the container's store**, readable by code-hub's user and anything running as it.
 - **A `docker0` `--listen` is reachable from a LAN neighbour that adds a route** to it (the weak host model); there the challenge-response is the gate.
 - **Loopback mirrors have no login**: any local process or user on the host can reach a mirrored app, like any local dev server.
+- **The no-relay bridge-address fallback has no login either**, and it is reachable by anything that can route to the container's bridge network — the host and its other containers. It works only on a native-Linux Docker host in practice. Turn it off in **Hub settings** where that matters.
 - **The panel updates on Refresh**, not live.
 - **Untested in CI**: Docker Desktop's `host.docker.internal` → host loopback path on macOS/Windows, the `docker0` default and gateway fallback on a real native-Linux Docker host, a second real LAN device, and Ctrl-C on Windows.
 - **Python 3.9 compatibility is checked statically** (the tests parse the source for 3.7 syntax and scan for 3.10+ APIs); run the relay tests with `CODEHUB_PYTHON=python3.9` to check it for real.
