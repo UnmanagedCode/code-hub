@@ -109,7 +109,7 @@ test('real tailscale funnel: SIGTERM removes the funnel config', { skip: !runTs 
     assert.deepEqual(await funnelStatusJson(), before,
       'SIGTERM to the foreground funnel restored the node config exactly — no funnel left registered');
   } finally {
-    // This is the one place in the suite that can leave PUBLIC state behind.
+    // A failure here could leave a PUBLIC funnel up: kill it whatever happened.
     tailscale.stopFunnel(pid);
     proxy.close();
     app.close();

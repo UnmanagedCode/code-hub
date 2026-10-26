@@ -171,6 +171,9 @@ test('autoShareClashWarning: another app auto-sharing on the same Funnel port', 
   expect(text).toMatch(/'y'/);
   expect(text).not.toMatch(/'z'|'w'|'me'/);
   expect(text).toMatch(/8443/);
+  // One clashing app or several: the losing side is counted to match.
+  expect(text).toMatch(/the others' auto-shares fail/);
+  expect(autoShareClashWarning(draft, me, [me, ts('x', 8443)])).toMatch(/the other's auto-share fails/);
   expect(autoShareClashWarning(draft, me, [ts('me', 8443)])).toBe(null);
   expect(autoShareClashWarning({ ...draft, funnelPort: 10000 }, me, apps)).toBe(null);
   expect(autoShareClashWarning({ ...draft, mode: 'lan' }, me, apps)).toBe(null);

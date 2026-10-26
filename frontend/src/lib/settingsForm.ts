@@ -163,6 +163,8 @@ export function autoShareClashWarning(
     .map((a) => `'${a.id}'`);
   if (!clashing.length) return null;
   const who = clashing.join(', ');
-  const verb = clashing.length === 1 ? 'also auto-shares' : 'also auto-share';
-  return `${who} ${verb} on Funnel port ${draft.funnelPort} — only the first to start gets it; the other's auto-share will fail.`;
+  const one = clashing.length === 1;
+  const verb = one ? 'also auto-shares' : 'also auto-share';
+  const losers = one ? "the other's auto-share fails" : "the others' auto-shares fail";
+  return `${who} ${verb} on Funnel port ${draft.funnelPort} — only the first to start gets it; ${losers}.`;
 }

@@ -27,6 +27,12 @@
 //   exists (polled), so a test can act while a tailscale share is
 //   deterministically still coming up — with no timing involved.
 //
+// FAKE_TAILSCALE_EXIT_GATE_DIR: a SIGTERMed funnel holds its exit — and so its
+//   Funnel port claim (FAKE_TAILSCALE_PORT_DIR) — until `<dir>/<funnelPort>`
+//   exists (polled), so a test can act while a funnel on a given port is
+//   deterministically still exiting. Removing the dir releases every held
+//   exit (a test's root teardown can't strand one); a SIGKILL ends it at once.
+//
 // FAKE_TAILSCALE_ARGV_LOG: append one timestamped JSON line per invocation, and
 //   another when a funnel exits — so a test can assert WHICH port was funnelled
 //   and that a replacement funnel did not start before the old one was gone.
@@ -153,7 +159,12 @@ if (args[0] === 'funnel') {
   process.on('SIGTERM', () => {
     logEvent({ event: 'sigterm', argv: args });
     if (mode === 'ignore-sigterm') return;                 // only SIGKILL reaps it
-    if (mode === 'slow-exit') setTimeout(quit, 300); else quit();
+    const exitGate = process.env.FAKE_TAILSCALE_EXIT_GATE_DIR;
+    if (exitGate) {
+      const open = path.join(exitGate, String(funnelPort));
+      const poll = setInterval(() => { if (existsSync(open) || !existsSync(exitGate)) { clearInterval(poll); quit(); } }, 20);
+    } else if (mode === 'slow-exit') setTimeout(quit, 300);
+    else quit();
   });
 
   const announce = () => {
