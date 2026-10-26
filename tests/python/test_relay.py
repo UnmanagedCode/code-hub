@@ -490,8 +490,8 @@ class Rendezvous(unittest.TestCase):
 
 
 class StartupErrors(unittest.TestCase):
-    """A1: a rendezvous file the relay can't write, or a rendezvous dir it
-    can't create in the store, names the path and, for a permission failure,
+    """A1: a rendezvous file the relay can't write or read, or a rendezvous
+    dir it can't create in the store, names the path and, for a permission failure,
     says to run the relay as the owner; only a failed control bind is reported
     as "cannot listen"; any other OSError is reported as itself."""
 
@@ -618,12 +618,44 @@ class RendezvousFiles(unittest.TestCase):
         real_read = os.read
         with mock.patch.object(relay.os, "read", lambda fd, n: real_read(fd, min(n, 7))):
             self.assertEqual(relay.read_secret(self.dir), secret)
+
+    def test_growth_past_stat_is_read_no_further_than_the_bound(self):
+        """A file far larger than its fstat size said (it grew after the
+        check) is refused as oversize, and the reads never ask for or gather
+        more than maxRendezvousBytes + 1 bytes in total."""
+        limit = PROTOCOL["maxRendezvousBytes"] + 1
+        small = self.dir / "small"
+        small.write_text("{}", encoding="utf-8")
         big = self.dir / "big"
-        big.write_text("x" * (PROTOCOL["maxRendezvousBytes"] + 1), encoding="utf-8")
-        with mock.patch.object(relay.os, "fstat", lambda fd: os.stat(str(self.dir / RDV["hubFile"]))), \
-                mock.patch.object(relay.os, "read", lambda fd, n: real_read(fd, min(n, 7))), \
-                self.assertRaises(ValueError):
-            relay.read_small_file(big)  # a file that grew past its stat size is still bounded
+        big.write_text("x" * (PROTOCOL["maxRendezvousBytes"] * 64), encoding="utf-8")
+        real_read = os.read
+        asked, got = [], []
+
+        def chunked(fd, n):
+            asked.append(n)
+            data = real_read(fd, min(n, 7))
+            got.append(len(data))
+            return data
+
+        with mock.patch.object(relay.os, "fstat", lambda fd: os.stat(str(small))), \
+                mock.patch.object(relay.os, "read", chunked), \
+                self.assertRaises(ValueError) as caught:
+            relay.read_small_file(big)
+        self.assertIn("larger than", str(caught.exception))
+        self.assertGreater(len(asked), 1, "chunked: the read loop ran")
+        self.assertLessEqual(sum(got), limit)
+        self.assertTrue(all(n <= limit - sum(got[:i]) for i, n in enumerate(asked)), asked[-3:])
+
+    def test_host_json_is_0600_under_a_restrictive_umask(self):
+        """host.json is 0600 whatever the umask: under 0477 it stays readable
+        to the owner (code-hub, the same uid), not narrowed to write-only."""
+        old = os.umask(0o477)
+        try:
+            path = relay.write_host_json(self.dir, "127.0.0.1:7077", 4242)
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
+        self.assertEqual(json.loads(relay.read_small_file(path))["pid"], 4242)
 
 
 class FakeTransport:

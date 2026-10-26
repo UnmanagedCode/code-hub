@@ -348,7 +348,9 @@ export function frameStream(socket) {
         if (ended) return null;
         const left = deadline - Date.now();
         if (left <= 0) throw new Error('no frame within the timeout');
-        await new Promise((r) => { wake = r; setTimeout(r, left); });
+        let timer;
+        await new Promise((r) => { wake = r; timer = setTimeout(r, left); });
+        clearTimeout(timer);
         wake = null;
       }
     },

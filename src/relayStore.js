@@ -114,7 +114,16 @@ export async function ensureSecret() {
     const secret = crypto.randomBytes(SECRET_BYTES).toString('base64url');
     const tmp = path.join(dir, `.${HUB_FILE}.${process.pid}.tmp`);
     await fs.rm(tmp, { force: true });
-    await fs.writeFile(tmp, `${JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, secret })}\n`, { mode: 0o600, flag: 'wx' });
+    // Created exclusively, then set to 0600 on the open handle: the create mode
+    // is narrowed by the umask, and a restrictive one would leave the file
+    // unreadable to code-hub itself.
+    const handle = await fs.open(tmp, 'wx', 0o600);
+    try {
+      await handle.chmod(0o600);
+      await handle.writeFile(`${JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, secret })}\n`);
+    } finally {
+      await handle.close();
+    }
     await fs.rename(tmp, file);
     return secret;
   } catch (e) {

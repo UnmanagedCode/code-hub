@@ -338,6 +338,8 @@ def write_host_json(rdir, listen, pid):
         if os.path.lexists(str(tmp)):
             os.unlink(str(tmp))
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if hasattr(os, "fchmod"):  # the create mode is narrowed by the umask
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
         os.replace(str(tmp), str(path))

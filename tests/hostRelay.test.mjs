@@ -453,6 +453,102 @@ test('H20: rendezvous reads survive short reads', async (t) => {
   assert.equal(await relayStore.ensureSecret(), await relaySecret(root), 'the hub file read whole too, so kept');
 });
 
+// Invariant (S2/S5): rendezvous reads stay bounded even when the file is far
+// larger than its fstat size said (it grew after the check): neither the async
+// read nor the watcher's sync read ever asks for or gathers more than
+// maxRendezvousBytes + 1 bytes, and the file is refused as oversize.
+test('H20b: a file that grew past its stat size is read no further than the bound', async (t) => {
+  const root = await setup(t);
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const fsCjs = createRequire(import.meta.url)('node:fs');
+  const hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
+  await fs.writeFile(hostFile, 'x'.repeat(P.maxRendezvousBytes * 64));
+  const limit = P.maxRendezvousBytes + 1;
+  const lying = (info) => Object.assign(Object.create(Object.getPrototypeOf(info)), info, { size: 10 });
+
+  const asked = []; // [position, length] of every async read
+  let gathered = 0;
+  const realOpen = fs.open;
+  t.mock.method(fs, 'open', async (...a) => {
+    const h = await realOpen.apply(fs, a);
+    return {
+      stat: async () => lying(await h.stat()),
+      close: () => h.close(),
+      read: async (buf, off, len, pos) => {
+        asked.push([pos, len]);
+        const r = await h.read(buf, off, Math.min(len, 7), pos);
+        gathered += r.bytesRead;
+        return r;
+      },
+    };
+  });
+  assert.match((await relayStore.readHost()).error, new RegExp(`is larger than ${P.maxRendezvousBytes} bytes`));
+  assert.ok(asked.length > 1, 'chunked: the read loop ran');
+  assert.ok(asked.every(([pos, len]) => pos + len <= limit), JSON.stringify(asked.at(-1)));
+  assert.ok(gathered <= limit, `gathered ${gathered}`);
+
+  const askedSync = [];
+  let gatheredSync = 0;
+  const realFstat = fsCjs.fstatSync;
+  const realReadSync = fsCjs.readSync;
+  fsCjs.fstatSync = (...a) => lying(realFstat(...a));
+  fsCjs.readSync = (fd, buf, off, len, pos) => {
+    askedSync.push([pos, len]);
+    const n = realReadSync(fd, buf, off, Math.min(len, 7), pos);
+    gatheredSync += n;
+    return n;
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fsCjs.fstatSync = realFstat; fsCjs.readSync = realReadSync; syncBuiltinESMExports(); });
+  const stop = relayStore.watchHost(() => {}); // its baseline is a sync read
+  stop();
+  assert.ok(askedSync.length > 1, 'chunked: the sync read loop ran');
+  assert.ok(askedSync.every(([pos, len]) => pos + len <= limit), JSON.stringify(askedSync.at(-1)));
+  assert.ok(gatheredSync <= limit, `gathered ${gatheredSync}`);
+});
+
+// Invariant (S2): a relay file whose CONTENT can't be used — a FIFO, an
+// oversize file — waits for a change (state waiting, recovery relay-file):
+// it is not mistaken for a passing read error and retried with backoff, and
+// no dial is made even though the oversize file names a live relay.
+test('H22: an unusable relay file waits for a change; it is not retried', { skip: posixOnly }, async (t) => {
+  const { execFileSync } = await import('node:child_process');
+  const root = await setup(t);
+  const fake = await fakeFor(t, root);
+  const valid = await fs.readFile(fake.hostFile, 'utf8');
+  const oversize = JSON.stringify({ ...JSON.parse(valid), pad: 'x'.repeat(P.maxRendezvousBytes) });
+  for (const [what, plant] of [
+    ['FIFO', async () => { await fs.rm(fake.hostFile); execFileSync('mkfifo', [fake.hostFile]); }],
+    ['oversize', () => fs.writeFile(fake.hostFile, oversize)],
+  ]) {
+    await plant();
+    const { handle } = exposeFor(t, 40043, SCOPES.loopback);
+    await hostRelay.init();
+    await waitFor(() => hostRelay.status().state === 'waiting', { timeout: 2000 });
+    assert.equal(handle.info().recovery, 'relay-file', what);
+    await sleep(1200); // past the first backoff steps: still waiting, never dialled
+    assert.equal(hostRelay.status().state, 'waiting', what);
+    assert.equal(fake.controls.length, 0, what);
+    hostRelay.stop();
+    handle.close();
+    await fs.rm(fake.hostFile, { force: true });
+  }
+});
+
+// Invariant (S5): relay.json is 0600 whatever the umask — under a restrictive
+// umask (0477) the created file is still owner-readable and -writable, so the
+// next boot keeps the same secret instead of failing to read it.
+test('H21: ensureSecret writes relay.json 0600 under a restrictive umask', { skip: posixOnly }, async (t) => {
+  const root = await setup(t);
+  const hubFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.hubFile);
+  await fs.rm(hubFile);
+  const old = process.umask(0o477);
+  t.after(() => process.umask(old));
+  const secret = await relayStore.ensureSecret();
+  assert.equal((await fs.stat(hubFile)).mode & 0o777, 0o600);
+  assert.equal(await relayStore.ensureSecret(), secret, 'readable again: kept, not replaced');
+});
+
 // Invariant (S6): a loopback listen is dialled through the Docker Desktop host
 // name; any other address as written, then the default gateway, deduplicated.
 test('H8: dialCandidates', () => {
