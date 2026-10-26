@@ -16,8 +16,12 @@ test('real cloudflared quick tunnel yields a trycloudflare URL', { skip: !run },
   delete process.env.CODEHUB_CLOUDFLARED_BIN; // use the real binary in PATH
   assert.equal(await tunnel.available(), true);
   const { url, pid } = await tunnel.startTunnel(65535);
-  assert.match(url, /trycloudflare\.com$/);
-  tunnel.stopTunnel(pid);
+  try {
+    assert.match(url, /trycloudflare\.com$/);
+  } finally {
+    // A failing assertion must not leave a public quick tunnel up.
+    tunnel.stopTunnel(pid);
+  }
   await waitFor(() => !pidAlive(pid), { timeout: 5000 });
 });
 

@@ -1473,44 +1473,54 @@ test('a share moving to another Funnel port frees its old port at once, while th
   assert.deepEqual(await holders(base), { 443: 'other', 8443: 'app', 10000: null });
 });
 
-// Every exiting funnel is waited out, not only the last one signalled: here
-// the 8443 funnel is signalled FIRST, so remembering just the latest pid would
-// wait on 443's funnel alone and spawn onto 8443 while its old holder still
-// exits — which tailscaled (and the fake) refuses.
-test('a new tailscale share waits out every exiting funnel, not only the last one signalled', async (t) => {
-  const { root, base } = await runningApps(t, ['app', 'other', 'third']);
-  const log = await useArgvLog(t);
-  const openExit = await useExitGate(t, root);
-  assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale', funnelPort: 443 })).status, 200);
-  assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale', funnelPort: 8443 })).status, 200);
-  const appPid = await funnelPidOf('app');
-  const otherPid = await funnelPidOf('other');
+// Every exiting funnel is waited out, whatever its port or the order it was
+// signalled in. Two funnels are torn down (443 and 8443) and then a new share
+// is made on EACH vacated port while both old funnels are still exiting. One
+// old funnel is released; the other is never released, so only waitForExit's
+// bound (a SIGKILL) ends it. A share that waited on any single pid would, in
+// one of the two release orders below, spawn onto the still-held port and be
+// refused by tailscaled (the fake) — so both shares answering 200, in both
+// orders, is what "waits for all" alone produces.
+test('a new tailscale share waits out every exiting funnel, whatever its port or order', async (t) => {
+  for (const releaseFirst of [443, 8443]) {
+    await t.test(`old ${releaseFirst} funnel released first`, async (st) => {
+      const { root, base } = await runningApps(st, ['app', 'other', 'third', 'fourth']);
+      const log = await useArgvLog(st);
+      const openExit = await useExitGate(st, root);
+      assert.equal((await j(base, 'POST', '/api/apps/app/share', { mode: 'tailscale', funnelPort: 443 })).status, 200);
+      assert.equal((await j(base, 'POST', '/api/apps/other/share', { mode: 'tailscale', funnelPort: 8443 })).status, 200);
+      const oldPid = { 443: await funnelPidOf('app'), 8443: await funnelPidOf('other') };
 
-  assert.equal((await j(base, 'DELETE', '/api/apps/other/share')).status, 200);
-  assert.equal((await j(base, 'DELETE', '/api/apps/app/share')).status, 200);
-  await openExit(443);
-  await waitFor(() => !pidAlive(appPid)); // the last-signalled funnel is gone...
-  assert.ok(pidAlive(otherPid), '...while the 8443 funnel is still exiting');
+      assert.equal((await j(base, 'DELETE', '/api/apps/app/share')).status, 200);
+      assert.equal((await j(base, 'DELETE', '/api/apps/other/share')).status, 200);
+      const invokesBefore = funnelEvents(await tailscaleEvents(log), 'invoke').length;
 
-  let settled = false;
-  const third = j(base, 'POST', '/api/apps/third/share', { mode: 'tailscale', funnelPort: 8443 });
-  third.then(() => { settled = true; });
-  await waitFor(async () => (await holders(base))[8443] === 'third');
-  // Long enough for a share that skipped the wait to have spawned and been refused.
-  await new Promise((r) => setTimeout(r, 500));
-  assert.equal(settled, false, 'the share is still waiting on the 8443 funnel');
+      const on443 = j(base, 'POST', '/api/apps/third/share', { mode: 'tailscale', funnelPort: 443 });
+      const on8443 = j(base, 'POST', '/api/apps/fourth/share', { mode: 'tailscale', funnelPort: 8443 });
+      await waitFor(async () => {
+        const h = await holders(base);
+        return h[443] === 'third' && h[8443] === 'fourth';
+      });
+      assert.ok(pidAlive(oldPid[443]) && pidAlive(oldPid[8443]), 'both old funnels are still exiting');
+      assert.equal(funnelEvents(await tailscaleEvents(log), 'invoke').length, invokesBefore, 'no new funnel while both old ones hold their ports');
 
-  await openExit(8443);
-  const res = await third;
-  assert.equal(res.status, 200, res.body.error);
-  const events = await tailscaleEvents(log);
-  const otherExit = funnelEvents(events, 'exit').find((e) => e.pid === otherPid);
-  const thirdStart = funnelEvents(events, 'invoke').at(-1);
-  assert.ok(otherExit && thirdStart.t >= otherExit.t, 'the new funnel started only after the old 8443 funnel had exited');
+      await openExit(releaseFirst);
+      const [a, b] = await Promise.all([on443, on8443]);
+      assert.equal(a.status, 200, a.body.error);
+      assert.equal(b.status, 200, b.body.error);
+
+      const events = await tailscaleEvents(log);
+      const released = funnelEvents(events, 'exit').find((e) => e.pid === oldPid[releaseFirst]);
+      const fresh = funnelEvents(events, 'invoke').slice(invokesBefore);
+      assert.equal(fresh.length, 2, 'exactly one new funnel per port, none refused and retried');
+      assert.ok(released && fresh.every((e) => e.t >= released.t), 'no new funnel started before the released one exited');
+      for (const port of [443, 8443]) assert.equal(pidAlive(oldPid[port]), false);
+    });
+  }
 });
 
 // A record persisted before tailscale shares carried a funnelPort is torn down
-// by pid like any other: no claim survives it, and its port is free again.
+// by pid like any other, and its port is free again.
 test('init tears down a persisted tailscale record with no funnelPort', async (t) => {
   const root = await mkRoot();
   const appChild = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
