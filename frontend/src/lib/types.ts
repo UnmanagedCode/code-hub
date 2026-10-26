@@ -28,6 +28,8 @@ export interface Tunnel {
   kind?: ShareKind;
   urls?: string[] | null;
   proxyPort?: number | null;
+  /** The public Funnel port a tailscale share runs on; null for other kinds. */
+  funnelPort?: number | null;
   fixedPortFallback?: boolean;
   fixedPortHolder?: 'app' | 'other' | 'unknown' | null;
   relay?: RelayInfo | null;
@@ -42,11 +44,12 @@ export interface Tunnel {
   qrSvg?: string;
 }
 
-/** A stored auto-share config: the options the share is made with (`tls` LAN only). */
+/** A stored auto-share config: the options the share is made with (`tls` LAN only, `funnelPort` tailscale only). */
 export interface AutoShare {
   mode: ShareKind;
   auth: boolean;
   tls?: boolean;
+  funnelPort?: number;
 }
 
 /** An app's stored settings (`app.settings`); never carries the password itself. */
@@ -95,9 +98,17 @@ export interface HubSettings {
   bridgeFallback: boolean;
 }
 
+/** One public Tailscale Funnel port and the app whose share holds it (a share still coming up included), or null when free. */
+export interface FunnelPort {
+  port: number;
+  holder: string | null;
+}
+
 export interface AppsResponse {
   cloudflaredAvailable: boolean;
   tailscaleAvailable: boolean;
+  /** Every Funnel port, in the server's order. */
+  funnelPorts: FunnelPort[];
   hubSettings: HubSettings;
   apps: App[];
 }
@@ -111,8 +122,8 @@ export interface SharePatch {
   passwordIsDefault?: boolean;
 }
 
-/** The UI's per-app share state: the mode picker, a share in flight, its failure, or the share response. */
-export type ShareState = { choosing: true } | 'loading' | { error: string } | Tunnel;
+/** The UI's per-app share state: the mode picker (`funnel`: its Funnel port row is open), a share in flight, its failure, or the share response. */
+export type ShareState = { choosing: true; funnel?: true } | 'loading' | { error: string } | Tunnel;
 
 /** An open Edit form. `auth`/`tls` exist only for a LAN share. */
 export interface CredDraft {

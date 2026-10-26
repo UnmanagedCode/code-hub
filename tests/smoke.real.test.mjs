@@ -68,7 +68,7 @@ const funnelStatusJson = () => new Promise((resolve, reject) => {
 // actually REMOVES the funnel config. code-hub's whole teardown model rests on
 // that one assumption about someone else's binary, and no fake can prove it —
 // if it ever stops holding, `unshare` reports success while a public URL stays
-// live in front of a dead proxy and the node's 443 stays occupied.
+// live in front of a dead proxy and its Funnel port stays occupied.
 //
 // It deliberately makes NO network request. The end-to-end gate check lives in
 // its own test below, because it additionally needs the node's MagicDNS name to
@@ -94,7 +94,7 @@ test('real tailscale funnel: SIGTERM removes the funnel config', { skip: !runTs 
 
   let pid = null;
   try {
-    const started = await tailscale.startFunnel(proxy.port);
+    const started = await tailscale.startFunnel(proxy.port, 443);
     pid = started.pid;
     assert.match(started.url, /^https:\/\/[^/]+\.ts\.net$/);
 
@@ -113,6 +113,51 @@ test('real tailscale funnel: SIGTERM removes the funnel config', { skip: !runTs 
     tailscale.stopFunnel(pid);
     proxy.close();
     app.close();
+  }
+});
+
+// PURPOSE: pin the two facts per-port sharing rests on, on a live node:
+// foreground funnels on different Funnel ports coexist (each holds its own
+// session's entry in the node's config), and SIGTERM to one removes ONLY its
+// own entry. If either stopped holding, a second app's share would knock out
+// the first's, or an unshare would take the other port down with it.
+// Reads `funnel status --json` for the same reason as the test above.
+test('real tailscale funnels on 443 and 8443 coexist, and SIGTERM to one removes only its own config', { skip: !runTs }, async () => {
+  delete process.env.CODEHUB_TAILSCALE_BIN;
+  assert.equal(await tailscale.available(), true);
+
+  const before = await funnelStatusJson();
+  const apps = [];
+  const pids = { 443: null, 8443: null };
+  try {
+    for (const funnelPort of [443, 8443]) {
+      const app = http.createServer((req, res) => { res.writeHead(200); res.end('ok'); });
+      await new Promise((r) => app.listen(0, '127.0.0.1', r));
+      apps.push(app);
+      const started = await tailscale.startFunnel(app.address().port, funnelPort);
+      pids[funnelPort] = started.pid;
+      if (funnelPort === 8443) assert.match(started.url, /^https:\/\/[^/]+\.ts\.net:8443$/);
+    }
+    const both = JSON.stringify(await funnelStatusJson());
+    assert.match(both, /:443\b/, 'the 443 funnel is registered');
+    assert.match(both, /:8443\b/, 'the 8443 funnel is registered alongside it');
+
+    tailscale.stopFunnel(pids[8443]);
+    await waitFor(() => !pidAlive(pids[8443]), { timeout: 5000 });
+    pids[8443] = null;
+    const one = JSON.stringify(await funnelStatusJson());
+    assert.match(one, /:443\b/, 'the 443 funnel survived the other one\'s exit');
+    assert.doesNotMatch(one, /:8443\b/, 'the 8443 funnel removed its own config');
+
+    tailscale.stopFunnel(pids[443]);
+    await waitFor(() => !pidAlive(pids[443]), { timeout: 5000 });
+    pids[443] = null;
+    assert.deepEqual(await funnelStatusJson(), before, 'with both gone the node config is exactly as it was');
+  } finally {
+    // This can leave PUBLIC state behind: kill whatever is still up.
+    tailscale.stopFunnel(pids[443]);
+    tailscale.stopFunnel(pids[8443]);
+    for (const app of apps) app.close();
   }
 });
 
@@ -142,7 +187,7 @@ test('real tailscale funnel through auth proxy: 401 without creds, 200 with', { 
 
   let pid = null;
   try {
-    const started = await tailscale.startFunnel(proxy.port);
+    const started = await tailscale.startFunnel(proxy.port, 443);
     pid = started.pid;
     await waitFor(async () => {
       try { const r = await fetch(started.url, { redirect: 'manual' }); return r.status === 401; }

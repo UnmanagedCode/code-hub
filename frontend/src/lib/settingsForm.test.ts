@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { automationFor, mainCheckoutSettingsAllowed, portError, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
+import { automationFor, autoShareClashWarning, mainCheckoutSettingsAllowed, portError, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from './settingsForm';
 import type { AppSettings } from './types';
 import { app } from '@/test/fixtures';
 
@@ -10,7 +10,7 @@ const draftOf = (a: ReturnType<typeof app>, over: Partial<SettingsDraft> = {}): 
 // Invariant: a fresh app's draft has both toggles off, an empty login, and LAN (auth + TLS on) as the mode.
 test('settingsDraftFor: an app with no settings → toggles off, mode lan', () => {
   expect(settingsDraftFor(app())).toStrictEqual({
-    username: '', password: '', forgetPassword: false, autoStart: false, autoShare: false, mode: 'lan', auth: true, tls: true, port: '',
+    username: '', password: '', forgetPassword: false, autoStart: false, autoShare: false, mode: 'lan', auth: true, tls: true, funnelPort: 443, port: '',
   });
   const stored = withSettings({ username: 'alice', hasPassword: true, autoStart: true, autoShare: { mode: 'tailscale', auth: true } });
   expect(settingsDraftFor(stored)).toMatchObject({ username: 'alice', password: '', autoStart: true, autoShare: true, mode: 'tailscale' });
@@ -76,7 +76,7 @@ test('settingsPatch: toggle shapes', () => {
   const a = app();
   expect(settingsPatch(draftOf(a, { autoShare: true, mode: 'lan', auth: false, tls: false }), a)).toStrictEqual({ autoShare: { mode: 'lan', auth: false, tls: false } });
   expect(settingsPatch(draftOf(a, { autoShare: true, mode: 'tunnel', auth: false, tls: false }), a)).toStrictEqual({ autoShare: { mode: 'tunnel', auth: true } });
-  expect(settingsPatch(draftOf(a, { autoShare: true, mode: 'tailscale' }), a)).toStrictEqual({ autoShare: { mode: 'tailscale', auth: true } });
+  expect(settingsPatch(draftOf(a, { autoShare: true, mode: 'tailscale' }), a)).toStrictEqual({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 443 } });
   expect(settingsPatch(draftOf(a, { autoStart: true }), a)).toStrictEqual({ autoStart: true });
 
   const stored = withSettings({ autoStart: true, autoShare: { mode: 'lan', auth: true, tls: true } });
@@ -138,4 +138,41 @@ test('portErrorFor is null for a worktree or always-on app, whatever the draft h
   expect(portErrorFor({ port: '80' }, app())).not.toBeNull();
   expect(portErrorFor({ port: '80' }, app({ isWorktree: true, id: 'web:k' }))).toBeNull();
   expect(portErrorFor({ port: '80' }, app({ alwaysOn: true }))).toBeNull();
+});
+
+// Invariant: the draft seeds the stored Funnel port, else the default 443.
+test('settingsDraftFor: funnelPort is the stored one, else 443', () => {
+  expect(settingsDraftFor(withSettings({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 10000 } })).funnelPort).toBe(10000);
+  expect(settingsDraftFor(withSettings({ autoShare: { mode: 'lan', auth: true, tls: true } })).funnelPort).toBe(443);
+  expect(settingsDraftFor(app()).funnelPort).toBe(443);
+});
+
+// Invariant: a tailscale auto-share is saved with its Funnel port; an unchanged one sends nothing, a changed port is
+// sent, and no other mode carries a funnelPort.
+test('settingsPatch: funnelPort is part of a tailscale auto-share only', () => {
+  const a = app();
+  expect(settingsPatch(draftOf(a, { autoShare: true, mode: 'tailscale', funnelPort: 8443 }), a)).toStrictEqual({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 8443 } });
+  const stored = withSettings({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 443 } });
+  expect(settingsPatch(draftOf(stored), stored)).toBe(null);
+  expect(settingsPatch(draftOf(stored, { funnelPort: 10000 }), stored)).toStrictEqual({ autoShare: { mode: 'tailscale', auth: true, funnelPort: 10000 } });
+  expect(settingsPatch(draftOf(stored, { mode: 'lan', funnelPort: 8443 }), stored)).toStrictEqual({ autoShare: { mode: 'lan', auth: true, tls: true } });
+  expect(settingsPatch(draftOf(stored, { mode: 'tunnel', funnelPort: 8443 }), stored)).toStrictEqual({ autoShare: { mode: 'tunnel', auth: true } });
+});
+
+// Invariant: the clash warning names every OTHER app that auto-shares via tailscale on the draft's Funnel port, and
+// is null otherwise.
+test('autoShareClashWarning: another app auto-sharing on the same Funnel port', () => {
+  const me = app({ id: 'me' });
+  const ts = (id: string, funnelPort: number) => withSettings({ autoShare: { mode: 'tailscale', auth: true, funnelPort } }, { id });
+  const draft = { autoShare: true, mode: 'tailscale' as const, funnelPort: 8443 };
+  const apps = [me, ts('x', 8443), ts('y', 8443), ts('z', 443), withSettings({ autoShare: { mode: 'lan', auth: true, tls: true } }, { id: 'w' })];
+  const text = autoShareClashWarning(draft, me, apps);
+  expect(text).toMatch(/'x'/);
+  expect(text).toMatch(/'y'/);
+  expect(text).not.toMatch(/'z'|'w'|'me'/);
+  expect(text).toMatch(/8443/);
+  expect(autoShareClashWarning(draft, me, [ts('me', 8443)])).toBe(null);
+  expect(autoShareClashWarning({ ...draft, funnelPort: 10000 }, me, apps)).toBe(null);
+  expect(autoShareClashWarning({ ...draft, mode: 'lan' }, me, apps)).toBe(null);
+  expect(autoShareClashWarning({ ...draft, autoShare: false }, me, apps)).toBe(null);
 });

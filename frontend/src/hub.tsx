@@ -23,8 +23,11 @@ export interface Hub extends AppsFeed {
   stop: (id: string) => Promise<void>;
   restart: (id: string) => Promise<void>;
   chooseShare: (id: string) => void;
+  /** Opens the picker's Funnel port row (tailscale picked, port not yet). */
+  chooseFunnelPort: (id: string) => void;
   cancelShare: (id: string) => void;
-  doShare: (id: string, mode: ShareKind) => Promise<void>;
+  /** `funnelPort` is sent for a tailscale share; without it the server shares on its default port. */
+  doShare: (id: string, mode: ShareKind, funnelPort?: number) => Promise<void>;
   unshare: (id: string) => Promise<void>;
   beginEdit: (id: string, shared: Tunnel, kind: ShareKind) => void;
   updateDraft: (id: string, patch: Partial<CredDraft>) => void;
@@ -120,11 +123,12 @@ export function HubProvider({ children }: { children: ReactNode }) {
       clearShare(id);
     }),
     chooseShare: (id: string) => setShareFor(id, { choosing: true }),
+    chooseFunnelPort: (id: string) => setShareFor(id, { choosing: true, funnel: true }),
     cancelShare: (id: string) => setShareFor(id, undefined),
-    doShare: async (id: string, mode: ShareKind) => {
+    doShare: async (id: string, mode: ShareKind, funnelPort?: number) => {
       setShareFor(id, 'loading');
       try {
-        setShareFor(id, await api<Tunnel>(appPath(id, 'share'), json('POST', { mode })));
+        setShareFor(id, await api<Tunnel>(appPath(id, 'share'), json('POST', { mode, ...(funnelPort ? { funnelPort } : {}) })));
       } catch (e) {
         setShareFor(id, { error: message(e) });
       }

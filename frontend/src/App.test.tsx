@@ -81,12 +81,37 @@ describe('list states', () => {
     expect(gets(calls)).toBe(1);
   });
 
-  // Invariant: the header reports which share backends are available.
+  // Invariant: the header reports which share backends are available; an available tailscale also counts its
+  // Funnel ports in use.
   it('the header shows cloudflared and tailscale availability', async () => {
-    stubFetch({ 'GET api/apps': listing([], { cloudflaredAvailable: true, tailscaleAvailable: false }) });
+    const { routes } = stubFetch({ 'GET api/apps': listing([], { cloudflaredAvailable: true, tailscaleAvailable: false }) });
     render(<App />);
     expect(await screen.findByText('cloudflared ✓')).toBeTruthy();
     expect(screen.getByText('no tailscale')).toBeTruthy();
+    routes['GET api/apps'] = listing([], { cloudflaredAvailable: false, tailscaleAvailable: true });
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('button', { name: 'tailscale ✓ 0/3' })).toBeTruthy();
+    expect(screen.getByText('no cloudflared')).toBeTruthy();
+  });
+
+  // Invariant: the tailscale badge counts the Funnel ports in use and lists each port's holder (on hover via its
+  // title, on click in a popover); it changes only when a new listing arrives.
+  it('the header tailscale badge shows ports in use and, on click, lists each port and its holder; it changes only with a new listing', async () => {
+    const user = userEvent.setup();
+    const ports = (holders: (string | null)[]) => [443, 8443, 10000].map((port, i) => ({ port, holder: holders[i] }));
+    const { routes } = stubFetch({ 'GET api/apps': listing([], { tailscaleAvailable: true, funnelPorts: ports([null, 'web', null]) }) });
+    render(<App />);
+    const badge = await screen.findByRole('button', { name: 'tailscale ✓ 1/3' });
+    expect(badge.getAttribute('title')).toBe(':443 — free\n:8443 — web\n:10000 — free');
+    await user.click(badge);
+    const popover = await screen.findByRole('dialog');
+    expect(within(popover).getAllByRole('listitem').map((li) => li.textContent)).toStrictEqual([':443 — free', ':8443 — web', ':10000 — free']);
+    await user.keyboard('{Escape}');
+
+    routes['GET api/apps'] = listing([], { tailscaleAvailable: true, funnelPorts: ports(['api', 'web', null]) });
+    expect(screen.getByRole('button', { name: 'tailscale ✓ 1/3' })).toBeTruthy(); // nothing reloads on its own
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('button', { name: 'tailscale ✓ 2/3' })).toBeTruthy();
   });
 
   // Invariant: the sort select reorders the cards.
@@ -192,6 +217,57 @@ describe('actions', () => {
     await user.click(within(card).getByRole('button', { name: 'LAN' }));
     expect(await within(card).findByText('https://192.0.2.1:5001')).toBeTruthy();
     expect(writes(calls)).toStrictEqual([{ method: 'POST', url: 'api/apps/web%3Ak/share', body: { mode: 'lan' } }]);
+  });
+
+  // Invariant: tailscale asks for a Funnel port before sharing; a port another app holds is disabled saying who
+  // holds it, and the chosen port is posted and shown on the share.
+  it('Share → tailscale shows the Funnel port row; a port held by another app is disabled with "used by <app>"; :8443 posts {mode:"tailscale",funnelPort:8443} and the panel shows the :8443 URL and "port 8443"', async () => {
+    const user = userEvent.setup();
+    const share: Tunnel = { kind: 'tailscale', url: 'https://node.tailnet.ts.net:8443', funnelPort: 8443, auth: true, username: 'hub', password: 'pw', authUrl: 'https://node.tailnet.ts.net:8443?__hubauth=T' };
+    const { calls } = stubFetch({
+      'GET api/apps': listing([running()], { tailscaleAvailable: true, funnelPorts: [{ port: 443, holder: 'api' }, { port: 8443, holder: null }, { port: 10000, holder: null }] }),
+      'POST api/apps/web/share': share,
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    expect(within(card).queryByRole('group', { name: 'Funnel port' })).toBeNull();
+    await user.click(within(card).getByRole('button', { name: 'tailscale' }));
+    expect(writes(calls)).toStrictEqual([]);
+    const row = within(card).getByRole('group', { name: 'Funnel port' });
+    const held = within(row).getByRole('button', { name: ':443' }) as HTMLButtonElement;
+    expect(held.disabled).toBe(true);
+    expect(document.getElementById(held.getAttribute('aria-describedby')!)?.textContent).toContain('used by api');
+    expect((within(row).getByRole('button', { name: ':10000' }) as HTMLButtonElement).disabled).toBe(false);
+    await user.click(within(row).getByRole('button', { name: ':8443' }));
+    expect(await within(card).findByText('https://node.tailnet.ts.net:8443')).toBeTruthy();
+    expect(within(card).getByText(/port 8443/)).toBeTruthy();
+    expect(writes(calls)).toStrictEqual([{ method: 'POST', url: 'api/apps/web/share', body: { mode: 'tailscale', funnelPort: 8443 } }]);
+  });
+
+  // Invariant: with every Funnel port held by other apps, tailscale can't be picked, and says why.
+  it('every Funnel port held by other apps disables tailscale with "all Funnel ports in use"', async () => {
+    const user = userEvent.setup();
+    stubFetch({ 'GET api/apps': listing([running()], { tailscaleAvailable: true, funnelPorts: [443, 8443, 10000].map((port) => ({ port, holder: 'api' })) }) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    const tailscale = within(card).getByRole('button', { name: 'tailscale' }) as HTMLButtonElement;
+    expect(tailscale.disabled).toBe(true);
+    expect(document.getElementById(tailscale.getAttribute('aria-describedby')!)?.textContent).toBe('all Funnel ports in use');
+  });
+
+  // Invariant: a refused share — a 409 for a held Funnel port included — shows the server's message in the card.
+  it('a share 409 renders in the share panel\'s alert', async () => {
+    const user = userEvent.setup();
+    const error = "'other' already has a tailscale share on Funnel port 443 — unshare it, or share on another port";
+    stubFetch({ 'GET api/apps': listing([running()], { tailscaleAvailable: true }), 'POST api/apps/web/share': () => json({ error }, 409) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'tailscale' }));
+    await user.click(within(card).getByRole('button', { name: ':443' }));
+    expect((await within(card).findByRole('alert')).textContent).toBe(error);
   });
 
   // Invariant: a failed share shows its error in place of the panel.
@@ -410,6 +486,21 @@ describe('share lifecycle', () => {
     await user.click(within(card).getByRole('button', { name: 'Share' }));
     await user.click(within(card).getByRole('button', { name: 'Cancel' }));
     expect(within(card).queryByRole('button', { name: 'LAN' })).toBeNull();
+    expect(writes(calls)).toStrictEqual([]);
+  });
+
+  // Invariant: Cancel backs out of the picker entirely even with the Funnel port row open, sending nothing.
+  it('Cancel after opening the Funnel port row sends nothing and closes the picker', async () => {
+    const user = userEvent.setup();
+    const { calls } = stubFetch({ 'GET api/apps': listing([running()], { tailscaleAvailable: true }) });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'tailscale' }));
+    within(card).getByRole('group', { name: 'Funnel port' });
+    await user.click(within(card).getByRole('button', { name: 'Cancel' }));
+    expect(within(card).queryByRole('group', { name: 'Funnel port' })).toBeNull();
+    expect(within(card).queryByRole('button', { name: 'tailscale' })).toBeNull();
     expect(writes(calls)).toStrictEqual([]);
   });
 

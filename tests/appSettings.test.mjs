@@ -234,8 +234,8 @@ test('autoShare is stored normalised, and null clears it', async (t) => {
   t.after(() => rmRoot(root));
   assert.deepEqual((await appSettings.update('app', { autoShare: { mode: 'lan' } })).autoShare, { mode: 'lan', auth: true, tls: true });
   assert.deepEqual((await appSettings.update('app', { autoShare: { mode: 'lan', auth: false, tls: false } })).autoShare, { mode: 'lan', auth: false, tls: false });
-  assert.deepEqual((await appSettings.update('app', { autoShare: { mode: 'tailscale', tls: true, extra: 1 } })).autoShare, { mode: 'tailscale', auth: true });
-  assert.deepEqual((await appSettings.get('app')).autoShare, { mode: 'tailscale', auth: true });
+  assert.deepEqual((await appSettings.update('app', { autoShare: { mode: 'tailscale', tls: true, extra: 1 } })).autoShare, { mode: 'tailscale', auth: true, funnelPort: 443 });
+  assert.deepEqual((await appSettings.get('app')).autoShare, { mode: 'tailscale', auth: true, funnelPort: 443 });
   assert.equal((await appSettings.update('app', { autoShare: null })).autoShare, null);
   assert.deepEqual({ ...(await appSettings.readAll()) }, {});
 });
@@ -249,7 +249,7 @@ test('a bad autoShare or autoStart is a 400 carrying share()\'s own message, and
   await appSettings.update('app', { username: 'alice' });
   const before = await fs.readFile(file(), 'utf8');
   const { validateShareOptions } = await import('../src/shareOptions.js');
-  for (const opts of [{ mode: 'ftp' }, {}, { mode: 'lan', auth: 'yes' }, { mode: 'tunnel', auth: false }, { mode: 'tailscale', auth: false }, { mode: 'lan', tls: 1 }]) {
+  for (const opts of [{ mode: 'ftp' }, {}, { mode: 'lan', auth: 'yes' }, { mode: 'tunnel', auth: false }, { mode: 'tailscale', auth: false }, { mode: 'lan', tls: 1 }, { mode: 'tailscale', funnelPort: 8080 }]) {
     let expected;
     try { validateShareOptions(opts); } catch (e) { expected = e.message; }
     assert.ok(expected, JSON.stringify(opts));

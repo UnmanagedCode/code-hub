@@ -7,13 +7,16 @@ import { CredEditForm } from '@/components/CredEditForm';
 import { ExternalLink } from '@/components/ExternalLink';
 import { QrDialog } from '@/components/QrDialog';
 import { useHub } from '@/hub';
-import { credRowValues, qrImageSrc, shareModes, sharePanelView } from '@/lib/shareState';
+import { funnelPortChoices } from '@/lib/funnelPorts';
+import { credRowValues, qrImageSrc, shareChooserModes, sharePanelView } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
-function ShareChooser({ app }: { app: App }) {
+function ShareChooser({ app, funnel }: { app: App; funnel: boolean }) {
   const hub = useHub();
   const ids = useId();
-  const modes = shareModes(!!hub.data?.cloudflaredAvailable, !!hub.data?.tailscaleAvailable);
+  const funnelPorts = hub.data?.funnelPorts ?? [];
+  const modes = shareChooserModes(!!hub.data?.cloudflaredAvailable, !!hub.data?.tailscaleAvailable, funnelPorts, app.id);
+  const ports = funnelPortChoices(funnelPorts, app.id);
   return (
     <div className="flex flex-col gap-1.5" role="group" aria-label="Share via">
       <div className="flex flex-wrap gap-2">
@@ -24,7 +27,9 @@ function ShareChooser({ app }: { app: App }) {
             variant="outline"
             disabled={!!m.disabledReason}
             aria-describedby={m.disabledReason ? `${ids}-${m.mode}` : undefined}
-            onClick={() => hub.doShare(app.id, m.mode)}
+            // tailscale first asks which Funnel port; the other modes share at once.
+            aria-pressed={m.mode === 'tailscale' ? funnel : undefined}
+            onClick={() => (m.mode === 'tailscale' ? hub.chooseFunnelPort(app.id) : hub.doShare(app.id, m.mode))}
           >
             {m.label}
           </Button>
@@ -34,6 +39,27 @@ function ShareChooser({ app }: { app: App }) {
       {modes.filter((m) => m.disabledReason).map((m) => (
         <p key={m.mode} id={`${ids}-${m.mode}`} className="text-xs text-muted-foreground">{m.disabledReason}</p>
       ))}
+      {funnel && (
+        <>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Funnel port">
+            {ports.map((p) => (
+              <Button
+                key={p.port}
+                size="sm"
+                variant="outline"
+                disabled={!!p.disabledReason}
+                aria-describedby={p.disabledReason ? `${ids}-port-${p.port}` : undefined}
+                onClick={() => hub.doShare(app.id, 'tailscale', p.port)}
+              >
+                {p.label}
+              </Button>
+            ))}
+          </div>
+          {ports.filter((p) => p.disabledReason).map((p) => (
+            <p key={p.port} id={`${ids}-port-${p.port}`} className="text-xs text-muted-foreground">{p.label} {p.disabledReason}</p>
+          ))}
+        </>
+      )}
     </div>
   );
 }
@@ -55,7 +81,7 @@ export function SharePanel({ app }: { app: App }) {
   const v = sharePanelView(hub.share[app.id], app, !!draft);
 
   if (v.view === 'none') return null;
-  if (v.view === 'choosing') return <ShareChooser app={app} />;
+  if (v.view === 'choosing') return <ShareChooser app={app} funnel={v.funnel} />;
   if (v.view === 'loading') {
     return (
       <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">

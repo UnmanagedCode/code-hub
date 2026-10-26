@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { storeRoot, isValidFixedPort, MIN_FIXED_PORT, MAX_FIXED_PORT } from './projects.js';
-import { validateShareOptions } from './shareOptions.js';
+import { validateShareOptions, withFunnelPortDefault } from './shareOptions.js';
 
 // Per-app settings: the default login a NEW share of an app starts with (see
 // appManager.share), whether code-hub starts the app when it boots
@@ -10,7 +10,7 @@ import { validateShareOptions } from './shareOptions.js';
 // in a project tree. Shape, keyed by exact app id (a worktree does NOT inherit
 // its parent project's entry):
 //   { "<id>": { "username"?: string, "password"?: string,
-//               "autoStart"?: true, "autoShare"?: { mode, auth, tls? },
+//               "autoStart"?: true, "autoShare"?: { mode, auth, tls?, funnelPort? },
 //               "port"?: number } }
 // Each field is independent; `autoStart` is stored only when true, and an
 // entry with none of the five keys is deleted, never kept. `port` is the app's
@@ -117,13 +117,14 @@ export async function get(id) {
 }
 
 // The client-safe view of an entry (none at all included): never carries the
-// password itself.
+// password itself. A tailscale `autoShare` always carries its `funnelPort`,
+// the default applied where the stored one has none.
 export function describe(entry) {
   return {
     username: entry?.username ?? null,
     hasPassword: typeof entry?.password === 'string',
     autoStart: entry?.autoStart === true,
-    autoShare: entry?.autoShare ?? null,
+    autoShare: entry?.autoShare ? withFunnelPortDefault(entry.autoShare) : null,
     port: entry?.port ?? null,
   };
 }
@@ -159,7 +160,7 @@ function parseChanges(body) {
     const v = body.autoShare;
     if (v === null) changes.autoShare = null;
     else if (typeof v === 'object' && !Array.isArray(v)) changes.autoShare = validateShareOptions(v);
-    else throw badRequest("'autoShare' must be { mode, auth?, tls? }, or null to clear");
+    else throw badRequest("'autoShare' must be { mode, auth?, tls?, funnelPort? }, or null to clear");
   }
   if ('port' in body) {
     const v = body.port;

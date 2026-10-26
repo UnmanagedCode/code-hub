@@ -30,6 +30,7 @@ export const app = (over: Partial<App> = {}): App => ({
 export const listing = (apps: App[], over: Partial<AppsResponse> = {}): AppsResponse => ({
   cloudflaredAvailable: true,
   tailscaleAvailable: false,
+  funnelPorts: [443, 8443, 10000].map((port) => ({ port, holder: null })),
   hubSettings: { bridgeFallback: true },
   apps,
   ...over,

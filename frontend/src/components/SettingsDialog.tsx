@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useHub } from '@/hub';
 import { cardLabel } from '@/lib/appView';
-import { automationFor, mainCheckoutSettingsAllowed, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
+import { automationFor, autoShareClashWarning, mainCheckoutSettingsAllowed, portErrorFor, portNote, portPlaceholder, settingsDraftFor, settingsPatch, type SettingsDraft } from '@/lib/settingsForm';
 import { PASSWORD_MASK, shareModes } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
@@ -73,6 +73,7 @@ export function SettingsDialog({ app }: { app: App }) {
   const automation = automationFor(app);
   const modes = shareModes(!!hub.data?.cloudflaredAvailable, !!hub.data?.tailscaleAvailable);
   const chosen = modes.find((m) => m.mode === draft.mode);
+  const clash = autoShareClashWarning(draft, app, hub.data?.apps ?? []);
 
   return (
     <>
@@ -160,6 +161,28 @@ export function SettingsDialog({ app }: { app: App }) {
                     )}
                     {draft.mode === 'lan' && check('auth', 'Authentication')}
                     {draft.mode === 'lan' && check('tls', 'TLS (HTTPS)')}
+                    {draft.mode === 'tailscale' && (
+                      <div role="radiogroup" aria-label="Funnel port" className="flex flex-wrap gap-3">
+                        {(hub.data?.funnelPorts ?? []).map(({ port }) => (
+                          <label key={port} className="flex items-center gap-1.5 text-sm">
+                            <input
+                              type="radio"
+                              name={`${ids}-funnel-port`}
+                              value={port}
+                              checked={draft.funnelPort === port}
+                              onChange={() => set({ funnelPort: port })}
+                              className="accent-primary"
+                            />
+                            :{port}
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                    {clash && (
+                      <Alert variant="warning">
+                        <AlertDescription>{clash}</AlertDescription>
+                      </Alert>
+                    )}
                   </div>
                 )}
               </fieldset>
