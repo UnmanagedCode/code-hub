@@ -52,14 +52,18 @@ export function sortApps(apps: App[], sort: SortKey): App[] {
   return list;
 }
 
+// The always-on host conductor's card leads the list under every sort; the rest keep their order.
+const hostFirst = (apps: App[]): App[] => [...apps.filter((a) => a.alwaysOn), ...apps.filter((a) => !a.alwaysOn)];
+
 export type AppGroup =
   | { kind: 'app'; app: App; worktrees: App[] }
   /** Worktrees whose main checkout isn't in the listing (no manifest source, not discovered). */
   | { kind: 'orphan'; project: string; worktrees: App[] };
 
 // Worktrees nest under their parent project rather than showing as top-level
-// cards. The sort applies to the top-level (main) cards only; orphan groups
-// follow every main.
+// cards. The sort applies to the top-level (main) cards only, after the
+// always-on host's group, which leads under every sort; orphan groups follow
+// every main.
 export function groupApps(apps: App[], sort: SortKey): AppGroup[] {
   const byProject = new Map<string, App[]>();
   for (const w of apps) {
@@ -70,7 +74,7 @@ export function groupApps(apps: App[], sort: SortKey): AppGroup[] {
   for (const list of byProject.values()) list.sort((a, b) => (a.branch || a.id).localeCompare(b.branch || b.id));
   const groups: AppGroup[] = [];
   const seen = new Set<string>();
-  for (const app of sortApps(apps.filter((a) => !a.isWorktree), sort)) {
+  for (const app of hostFirst(sortApps(apps.filter((a) => !a.isWorktree), sort))) {
     seen.add(app.project);
     groups.push({ kind: 'app', app, worktrees: byProject.get(app.project) ?? [] });
   }
