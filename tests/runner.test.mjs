@@ -5,7 +5,7 @@ import net from 'node:net';
 import * as runner from '../src/runner.js';
 import { allocatePort } from '../src/net.js';
 import path from 'node:path';
-import { promises as fs, existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, writeFileSync, statSync, openSync, closeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
 import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd, openFdsOf } from './helpers.mjs';
@@ -277,7 +277,7 @@ test('a ready app\'s log grows past the cap and the sweep rotates it', async (t)
 
 // Pins: a crashed start also releases its claim (the exit/settle path), so its
 // log is swept — and stays inspectable until then.
-test('a crashed start\'s log is no longer claimed and is rotated by the sweep', async (t) => {
+test('a crashed start\'s log is no longer claimed and is rotated by the sweep', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const start = fakeAppCmd('crash');
@@ -294,7 +294,7 @@ test('a crashed start\'s log is no longer claimed and is rotated by the sweep', 
 // retention, with the id not yet in the running set, leaves it alone — and the
 // parent closes its write fd after spawn (no fd of this process can write the
 // log; once settled, none refers to it at all).
-test('a starting app\'s log is protected, and the parent holds no write fd to it', async (t) => {
+test('a starting app\'s log is protected, and the parent holds no write fd to it', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const marker = path.join(root, 'gate');
@@ -323,7 +323,7 @@ const sweepable = (file) => { // true once the file's claim is gone: an over-cap
 
 // Pins: a spawn that throws synchronously (invalid cwd type) still releases
 // the claim and closes the tail — nothing leaks and the log is sweepable.
-test('a synchronous spawn failure rejects start and releases the log claim and fds', async (t) => {
+test('a synchronous spawn failure rejects start and releases the log claim and fds', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const app = { id: 'syncfail', path: 123, manifest: { start: 'true', healthPath: null, readyWhen: null } };
@@ -336,7 +336,7 @@ test('a synchronous spawn failure rejects start and releases the log claim and f
 
 // Pins: an asynchronous spawn failure (ENOENT cwd, via proc 'error') settles
 // crashed and releases the claim and tail.
-test('an asynchronous spawn failure settles crashed and releases the log claim and fds', async (t) => {
+test('an asynchronous spawn failure settles crashed and releases the log claim and fds', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const app = { id: 'asyncfail', path: '/no/such/dir', manifest: { start: 'true', healthPath: null, readyWhen: null } };
@@ -350,7 +350,7 @@ test('an asynchronous spawn failure settles crashed and releases the log claim a
 
 // Pins: readiness setup that throws synchronously (an invalid readyWhen handed
 // straight to the runner) still settles crashed and releases claim and tail.
-test('a synchronous detectReady throw settles crashed and releases the log claim and fds', async (t) => {
+test('a synchronous detectReady throw settles crashed and releases the log claim and fds', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const start = fakeAppCmd();
@@ -364,4 +364,38 @@ test('a synchronous detectReady throw settles crashed and releases the log claim
   await waitFor(() => readFileSync(file, 'utf8').includes('listening'));
   assert.deepEqual(openFdsOf(file), []);
   assert.equal(sweepable(file), true);
+});
+
+// Pins: readiness failing asynchronously (the readyWhen match deadline rejects
+// the readiness promise — the same settle handler a readiness timeout uses)
+// closes the tail fd and releases the claim.
+test('a readiness failure settles crashed and releases the log claim and fds', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const start = fakeAppCmd('backtrack');
+  const dir = await mkProject(root, 'app', { start });
+  const app = { id: 'rdyfail', path: dir, manifest: { start, healthPath: null, readyWhen: '(a|a)+$' } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => runner.stop({ id: 'rdyfail', pgid: rec.pgid }));
+  assert.equal(await rec.settled, 'crashed');
+  assert.match(runner.runtime('rdyfail').error, /deadline/);
+  const file = appLog.logFile('rdyfail');
+  assert.deepEqual(openFdsOf(file), []);
+  assert.equal(sweepable(file), true);
+});
+
+// Pins: openFdsOf finds a writable fd on a known file, so narrowing the helper
+// (or breaking its flags parse) fails here instead of silently passing the fd tests.
+test('openFdsOf reports a writable fd on an open file', { skip: process.platform !== 'linux' && '/proc/self/fd is Linux-only' }, async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const file = path.join(root, 'probe');
+  const fd = openSync(file, 'w');
+  try {
+    assert.deepEqual(openFdsOf(file, { writable: true }), [String(fd)]);
+    assert.deepEqual(openFdsOf(file), [String(fd)]);
+  } finally {
+    closeSync(fd);
+  }
+  assert.deepEqual(openFdsOf(file), []);
 });

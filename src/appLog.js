@@ -89,7 +89,8 @@ export function tail(file, maxBytes) {
   };
 }
 
-// Keep the last `capBytes` of `file` in `file.1` (older bytes are dropped),
+// Keep the last `capBytes` of `file` in `file.1` (older bytes are dropped; the
+// cut is byte-based, so the kept text can begin mid-line or mid-character),
 // then truncate it. O_APPEND makes the child's next write land at the new end (0).
 function rotate(file, capBytes) {
   const fd = fs.openSync(file, 'r');
@@ -98,10 +99,13 @@ function rotate(file, capBytes) {
     const size = fs.fstatSync(fd).size;
     const len = Math.min(size, capBytes);
     tailBytes = Buffer.alloc(len);
-    fs.readSync(fd, tailBytes, 0, len, size - len);
+    const n = fs.readSync(fd, tailBytes, 0, len, size - len);
+    tailBytes = tailBytes.subarray(0, n); // a short read must not pad .log.1 with NULs
   } finally {
     fs.closeSync(fd);
   }
+  // `mode` only applies on creation, so an older, looser .log.1 is removed first.
+  fs.rmSync(file + '.1', { force: true });
   fs.writeFileSync(file + '.1', tailBytes, { mode: 0o600 });
   fs.truncateSync(file, 0);
 }
@@ -114,8 +118,9 @@ function rotate(file, capBytes) {
 // Synchronous on purpose: each check-then-act runs in one tick, so no start
 // (which claims synchronously in openForChild) can interleave between a check
 // and the rm/rotate it guards, and two sweeps can never overlap. The cost is
-// blocking the event loop for at most `capBytes` read and written per over-cap
-// app per pass — including the boot pass, which runs before the hub listens.
+// blocking the event loop per over-cap app per pass: at most `capBytes` read
+// and written, plus the truncate, whose time grows with the size of the backlog
+// it frees — including in the boot pass, which runs before the hub listens.
 // `now` and `capBytes` are test seams.
 export function sweep({ running, now = Date.now(), capBytes = LOG_CAP_BYTES }) {
   const live = new Set([...running].map(logFile));

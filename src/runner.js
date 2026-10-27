@@ -69,8 +69,7 @@ function spawnChild(app, port) {
       stdio: ['ignore', fd, fd],
     });
   } catch (e) {
-    tail?.close();
-    release();
+    try { tail?.close(); } finally { release(); }
     throw e;
   } finally {
     closeSync(fd);

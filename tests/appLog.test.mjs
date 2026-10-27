@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { promises as fs, closeSync, readFileSync, writeFileSync, existsSync, statSync, appendFileSync, mkdirSync, rmSync } from 'node:fs';
+import { promises as fs, closeSync, readFileSync, writeFileSync, existsSync, statSync, appendFileSync, mkdirSync, rmSync, chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
 import * as appManager from '../src/appManager.js';
@@ -17,9 +17,9 @@ function writeLog(id, content, suffix = '') {
   return f;
 }
 
-// Pins: copy-truncate really frees the disk under a live O_APPEND writer (the
-// next write lands at offset 0, not a sparse hole at the old offset), and one
-// rotated generation keeps the old content.
+// Pins: rotation really frees the disk under a live O_APPEND writer (the next
+// write lands at offset 0, not a sparse hole at the old offset), and the one
+// rotated generation keeps only the last capBytes — older bytes are dropped.
 test('rotation by the sweep truncates a live O_APPEND writer\'s file to the start', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
@@ -299,4 +299,17 @@ test('openForChild failing releases its claim', async (t) => {
   await fs.utimes(file, old, old);
   appLog.sweep({ running: [] });
   assert.equal(existsSync(file), false);
+});
+
+// Pins: .log.1 is 0600 after a rotation — also when a looser .log.1 already
+// existed (the creation mode alone would leave it 0644).
+test('rotation leaves .log.1 mode 0600, even over an existing looser one', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const file = writeLog('mode', 'x'.repeat(500));
+  writeFileSync(file + '.1', 'old', { mode: 0o644 });
+  chmodSync(file + '.1', 0o644);
+  appLog.sweep({ running: ['mode'], capBytes: 100 });
+  assert.equal(readFileSync(file + '.1', 'utf8'), 'x'.repeat(100));
+  assert.equal(statSync(file + '.1').mode & 0o777, 0o600);
 });
