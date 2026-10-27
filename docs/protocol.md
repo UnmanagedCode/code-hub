@@ -7,7 +7,7 @@
 | `start` | string | **yes** | Blocking foreground command. Must bind `$PORT` and stay up until killed. Run via `bash -lc` in its own process group with `env.PORT` set to the app's port: the app's Settings `port`, else the manifest's `port`, on a non-worktree checkout, otherwise an allocated free port. |
 | `name` | string | no | Display name (default: directory basename). |
 | `healthPath` | string | no | HTTP path polled for readiness; any HTTP response = ready. |
-| `readyWhen` | string | no | Regex matched against the child's stdout/stderr to detect readiness. Matched in bounded windows under a time limit; see "`readyWhen` matching" below. |
+| `readyWhen` | string | no | Regex matched against the child's stdout/stderr, read back from its log file (see "App output logs"), to detect readiness. Matched in bounded windows under a time limit; see "`readyWhen` matching" below. |
 | `port` | integer | no | Fixed port for the **default checkout**; `1024`–`65535`. When absent, a free ephemeral port is allocated on every start. Worktrees always get a free port and never inherit this. An app's Settings `port` overrides it. An app's Settings `port` overrides it. A busy fixed port **refuses the start** (`409`) rather than falling back — a port that quietly moves defeats the point of pinning it. |
 | `routes` | array | no | Named URLs the app serves. Non-empty array of `{ name, path }`; `name` a non-empty string, `path` a string starting with `/`. When absent, a single implicit route at `/` is used. |
 
@@ -22,6 +22,17 @@ Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe
 - The load-time check is a heuristic. It does not catch overlapping alternation under repetition (`(a|a)+$`), adjacent overlapping quantifiers (`.*a.*b.*c`) or backreferences; the slice size and the deadline bound those.
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
+
+## App output logs: `<projectsRoot>/.code-hub/logs/`
+
+- code-hub opens `<id>.log` (`O_APPEND`) and hands the fd to the app as both stdout and stderr; the app doesn't open it. `<id>` is `encodeURIComponent(app id)` (`appLog.logFile`). Directory mode `0700`, file mode `0600`. A failed open fails the start with the path in the error.
+- Stdout and stderr are interleaved in the order of the app's `write(2)` calls; an app's own stdio buffering can reorder its logical output.
+- Every start (Start, Restart, auto-start) truncates the file and deletes `<id>.log.1`.
+- The app's process holds the fd it was handed, so it keeps being written across code-hub restarts; an adopted app's output is readable there. An adopted app with no log file has no recoverable output (see `docs/architecture.md` → Startup reconciliation).
+- Rotation: every `LOG_SWEEP_MS`, any log over `LOG_CAP_BYTES` has its last `LOG_CAP_BYTES` copied to `<id>.log.1` (one generation, overwriting the previous; older bytes are dropped, and since the cut is byte-based the kept text can begin mid-line or mid-character) and is then truncated. Skipped for an app whose start is in progress (any readiness kind: the file is claimed from the start until it settles).
+- Retention: the `.log`/`.log.1` of an id that is not running and not mid-start is deleted once its last write is older than `LOG_RETENTION_MS`; an orphan `.log.1` likewise. A running app's log is never deleted. Stopping an app keeps its log.
+- Limitations: lines written between the copy and the truncate are lost. Nothing rotates while no code-hub runs, so the log can grow far past `LOG_CAP_BYTES`; the first sweep at boot keeps only its last `LOG_CAP_BYTES` in `.log.1` and drops the rest of the backlog. That `.log.1` stays until the next rotation overwrites it, the app's next start deletes it, or — for an id that is not running — retention removes it after `LOG_RETENTION_MS`.
+- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
 
 ## Machine-local registration: `registrations.json` (`<projectsRoot>/.code-hub/registrations.json`)
 

@@ -1,4 +1,4 @@
-import { promises as fs, readFileSync } from 'node:fs';
+import { promises as fs, readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import crypto from 'node:crypto';
 import net from 'node:net';
 import os from 'node:os';
@@ -472,4 +472,17 @@ export async function listeningAddrs(pid) {
     out.add(`${[n & 255, (n >>> 8) & 255, (n >>> 16) & 255, n >>> 24].join('.')}:${parseInt(portHex, 16)}`);
   }
   return out;
+}
+
+// The fds of THIS process that refer to `file` (Linux /proc). `writable` keeps
+// only those opened with write access.
+export function openFdsOf(file, { writable = false } = {}) {
+  return readdirSync('/proc/self/fd').filter((fd) => {
+    try {
+      if (readlinkSync(`/proc/self/fd/${fd}`) !== file) return false;
+      if (!writable) return true;
+      const flags = /flags:\s*(\d+)/.exec(readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8'))[1];
+      return (parseInt(flags, 8) & 3) !== 0;
+    } catch { return false; }
+  });
 }
