@@ -59,6 +59,35 @@ describe('groupApps', () => {
   it('an empty listing has no groups', () => {
     expect(groupApps([], 'edited')).toStrictEqual([]);
   });
+
+  const label = (g: ReturnType<typeof groupApps>[number]) => (g.kind === 'app' ? g.app.id : `orphan:${g.project}`);
+
+  // Invariant: under every sort the always-on host's group comes first, with its worktrees nested under it; the
+  // other groups keep exactly the order they would have without the host.
+  it('the always-on host leads under every sort; the rest keep their sorted order', () => {
+    // Without the pin the host sorts behind alpha under every key: oldest commit, name after alpha, running like alpha.
+    const host = app({ id: 'code-conductor', alwaysOn: true, status: 'running', lastCommitAt: '2026-01-01T00:00:00Z' });
+    const hostWorktree = app({ id: 'code-conductor:feat', isWorktree: true, branch: 'feat' });
+    const others = [
+      app({ id: 'alpha', status: 'running', lastCommitAt: '2026-05-01T00:00:00Z' }),
+      app({ id: 'beta', status: 'starting', lastCommitAt: '2026-03-01T00:00:00Z' }),
+      app({ id: 'zed', status: 'stopped', lastCommitAt: '2026-04-01T00:00:00Z' }),
+      app({ id: 'lost:k', isWorktree: true, branch: 'k' }),
+    ];
+    for (const sort of ['edited', 'name', 'status'] as const) {
+      const groups = groupApps([...others, hostWorktree, host], sort);
+      expect(label(groups[0])).toBe('code-conductor');
+      expect(ids(groups[0].worktrees)).toStrictEqual(['code-conductor:feat']);
+      expect(groups.slice(1).map(label)).toStrictEqual(groupApps(others, sort).map(label));
+      expect(label(groups[groups.length - 1])).toBe('orphan:lost');
+    }
+  });
+
+  // Invariant: the pin keys on alwaysOn, not on the code-conductor id — a standalone code-conductor sorts like any app.
+  it('a code-conductor app that is not always-on sorts like any other', () => {
+    const apps = [app({ id: 'code-conductor', alwaysOn: false }), app({ id: 'alpha' })];
+    expect(groupApps(apps, 'name').map(label)).toStrictEqual(['alpha', 'code-conductor']);
+  });
 });
 
 describe('controlsFor', () => {

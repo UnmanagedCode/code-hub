@@ -127,6 +127,25 @@ describe('list states', () => {
     await user.selectOptions(screen.getByLabelText('Sort'), 'name');
     expect(names()).toStrictEqual(['alpha', 'zed']);
   });
+
+  // Invariant: the always-on host's card renders first under every Sort option; the other cards stay in sort order.
+  it('the always-on host card renders first under every sort', async () => {
+    const user = userEvent.setup();
+    // Without the pin, alpha leads every sort.
+    stubFetch({ 'GET api/apps': listing([
+      app({ id: 'code-conductor', alwaysOn: true, status: 'running', lastCommitAt: '2026-01-01T00:00:00Z' }),
+      app({ id: 'alpha', status: 'running', lastCommitAt: '2026-05-01T00:00:00Z' }),
+      app({ id: 'zed', lastCommitAt: '2026-03-01T00:00:00Z' }),
+    ]) });
+    render(<App />);
+    await screen.findByRole('article', { name: 'code-conductor' });
+    const names = () => screen.getAllByRole('article').map((a) => a.getAttribute('aria-label'));
+    expect(names()).toStrictEqual(['code-conductor', 'alpha', 'zed']);
+    await user.selectOptions(screen.getByLabelText('Sort'), 'name');
+    expect(names()).toStrictEqual(['code-conductor', 'alpha', 'zed']);
+    await user.selectOptions(screen.getByLabelText('Sort'), 'status');
+    expect(names()).toStrictEqual(['code-conductor', 'alpha', 'zed']);
+  });
 });
 
 describe('layout', () => {
