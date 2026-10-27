@@ -21,9 +21,8 @@ export function logFile(id) {
 
 // A file is CLAIMED from before openForChild truncates it until its start
 // settles (the runner calls the returned `release`). The sweep never rotates or
-// deletes a claimed file: that closes the window where a fresh start's log is
-// stale or oversized by the previous run's leftovers, and the readiness tail
-// can't lose output to rotation.
+// deletes a claimed file, so the readiness tail can't lose output to rotation
+// and a log that is still starting can't be unlinked under its child.
 const claims = new Map(); // file → open claim count
 const isClaimed = (file) => claims.has(file);
 function claim(file) {
@@ -90,15 +89,34 @@ export function tail(file, maxBytes) {
   };
 }
 
-// One pass: delete logs of non-running ids idle past retention; copy-truncate
-// any other log over the cap. Claimed and running files are skipped by every
-// destructive step.
+// Keep the last `capBytes` of `file` in `file.1` (older bytes are dropped),
+// then truncate it. O_APPEND makes the child's next write land at the new end (0).
+function rotate(file, capBytes) {
+  const fd = fs.openSync(file, 'r');
+  let tailBytes;
+  try {
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, capBytes);
+    tailBytes = Buffer.alloc(len);
+    fs.readSync(fd, tailBytes, 0, len, size - len);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.writeFileSync(file + '.1', tailBytes, { mode: 0o600 });
+  fs.truncateSync(file, 0);
+}
+
+// One pass: delete logs of non-running ids idle past retention; rotate any
+// other log over the cap by keeping only its last `capBytes` in `.log.1` and
+// truncating it. Claimed files are never touched; running files are rotated
+// (by design) but never deleted.
 //
 // Synchronous on purpose: each check-then-act runs in one tick, so no start
 // (which claims synchronously in openForChild) can interleave between a check
-// and the rm/copy/truncate it guards, and two sweeps can never overlap. The
-// cost is blocking the event loop for the copy of at most one oversized log
-// per app. `now` and `capBytes` are test seams.
+// and the rm/rotate it guards, and two sweeps can never overlap. The cost is
+// blocking the event loop for at most `capBytes` read and written per over-cap
+// app per pass — including the boot pass, which runs before the hub listens.
+// `now` and `capBytes` are test seams.
 export function sweep({ running, now = Date.now(), capBytes = LOG_CAP_BYTES }) {
   const live = new Set([...running].map(logFile));
   const protectedFile = (file) => live.has(file) || isClaimed(file);
@@ -119,9 +137,7 @@ export function sweep({ running, now = Date.now(), capBytes = LOG_CAP_BYTES }) {
           fs.rmSync(file, { force: true });
           fs.rmSync(file + '.1', { force: true });
         } else if (st.size > capBytes) {
-          // O_APPEND makes the child's next write land at the new end (0).
-          fs.copyFileSync(file, file + '.1');
-          fs.truncateSync(file, 0);
+          rotate(file, capBytes);
         }
       } else if (name.endsWith('.log.1')) {
         const base = file.slice(0, -2);

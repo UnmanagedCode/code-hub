@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { promises as fs, closeSync, readFileSync, writeFileSync, existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
+import { promises as fs, closeSync, readFileSync, writeFileSync, existsSync, statSync, appendFileSync, mkdirSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
 import * as appManager from '../src/appManager.js';
@@ -33,10 +33,10 @@ test('rotation by the sweep truncates a live O_APPEND writer\'s file to the star
   t.after(() => proc.kill('SIGKILL'));
 
   await waitFor(() => statSync(file).size > cap);
-  await appLog.sweep({ running: ['rot'], capBytes: cap });
+  appLog.sweep({ running: ['rot'], capBytes: cap });
   const rotated = readFileSync(file + '.1', 'utf8');
-  assert.ok(rotated.length > cap);
-  assert.match(rotated, /^x{1023}\n/);
+  assert.equal(rotated.length, cap); // only the last capBytes are kept
+  assert.match(rotated, /^x*\n(x{1023}\n)+$/);
 
   await waitFor(() => statSync(file).size > 0);
   const now = readFileSync(file, 'utf8');
@@ -72,7 +72,7 @@ test('retention deletes only stale logs of non-running ids', async (t) => {
   }
   await Promise.all(['stale', 'staleRunning'].flatMap((id) => [
     fs.utimes(files[id], old, old), fs.utimes(files[id] + '.1', old, old)]));
-  await appLog.sweep({ running: ['staleRunning'], now });
+  appLog.sweep({ running: ['staleRunning'], now });
   assert.equal(existsSync(files.stale), false);
   assert.equal(existsSync(files.stale + '.1'), false);
   assert.equal(existsSync(files.staleRunning), true);
@@ -104,6 +104,21 @@ test('the sweep skips a claimed file for rotation and for retention, until relea
   appLog.sweep({ running: [], capBytes: 1024 });
   assert.equal(existsSync(file), false);
   assert.equal(existsSync(file + '.1'), false);
+});
+
+// Pins: a claim's release is idempotent per claim — releasing the FIRST of two
+// claims twice must not drop the second's claim (a shared counter would).
+test('a double release of one claim does not free another start\'s claim', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const first = appLog.openForChild('dr'); closeSync(first.fd);
+  const second = appLog.openForChild('dr'); closeSync(second.fd);
+  writeFileSync(second.file, 'y'.repeat(4096));
+  first.release();
+  first.release();
+  appLog.sweep({ running: [], capBytes: 1024 });
+  assert.equal(statSync(second.file).size, 4096);
+  second.release();
 });
 
 // Pins: claims are counted per start — releasing one of two overlapping starts
@@ -172,7 +187,7 @@ test('startSweep rotates on a later tick and a second call replaces the first in
   appLog.startSweep(() => { b += 1; return ['g']; }, { intervalMs: 10, capBytes: 100 });
   const file = writeLog('g', 'z'.repeat(500));
   await waitFor(() => existsSync(file + '.1'));
-  assert.equal(readFileSync(file + '.1', 'utf8').length, 500);
+  assert.equal(readFileSync(file + '.1', 'utf8'), 'z'.repeat(100));
   assert.equal(statSync(file).size, 0);
   await waitFor(() => b >= 3);
   assert.equal(a, 1, 'the replaced interval must not keep ticking');
@@ -250,7 +265,38 @@ test('appManager.init sweeps once at boot', async (t) => {
   await appManager.init();
 
   assert.equal(statSync(big).size, 0);
-  assert.equal(statSync(big + '.1').size, appLog.LOG_CAP_BYTES + 1);
+  assert.equal(statSync(big + '.1').size, appLog.LOG_CAP_BYTES);
   assert.equal(existsSync(stale), false);
   assert.equal(pidAlive(child.pid), true);
+});
+
+// Pins: rotation keeps only the LAST capBytes in .log.1 (bounded copy; older
+// backlog is dropped) and truncates the live file.
+test('rotation keeps only the last capBytes of an oversized log', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const cap = 100;
+  const content = Array.from({ length: 50 }, (_, i) => String(i).padStart(9, '0') + '\n').join('');
+  const file = writeLog('big', content);
+  appLog.sweep({ running: ['big'], capBytes: cap });
+  assert.equal(statSync(file).size, 0);
+  const kept = readFileSync(file + '.1', 'utf8');
+  assert.equal(kept.length, cap);
+  assert.equal(kept, content.slice(-cap));
+});
+
+// Pins: a failing openForChild (its .log.1 reset throws) releases its claim, so
+// the file is sweepable afterwards.
+test('openForChild failing releases its claim', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const file = appLog.logFile('fail');
+  mkdirSync(file + '.1', { recursive: true });
+  assert.throws(() => appLog.openForChild('fail'), /cannot reset/);
+  rmSync(file + '.1', { recursive: true });
+  writeFileSync(file, 'x');
+  const old = new Date(Date.now() - appLog.LOG_RETENTION_MS - 60_000);
+  await fs.utimes(file, old, old);
+  appLog.sweep({ running: [] });
+  assert.equal(existsSync(file), false);
 });

@@ -5,10 +5,10 @@ import net from 'node:net';
 import * as runner from '../src/runner.js';
 import { allocatePort } from '../src/net.js';
 import path from 'node:path';
-import { promises as fs, existsSync, readFileSync, writeFileSync, readdirSync, readlinkSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
-import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd, openFdsOf } from './helpers.mjs';
 
 function get(port) {
   return new Promise((resolve, reject) => {
@@ -272,7 +272,7 @@ test('a ready app\'s log grows past the cap and the sweep rotates it', async (t)
   const file = appLog.logFile('rot');
   await waitFor(() => readFileSync(file, 'utf8').length > 100);
   appLog.sweep({ running: ['rot'], capBytes: 100 });
-  assert.ok(readFileSync(file + '.1', 'utf8').length > 100);
+  assert.equal(readFileSync(file + '.1', 'utf8').length, 100);
 });
 
 // Pins: a crashed start also releases its claim (the exit/settle path), so its
@@ -285,8 +285,9 @@ test('a crashed start\'s log is no longer claimed and is rotated by the sweep', 
   const app = { id: 'crashlog', path: dir, manifest: { start, healthPath: null, readyWhen: null } };
   await runner.start(app, await allocatePort());
   await waitFor(() => runner.runtime('crashlog')?.status === 'crashed');
-  appLog.sweep({ running: [], capBytes: 1 });
-  assert.match(readFileSync(appLog.logFile('crashlog') + '.1', 'utf8'), /boom: could not start/);
+  appLog.sweep({ running: [], capBytes: 10 });
+  assert.match(readFileSync(appLog.logFile('crashlog') + '.1', 'utf8'), /^not start\n$/);
+  assert.deepEqual(openFdsOf(appLog.logFile('crashlog')), []);
 });
 
 // Pins: while a start is in progress its log is claimed — a sweep far past
@@ -308,13 +309,59 @@ test('a starting app\'s log is protected, and the parent holds no write fd to it
   appLog.sweep({ running: [], now: Date.now() + 2 * appLog.LOG_RETENTION_MS });
   assert.equal(existsSync(file), true);
 
-  const fds = () => readdirSync('/proc/self/fd').filter((fd) => {
-    try { return readlinkSync(`/proc/self/fd/${fd}`) === file; } catch { return false; }
-  });
-  const writable = (fd) => (parseInt(/flags:\s*(\d+)/.exec(readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8'))[1], 8) & 3) !== 0;
-  assert.deepEqual(fds().filter(writable), []);
+  assert.deepEqual(openFdsOf(file, { writable: true }), []);
 
   writeFileSync(marker, 'go');
   await waitFor(() => runner.runtime('gate')?.status === 'ready');
-  assert.deepEqual(fds(), []);
+  assert.deepEqual(openFdsOf(file), []);
+});
+
+const sweepable = (file) => { // true once the file's claim is gone: an over-cap sweep empties it
+  appLog.sweep({ running: [], capBytes: 1 });
+  return statSync(file).size === 0;
+};
+
+// Pins: a spawn that throws synchronously (invalid cwd type) still releases
+// the claim and closes the tail — nothing leaks and the log is sweepable.
+test('a synchronous spawn failure rejects start and releases the log claim and fds', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const app = { id: 'syncfail', path: 123, manifest: { start: 'true', healthPath: null, readyWhen: null } };
+  await assert.rejects(async () => runner.start(app, await allocatePort()), { code: 'ERR_INVALID_ARG_TYPE' });
+  const file = appLog.logFile('syncfail');
+  writeFileSync(file, 'junk');
+  assert.deepEqual(openFdsOf(file), []);
+  assert.equal(sweepable(file), true);
+});
+
+// Pins: an asynchronous spawn failure (ENOENT cwd, via proc 'error') settles
+// crashed and releases the claim and tail.
+test('an asynchronous spawn failure settles crashed and releases the log claim and fds', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const app = { id: 'asyncfail', path: '/no/such/dir', manifest: { start: 'true', healthPath: null, readyWhen: null } };
+  const rec = await runner.start(app, await allocatePort());
+  assert.equal(await rec.settled, 'crashed');
+  const file = appLog.logFile('asyncfail');
+  writeFileSync(file, 'junk');
+  assert.deepEqual(openFdsOf(file), []);
+  assert.equal(sweepable(file), true);
+});
+
+// Pins: readiness setup that throws synchronously (an invalid readyWhen handed
+// straight to the runner) still settles crashed and releases claim and tail.
+test('a synchronous detectReady throw settles crashed and releases the log claim and fds', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const start = fakeAppCmd();
+  const dir = await mkProject(root, 'app', { start });
+  const app = { id: 'badre', path: dir, manifest: { start, healthPath: null, readyWhen: '(' } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => runner.stop({ id: 'badre', pgid: rec.pgid }));
+  assert.equal(await rec.settled, 'crashed');
+  assert.match(runner.runtime('badre').error, /./);
+  const file = appLog.logFile('badre');
+  await waitFor(() => readFileSync(file, 'utf8').includes('listening'));
+  assert.deepEqual(openFdsOf(file), []);
+  assert.equal(sweepable(file), true);
 });

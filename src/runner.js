@@ -50,8 +50,7 @@ function settle(c, status, error = null) {
   c.status = status;
   c.error = error;
   c.resolveSettled(status);
-  c.tail.close();
-  c.release(); // the sweep may rotate this log again
+  try { c.tail.close(); } finally { c.release(); } // the sweep may rotate this log again
 }
 
 // Spawn the manifest's blocking start command in its OWN process group
@@ -140,10 +139,14 @@ export async function start(app, port, { fixed = false } = {}) {
     }
 
     if (c.status === 'starting') {
-      detectReady(app, port, c).then(
-        () => settle(c, 'ready'),
-        (e) => settle(c, 'crashed', e.message),
-      );
+      try {
+        detectReady(app, port, c).then(
+          () => settle(c, 'ready'),
+          (e) => settle(c, 'crashed', e.message),
+        );
+      } catch (e) {
+        settle(c, 'crashed', e.message); // a synchronous throw (e.g. an invalid readyWhen) must still release the claim
+      }
     }
     return { pid: c.proc.pid, pgid: c.proc.pid, port, startedAt: new Date().toISOString(), settled: c.settled };
   }
