@@ -25,12 +25,13 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
 
 ## App output logs: `<projectsRoot>/.code-hub/logs/`
 
-- Each started app's stdout and stderr (interleaved in write order) go to `<id>.log`, where `<id>` is `encodeURIComponent(app id)` (`appLog.logFile`). Directory mode `0700`, file mode `0600`.
+- code-hub opens `<id>.log` (`O_APPEND`) and hands the fd to the app as both stdout and stderr; the app doesn't open it. `<id>` is `encodeURIComponent(app id)` (`appLog.logFile`). Directory mode `0700`, file mode `0600`. A failed open fails the start with the path in the error.
+- Stdout and stderr are interleaved in the order of the app's `write(2)` calls; an app's own stdio buffering can reorder its logical output.
 - Every start (Start, Restart, auto-start) truncates the file and deletes `<id>.log.1`.
-- The file is opened `O_APPEND` by the app's own process, so it keeps being written across code-hub restarts; an adopted app's output is readable there.
-- Rotation: every `LOG_SWEEP_MS`, a log over `LOG_CAP_BYTES` is copied to `<id>.log.1` (one generation) and truncated. Skipped while a `readyWhen` readiness check is reading that file.
-- Retention: the `.log`/`.log.1` of an id that is not running is deleted once its last write is older than `LOG_RETENTION_MS`. A running app's log is never deleted. Stopping an app keeps its log.
-- Limitations: lines written between the copy and the truncate are lost; nothing rotates while no code-hub runs (the first sweep at boot catches up); an app started without a log file has none.
+- The app holds the file open itself, so it keeps being written across code-hub restarts; an adopted app's output is readable there (an app started before this existed has none — see `docs/architecture.md` → Startup reconciliation).
+- Rotation: every `LOG_SWEEP_MS`, any log over `LOG_CAP_BYTES` is copied to `<id>.log.1` (one generation, overwriting the previous) and truncated. Skipped for an app whose start is in progress (any readiness kind: the file is claimed from the start until it settles).
+- Retention: the `.log`/`.log.1` of an id that is not running and not mid-start is deleted once its last write is older than `LOG_RETENTION_MS`; an orphan `.log.1` likewise. A running app's log is never deleted. Stopping an app keeps its log.
+- Limitations: lines written between the copy and the truncate are lost. Nothing rotates while no code-hub runs, so the log can grow far past `LOG_CAP_BYTES`; the first sweep at boot then copies the whole backlog to `.log.1` in one go, where it stays (above the cap) until the next rotation overwrites it or the app's next start deletes it.
 - Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
 
 ## Machine-local registration: `registrations.json` (`<projectsRoot>/.code-hub/registrations.json`)

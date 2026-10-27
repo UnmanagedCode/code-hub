@@ -51,6 +51,7 @@ function settle(c, status, error = null) {
   c.error = error;
   c.resolveSettled(status);
   c.tail.close();
+  c.release(); // the sweep may rotate this log again
 }
 
 // Spawn the manifest's blocking start command in its OWN process group
@@ -58,19 +59,24 @@ function settle(c, status, error = null) {
 function spawnChild(app, port) {
   // stdout and stderr share one O_APPEND fd, so they stay interleaved in write
   // order and no code-hub process is in the output path.
-  const { fd, file } = appLog.openForChild(app.id);
-  let proc;
+  const { fd, file, release } = appLog.openForChild(app.id);
+  let proc, tail;
   try {
+    tail = appLog.tail(file, OUTPUT_CAP);
     proc = spawn('bash', ['-lc', app.manifest.start], {
       cwd: app.path,
       env: { ...process.env, PORT: String(port) },
       detached: true,
       stdio: ['ignore', fd, fd],
     });
+  } catch (e) {
+    tail?.close();
+    release();
+    throw e;
   } finally {
     closeSync(fd);
   }
-  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0, tail: appLog.tail(file, OUTPUT_CAP) };
+  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0, tail, release };
   c.settled = new Promise((resolve) => { c.resolveSettled = resolve; });
 
   proc.on('exit', (code, signal) => {

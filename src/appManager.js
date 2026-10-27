@@ -103,7 +103,7 @@ export async function init() {
   // because their records no longer hold them to be swept.
   const { strandedShares } = await state.reconcile(store);
   for (const { id, tunnel: t } of strandedShares) killShareChild(id, t, { verify: true });
-  await appLog.startSweep(() => Object.keys(store.apps));
+  appLog.startSweep(() => Object.keys(store.apps));
   // A persisted share from before a restart points at an auth proxy that no
   // longer exists (in-process, gone with the old code-hub). Tear the orphaned
   // child down so it can't serve a broken URL — the share simply needs

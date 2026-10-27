@@ -5,7 +5,7 @@ import net from 'node:net';
 import * as runner from '../src/runner.js';
 import { allocatePort } from '../src/net.js';
 import path from 'node:path';
-import { promises as fs, existsSync, readFileSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, writeFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
 import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd } from './helpers.mjs';
@@ -256,4 +256,65 @@ test('an app keeps running, writing and serving after the code-hub that launched
   assert.equal(pidAlive(pid), true);
   assert.equal(existsSync(marker), false, existsSync(marker) ? readFileSync(marker, 'utf8') : '');
   assert.equal(await get(port), 200);
+});
+
+// Pins: settle() releases the start's claim and closes its tail on the ready
+// path — without it the sweep would never rotate a running app's log.
+test('a ready app\'s log grows past the cap and the sweep rotates it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const start = fakeAppCmd('chatty', path.join(root, 'marker'));
+  const dir = await mkProject(root, 'app', { start });
+  const app = { id: 'rot', path: dir, manifest: { start, healthPath: null, readyWhen: null } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => runner.stop({ id: 'rot', pgid: rec.pgid }));
+  await waitFor(() => runner.runtime('rot')?.status === 'ready');
+  const file = appLog.logFile('rot');
+  await waitFor(() => readFileSync(file, 'utf8').length > 100);
+  appLog.sweep({ running: ['rot'], capBytes: 100 });
+  assert.ok(readFileSync(file + '.1', 'utf8').length > 100);
+});
+
+// Pins: a crashed start also releases its claim (the exit/settle path), so its
+// log is swept — and stays inspectable until then.
+test('a crashed start\'s log is no longer claimed and is rotated by the sweep', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const start = fakeAppCmd('crash');
+  const dir = await mkProject(root, 'app', { start });
+  const app = { id: 'crashlog', path: dir, manifest: { start, healthPath: null, readyWhen: null } };
+  await runner.start(app, await allocatePort());
+  await waitFor(() => runner.runtime('crashlog')?.status === 'crashed');
+  appLog.sweep({ running: [], capBytes: 1 });
+  assert.match(readFileSync(appLog.logFile('crashlog') + '.1', 'utf8'), /boom: could not start/);
+});
+
+// Pins: while a start is in progress its log is claimed — a sweep far past
+// retention, with the id not yet in the running set, leaves it alone — and the
+// parent closes its write fd after spawn (no fd of this process can write the
+// log; once settled, none refers to it at all).
+test('a starting app\'s log is protected, and the parent holds no write fd to it', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const marker = path.join(root, 'gate');
+  const start = fakeAppCmd('gated', marker);
+  const dir = await mkProject(root, 'app', { start });
+  const app = { id: 'gate', path: dir, manifest: { start, healthPath: null, readyWhen: null } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => runner.stop({ id: 'gate', pgid: rec.pgid }));
+  assert.equal(runner.runtime('gate').status, 'starting');
+  const file = appLog.logFile('gate');
+
+  appLog.sweep({ running: [], now: Date.now() + 2 * appLog.LOG_RETENTION_MS });
+  assert.equal(existsSync(file), true);
+
+  const fds = () => readdirSync('/proc/self/fd').filter((fd) => {
+    try { return readlinkSync(`/proc/self/fd/${fd}`) === file; } catch { return false; }
+  });
+  const writable = (fd) => (parseInt(/flags:\s*(\d+)/.exec(readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8'))[1], 8) & 3) !== 0;
+  assert.deepEqual(fds().filter(writable), []);
+
+  writeFileSync(marker, 'go');
+  await waitFor(() => runner.runtime('gate')?.status === 'ready');
+  assert.deepEqual(fds(), []);
 });

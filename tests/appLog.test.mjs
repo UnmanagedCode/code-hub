@@ -24,11 +24,12 @@ test('rotation by the sweep truncates a live O_APPEND writer\'s file to the star
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const cap = 8 * 1024;
-  const { fd, file } = appLog.openForChild('rot');
+  const { fd, file, release } = appLog.openForChild('rot');
   const line = 'x'.repeat(1023) + '\n';
   const proc = spawn(process.execPath, ['-e',
     `setInterval(() => process.stdout.write(${JSON.stringify(line)}), 10)`], { stdio: ['ignore', fd, fd] });
   closeSync(fd);
+  release(); // the start has settled
   t.after(() => proc.kill('SIGKILL'));
 
   await waitFor(() => statSync(file).size > cap);
@@ -79,21 +80,102 @@ test('retention deletes only stale logs of non-running ids', async (t) => {
   assert.equal(existsSync(files.fresh), true);
 });
 
-// Pins: readiness can't lose output to rotation while a tail is open.
-test('the sweep never rotates a file being tailed', async (t) => {
+// Pins: a file claimed by a start (from openForChild until release) is never
+// rotated or deleted by the sweep — however oversized or stale, and even when
+// its id isn't in the running set yet — and is swept normally once released.
+// This is what keeps a fresh start's output (a readyWhen marker) from being
+// wiped, and a just-opened live log from being unlinked.
+test('the sweep skips a claimed file for rotation and for retention, until released', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await mkLogsDir('t');
-  const f = writeLog('t', 'y'.repeat(4096));
-  const tl = appLog.tail(f, 1024);
-  await appLog.sweep({ running: ['t'], capBytes: 1024 });
-  assert.equal(statSync(f).size, 4096);
-  assert.equal(existsSync(f + '.1'), false);
-  tl.close();
-  tl.close(); // idempotent
-  await appLog.sweep({ running: ['t'], capBytes: 1024 });
-  assert.equal(statSync(f).size, 0);
-  assert.equal(statSync(f + '.1').size, 4096);
+  const { fd, file, release } = appLog.openForChild('c');
+  closeSync(fd);
+  writeFileSync(file, 'y'.repeat(4096));
+  writeFileSync(file + '.1', 'older');
+  const old = new Date(Date.now() - appLog.LOG_RETENTION_MS - 60_000);
+  await fs.utimes(file, old, old);
+
+  appLog.sweep({ running: [], capBytes: 1024 });
+  assert.equal(statSync(file).size, 4096);
+  assert.equal(readFileSync(file + '.1', 'utf8'), 'older');
+
+  release();
+  release(); // idempotent: a second release can't free another start's claim
+  appLog.sweep({ running: [], capBytes: 1024 });
+  assert.equal(existsSync(file), false);
+  assert.equal(existsSync(file + '.1'), false);
+});
+
+// Pins: claims are counted per start — releasing one of two overlapping starts
+// of the same id leaves the file protected.
+test('overlapping claims of one file keep it protected until the last release', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const first = appLog.openForChild('o'); closeSync(first.fd);
+  const second = appLog.openForChild('o'); closeSync(second.fd);
+  writeFileSync(second.file, 'y'.repeat(4096));
+  first.release();
+  appLog.sweep({ running: [], capBytes: 1024 });
+  assert.equal(statSync(second.file).size, 4096);
+  second.release();
+  appLog.sweep({ running: [], capBytes: 1024 });
+  assert.equal(statSync(second.file).size, 0);
+});
+
+// Pins: a stale orphan `.log.1` (no `.log` beside it) is removed only when its
+// id is neither running nor claimed, and only once past retention.
+test('an orphan .log.1 is deleted when stale and not live, and kept when live, claimed or fresh', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const now = Date.now();
+  const old = new Date(now - appLog.LOG_RETENTION_MS - 60_000);
+  const mk = async (id, when) => {
+    const f = writeLog(id, 'x', '.1');
+    await fs.utimes(f, when, when);
+    return f;
+  };
+  const gone = await mk('gone', old);
+  const live = await mk('live', old);
+  const fresh = await mk('fresh', new Date(now));
+  const c = appLog.openForChild('claimed'); // removes any .1, so claim first
+  closeSync(c.fd);
+  await fs.rm(c.file);
+  const claimed = await mk('claimed', old);
+
+  appLog.sweep({ running: ['live'], now });
+  assert.equal(existsSync(gone), false);
+  assert.equal(existsSync(live), true);
+  assert.equal(existsSync(fresh), true);
+  assert.equal(existsSync(claimed), true);
+  c.release();
+});
+
+// Pins: the log file is 0600 and its directory 0700 (output can hold secrets).
+test('the log file is created 0600 inside a 0700 directory', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const { fd, file, release } = appLog.openForChild('m');
+  closeSync(fd);
+  release();
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(statSync(path.dirname(file)).mode & 0o777, 0o700);
+});
+
+// Pins: startSweep ticks periodically (a later tick rotates a log that grew
+// after the initial pass) and is idempotent — a second call replaces the first
+// interval instead of leaking it.
+test('startSweep rotates on a later tick and a second call replaces the first interval', async (t) => {
+  const root = await mkRoot();
+  t.after(() => { appLog.stopSweep(); return rmRoot(root); });
+  let a = 0; let b = 0;
+  appLog.startSweep(() => { a += 1; return ['g']; }, { intervalMs: 10, capBytes: 100 });
+  appLog.startSweep(() => { b += 1; return ['g']; }, { intervalMs: 10, capBytes: 100 });
+  const file = writeLog('g', 'z'.repeat(500));
+  await waitFor(() => existsSync(file + '.1'));
+  assert.equal(readFileSync(file + '.1', 'utf8').length, 500);
+  assert.equal(statSync(file).size, 0);
+  await waitFor(() => b >= 3);
+  assert.equal(a, 1, 'the replaced interval must not keep ticking');
 });
 
 // Pins: a per-tick read never exceeds the cap (so readyWhen's scanned surface
@@ -117,6 +199,23 @@ test('a tail read is bounded and decodes multi-byte chars across reads', async (
   const first = tl.read().text;
   appendFileSync(f, euro.subarray(2));
   assert.equal(first + tl.read().text, '€');
+});
+
+// Pins: when a read skips ahead, the decoder drops a pending partial character
+// from before the skip instead of emitting U+FFFD into the new text.
+test('a skip discards a pending partial multi-byte char (no U+FFFD)', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  await mkLogsDir('d');
+  const f = writeLog('d', '');
+  const tl = appLog.tail(f, 100);
+  t.after(() => tl.close());
+  appendFileSync(f, Buffer.from('€').subarray(0, 2));
+  assert.equal(tl.read().text, '');
+  appendFileSync(f, 'a'.repeat(300));
+  const r = tl.read();
+  assert.equal(r.text, 'a'.repeat(100));
+  assert.equal(r.skipped, 200);
 });
 
 // Pins: the id → filename mapping is injective and confined to the logs dir.
