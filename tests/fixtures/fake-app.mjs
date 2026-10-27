@@ -30,6 +30,10 @@
 //   backtrack   → prints 32 'a's and a '!' before binding, then behaves as
 //                 default. Output that makes a pattern like (a|a)+$ take
 //                 tens of seconds per unprotected check.
+//   chatty      → same as default, then every 20ms writes "tick <n>" alternating
+//                 stdout/stderr. An 'error' on stdout/stderr or an uncaught
+//                 exception is appended to $FAKE_APP_MARKER and the app keeps
+//                 running, as Next's dev server does.
 import http from 'node:http';
 import { READY_OVERLAP_CHARS } from '../../src/readyWhen.js';
 
@@ -76,6 +80,19 @@ server.listen(port, host, () => {
     if (process.env.FAKE_APP_MODE === 'flood') console.log('x'.repeat(2 * READY_OVERLAP_CHARS));
   }
 });
+
+if (process.env.FAKE_APP_MODE === 'chatty') {
+  const { appendFileSync } = await import('node:fs');
+  const record = (what) => (e) => appendFileSync(process.env.FAKE_APP_MARKER, `${what}:${e.code ?? e.message}\n`);
+  process.stdout.on('error', record('stdout'));
+  process.stderr.on('error', record('stderr'));
+  process.on('uncaughtException', record('uncaught'));
+  let n = 0;
+  setInterval(() => {
+    n += 1;
+    (n % 2 ? process.stdout : process.stderr).write(`tick ${n}\n`);
+  }, 20);
+}
 
 // Keep the process alive and exit cleanly on SIGTERM so process-group kill is
 // observable in tests.

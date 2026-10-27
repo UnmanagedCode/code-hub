@@ -1,19 +1,21 @@
 import { spawn } from 'node:child_process';
+import { closeSync } from 'node:fs';
 import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
 import { pidAlive } from './state.js';
 import { createReadyMatcher } from './readyWhen.js';
+import * as appLog from './appLog.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
 const READY_TIMEOUT_MS = 30000;
-const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring
+const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring, fed from the log file; also caps each read
 const EADDRINUSE_RETRIES = 3;
 const SPAWN_SETTLE_MS = 400; // window to catch a fast EADDRINUSE crash before committing to this attempt's port
 
 // In-memory runtime for children spawned by THIS code-hub process. Apps
-// adopted after a restart have no entry here (we can't recapture their
-// stdout) and are treated as already-ready by the app manager.
-const children = new Map(); // id → { proc, pgid, status, error, output, total }
+// adopted after a restart have no entry here and are treated as already-ready
+// by the app manager; their output is still in appLog.logFile(id).
+const children = new Map(); // id → { proc, pgid, status, error, output, total, tail }
 
 // Called with the app id whenever a child this process spawned exits, for any
 // reason — a crash, the app stopping on its own, or a kill.
@@ -28,10 +30,16 @@ export function runtime(id) {
   return { status: c.status, error: c.error, output: c.output };
 }
 
-function appendOutput(c, chunk) {
+function appendOutput(c, chunk, skipped = 0) {
   c.output += chunk;
-  c.total += chunk.length;
+  c.total += chunk.length + skipped;
   if (c.output.length > OUTPUT_CAP) c.output = c.output.slice(-OUTPUT_CAP);
+}
+
+// Pull the bytes the app has written to its log since the last pump into the ring.
+function pump(c) {
+  const { text, skipped } = c.tail.read();
+  appendOutput(c, text, skipped);
 }
 
 // The single exit from 'starting': resolves the child's `settled` promise
@@ -42,28 +50,35 @@ function settle(c, status, error = null) {
   c.status = status;
   c.error = error;
   c.resolveSettled(status);
+  c.tail.close();
 }
 
 // Spawn the manifest's blocking start command in its OWN process group
 // (detached ⇒ child is group leader ⇒ pgid === pid), with PORT injected.
 function spawnChild(app, port) {
-  const proc = spawn('bash', ['-lc', app.manifest.start], {
-    cwd: app.path,
-    env: { ...process.env, PORT: String(port) },
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0 };
+  // stdout and stderr share one O_APPEND fd, so they stay interleaved in write
+  // order and no code-hub process is in the output path.
+  const { fd, file } = appLog.openForChild(app.id);
+  let proc;
+  try {
+    proc = spawn('bash', ['-lc', app.manifest.start], {
+      cwd: app.path,
+      env: { ...process.env, PORT: String(port) },
+      detached: true,
+      stdio: ['ignore', fd, fd],
+    });
+  } finally {
+    closeSync(fd);
+  }
+  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0, tail: appLog.tail(file, OUTPUT_CAP) };
   c.settled = new Promise((resolve) => { c.resolveSettled = resolve; });
-
-  const onData = (d) => appendOutput(c, d.toString());
-  proc.stdout.on('data', onData);
-  proc.stderr.on('data', onData);
 
   proc.on('exit', (code, signal) => {
     // Exit before readiness = crash; after = the app stopped on its own.
-    if (c.status === 'starting') settle(c, 'crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
-    else if (c.status === 'ready') c.status = 'exited';
+    if (c.status === 'starting') {
+      pump(c); // drain the log first so the tail (and raceSettle's EADDRINUSE check) sees the app's last output
+      settle(c, 'crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
+    } else if (c.status === 'ready') c.status = 'exited';
     for (const listener of exitListeners) {
       try { listener(app.id); } catch (e) { console.error(`[runner] exit listener failed: ${e.message}`); }
     }
@@ -132,7 +147,7 @@ function detectReady(app, port, c) {
   const { readyWhen, healthPath } = app.manifest;
   if (readyWhen) {
     const m = createReadyMatcher(readyWhen);
-    return poll(() => m.scan(c.output, c.total));
+    return poll(() => { pump(c); return m.scan(c.output, c.total); });
   }
   if (healthPath) {
     return poll(() => httpOk(port, healthPath));

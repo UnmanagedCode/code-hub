@@ -7,7 +7,7 @@
 | `start` | string | **yes** | Blocking foreground command. Must bind `$PORT` and stay up until killed. Run via `bash -lc` in its own process group with `env.PORT` set to the app's port: the app's Settings `port`, else the manifest's `port`, on a non-worktree checkout, otherwise an allocated free port. |
 | `name` | string | no | Display name (default: directory basename). |
 | `healthPath` | string | no | HTTP path polled for readiness; any HTTP response = ready. |
-| `readyWhen` | string | no | Regex matched against the child's stdout/stderr to detect readiness. Matched in bounded windows under a time limit; see "`readyWhen` matching" below. |
+| `readyWhen` | string | no | Regex matched against the child's stdout/stderr, read back from its log file (see "App output logs"), to detect readiness. Matched in bounded windows under a time limit; see "`readyWhen` matching" below. |
 | `port` | integer | no | Fixed port for the **default checkout**; `1024`–`65535`. When absent, a free ephemeral port is allocated on every start. Worktrees always get a free port and never inherit this. An app's Settings `port` overrides it. An app's Settings `port` overrides it. A busy fixed port **refuses the start** (`409`) rather than falling back — a port that quietly moves defeats the point of pinning it. |
 | `routes` | array | no | Named URLs the app serves. Non-empty array of `{ name, path }`; `name` a non-empty string, `path` a string starting with `/`. When absent, a single implicit route at `/` is used. |
 
@@ -22,6 +22,16 @@ Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe
 - The load-time check is a heuristic. It does not catch overlapping alternation under repetition (`(a|a)+$`), adjacent overlapping quantifiers (`.*a.*b.*c`) or backreferences; the slice size and the deadline bound those.
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
+
+## App output logs: `<projectsRoot>/.code-hub/logs/`
+
+- Each started app's stdout and stderr (interleaved in write order) go to `<id>.log`, where `<id>` is `encodeURIComponent(app id)` (`appLog.logFile`). Directory mode `0700`, file mode `0600`.
+- Every start (Start, Restart, auto-start) truncates the file and deletes `<id>.log.1`.
+- The file is opened `O_APPEND` by the app's own process, so it keeps being written across code-hub restarts; an adopted app's output is readable there.
+- Rotation: every `LOG_SWEEP_MS`, a log over `LOG_CAP_BYTES` is copied to `<id>.log.1` (one generation) and truncated. Skipped while a `readyWhen` readiness check is reading that file.
+- Retention: the `.log`/`.log.1` of an id that is not running is deleted once its last write is older than `LOG_RETENTION_MS`. A running app's log is never deleted. Stopping an app keeps its log.
+- Limitations: lines written between the copy and the truncate are lost; nothing rotates while no code-hub runs (the first sweep at boot catches up); an app started without a log file has none.
+- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
 
 ## Machine-local registration: `registrations.json` (`<projectsRoot>/.code-hub/registrations.json`)
 

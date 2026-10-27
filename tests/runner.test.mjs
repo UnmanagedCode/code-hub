@@ -5,7 +5,9 @@ import net from 'node:net';
 import * as runner from '../src/runner.js';
 import { allocatePort } from '../src/net.js';
 import path from 'node:path';
-import { promises as fs } from 'node:fs';
+import { promises as fs, existsSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import * as appLog from '../src/appLog.js';
 import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd } from './helpers.mjs';
 
 function get(port) {
@@ -85,7 +87,7 @@ test('a start command that exits immediately is reported crashed with a tail', a
   const port = await allocatePort();
   await runner.start(app, port);
   await waitFor(() => runner.runtime('boom')?.status === 'crashed');
-  assert.match(runner.runtime('boom').error, /exited|boom/);
+  assert.match(runner.runtime('boom').error, /boom: could not start/);
 });
 
 test('EADDRINUSE on first bind triggers a retry on a new port', async (t) => {
@@ -219,4 +221,39 @@ test('onExit listeners hear every child exit with the app id: crash, self-exit a
   assert.equal(await stopped.settled, 'ready');
   runner.stop({ id: 'exit-stop', pgid: stopped.pgid });
   await waitFor(() => heard.includes('exit-stop'));
+});
+
+// Pins: the app's output path depends on no code-hub process staying alive —
+// after the launcher is SIGKILLed the app neither hits EPIPE nor stops serving,
+// and its post-launcher output is readable at appLog.logFile for a new hub.
+test('an app keeps running, writing and serving after the code-hub that launched it is killed', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const marker = path.join(root, 'marker');
+  const start = fakeAppCmd('chatty', marker);
+  const dir = await mkProject(root, 'app', { start });
+  const port = await allocatePort();
+
+  const launcher = spawn(process.execPath,
+    [new URL('./fixtures/launch-app.mjs', import.meta.url).pathname, 'chat', dir, start, String(port)],
+    { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, PROJECTS_ROOT: root } });
+  t.after(() => launcher.kill('SIGKILL'));
+  let out = '';
+  launcher.stdout.on('data', (d) => { out += d; });
+  await waitFor(() => out.includes('\n'));
+  const { status, pid, pgid } = JSON.parse(out);
+  t.after(() => { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } });
+  assert.equal(status, 'ready');
+
+  const exited = new Promise((r) => launcher.on('exit', r));
+  launcher.kill('SIGKILL');
+  await exited;
+
+  const maxTick = () => Math.max(0, ...[...readFileSync(appLog.logFile('chat'), 'utf8').matchAll(/tick (\d+)/g)].map((m) => Number(m[1])));
+  const before = maxTick();
+  await waitFor(() => maxTick() >= before + 5);
+
+  assert.equal(pidAlive(pid), true);
+  assert.equal(existsSync(marker), false, existsSync(marker) ? readFileSync(marker, 'utf8') : '');
+  assert.equal(await get(port), 200);
 });
