@@ -79,6 +79,8 @@ test('restart of a fixed-port app whose old process exits slowly returns 200 on 
   const restarted = await j(base, 'POST', '/api/apps/app/restart');
   assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
   assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
   assert.equal(restarted.body.fixedPort, a);
 });
 
@@ -93,6 +95,23 @@ test('restart of a fixed-port app whose leader exits at once but a group child h
   const restarted = await j(base, 'POST', '/api/apps/app/restart');
   assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
   assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
+});
+
+// Invariant: a same-group member that ignores SIGTERM is SIGKILLed after the
+// grace even though the leader is already gone, so the restart still gets its
+// fixed port back and the new instance serves on it.
+test('restart of a fixed-port app whose group child ignores SIGTERM returns 200 and serves on the same port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('groupstubborn'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
 });
 
 // Invariant: clearing the Settings port falls back to the manifest's.

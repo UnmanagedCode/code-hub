@@ -40,13 +40,17 @@
 //   groupchild  → the leader spawns a `slowexit` copy of this fixture into its own
 //                 process group and exits at once on SIGTERM, leaving only the
 //                 child holding $PORT (the `npm` → `node` wrapper shape).
+//   groupstubborn → like groupchild, but the same-group child ignores SIGTERM (only
+//                 SIGKILL ends it) while the leader exits at once.
+//   ignoreterm  → same as default, but SIGTERM is ignored; the child of groupstubborn.
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { READY_OVERLAP_CHARS } from '../../src/readyWhen.js';
 
-if (process.env.FAKE_APP_MODE === 'groupchild') {
+if (process.env.FAKE_APP_MODE === 'groupchild' || process.env.FAKE_APP_MODE === 'groupstubborn') {
   const { spawn } = await import('node:child_process');
-  spawn(process.execPath, [fileURLToPath(import.meta.url)], { stdio: 'inherit', env: { ...process.env, FAKE_APP_MODE: 'slowexit' } });
+  const childMode = process.env.FAKE_APP_MODE === 'groupchild' ? 'slowexit' : 'ignoreterm';
+  spawn(process.execPath, [fileURLToPath(import.meta.url)], { stdio: 'inherit', env: { ...process.env, FAKE_APP_MODE: childMode } });
   process.on('SIGTERM', () => process.exit(0));
   await new Promise(() => {});
 }
@@ -110,7 +114,9 @@ if (process.env.FAKE_APP_MODE === 'chatty') {
 
 // Keep the process alive and exit cleanly on SIGTERM so process-group kill is
 // observable in tests.
-if (process.env.FAKE_APP_MODE === 'slowexit') {
+if (process.env.FAKE_APP_MODE === 'ignoreterm') {
+  process.on('SIGTERM', () => {});
+} else if (process.env.FAKE_APP_MODE === 'slowexit') {
   process.on('SIGTERM', () => setTimeout(() => server.close(() => process.exit(0)), Number(process.env.FAKE_APP_EXIT_DELAY_MS ?? 400)));
 } else {
   process.on('SIGTERM', () => { server.close(() => process.exit(0)); });

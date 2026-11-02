@@ -431,3 +431,18 @@ test('waitGone stays false while only a non-leader member of the group lives', a
   assert.ok(pidAlive(member));
   assert.equal(await runner.waitGone(leader.pid, 50), false);
 });
+
+// Pins: stop() SIGKILLs the group on the group's liveness, not the leader's — a
+// member that ignores SIGTERM outlives an already-exited leader unless it is
+// escalated, so the group is gone within the stop wait.
+test('stop escalates to SIGKILL for a group whose leader is gone but a member ignores SIGTERM', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd('groupstubborn') });
+  const app = { id: 'app', path: dir, manifest: { start: fakeAppCmd('groupstubborn'), healthPath: null, readyWhen: null } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => { try { process.kill(-rec.pgid, 'SIGKILL'); } catch { /* gone */ } });
+  await rec.settled;
+  runner.stop({ id: 'app', pgid: rec.pgid });
+  assert.equal(await runner.waitGone(rec.pgid, runner.STOP_WAIT_MS), true);
+});

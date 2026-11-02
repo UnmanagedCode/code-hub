@@ -2,13 +2,13 @@ import { spawn } from 'node:child_process';
 import { closeSync } from 'node:fs';
 import http from 'node:http';
 import { waitForPort, allocatePort } from './net.js';
-import { pidAlive } from './state.js';
 import { createReadyMatcher } from './readyWhen.js';
 import * as appLog from './appLog.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
-// How long a caller waits for a stopped group to be gone: the SIGKILL grace plus
-// time for the kernel to deliver it and the group to be reaped.
+// How long a caller waits for a stopped group to be gone: stop() escalates to
+// SIGKILL after GRACE_MS if any member is still alive, so this adds time for the
+// kernel to deliver it and the group to be reaped.
 const STOP_WAIT_MARGIN_MS = 1000;
 export const STOP_WAIT_MS = GRACE_MS + STOP_WAIT_MARGIN_MS;
 const GONE_POLL_MS = 20;
@@ -201,7 +201,10 @@ export function stop({ id, pgid }) {
   children.delete(id);
   try { process.kill(-pgid, 'SIGTERM'); } catch { /* already gone */ }
   const t = setTimeout(() => {
-    if (pidAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
+    // Gate on the group, not the leader: a member can outlive an exited leader. A
+    // pgid cannot be recycled while any member of the group exists, so a live
+    // group is still ours to kill.
+    if (groupAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
   }, GRACE_MS);
   t.unref();
 }
