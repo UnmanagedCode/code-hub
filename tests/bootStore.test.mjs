@@ -5,6 +5,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { start } from '../server.js';
+import * as hubSettings from '../src/hubSettings.js';
 import { allocatePort } from '../src/net.js';
 import { mkRoot, rmRoot, mkProject, dataDirIn, snapshotTree, fakeCloudflaredBin, fakeTailscaleBin, REPO_ROOT } from './helpers.mjs';
 
@@ -62,24 +63,27 @@ test('B2: legacy store plus a non-empty data dir → non-zero exit naming both p
   assert.deepEqual(await snapshotTree(root), before);
 });
 
-// Invariant: the migration runs before anything reads or writes the store.
+// Invariant: nothing reads or writes the data dir before the migration — the hub
+// lists an app registered only in the legacy store, serves the legacy
+// hub-settings (a non-default value, so a pre-migration read cached as the
+// default would fail), and the relay dir lands in the data dir.
 // (An explicit `port: 0` is OS-assigned: only an omitted port defaults to 7000.)
-test('B3: start() migrates the legacy store first, so the hub lists an app registered only there', async (t) => {
-  const root = await mkRoot();
+test('B3: start() migrates the legacy store before any read or write of the data dir', async (t) => {
+  const root = await mkRoot({ bridgeFallback: true }); // writes no hub-settings: the default (true) applies
   t.after(() => rmRoot(root));
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
-  await fs.rm(dataDirIn(root), { recursive: true }); // the data dir starts absent; the legacy store holds the data
   await mkProject(root, 'reg'); // a manifest-less dir, so it is listed only through its registration
   const legacy = path.join(root, '.code-hub');
   await fs.mkdir(legacy);
   await fs.writeFile(path.join(legacy, 'registrations.json'), JSON.stringify({ reg: { start: 'true' } }));
-  await fs.writeFile(path.join(legacy, 'hub-settings.json'), JSON.stringify({ bridgeFallback: false }));
+  await fs.writeFile(path.join(legacy, 'hub-settings.json'), JSON.stringify({ bridgeFallback: false })); // differs from the default
   const server = await start({ port: 0, host: '127.0.0.1' });
   t.after(() => new Promise((r) => server.close(r)));
   const res = await fetch(`http://127.0.0.1:${server.address().port}/api/apps`);
   const apps = await res.json();
   assert.ok((apps.apps ?? apps).some((a) => a.id === 'reg'), JSON.stringify(apps));
+  assert.equal(hubSettings.get().bridgeFallback, false, 'the legacy hub-settings are the effective ones');
   assert.equal(await exists(legacy), false);
-  assert.equal(await exists(path.join(dataDirIn(root), 'relay')), true, 'the hub provisioned its relay dir in the data dir');
+  assert.equal(await exists(path.join(dataDirIn(root), 'relay', 'relay.json')), true, 'code-hub provisioned its rendezvous file in the data dir');
 });

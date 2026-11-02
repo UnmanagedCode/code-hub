@@ -54,6 +54,24 @@ test('M1d: no arguments → moves <PROJECTS_ROOT>/.code-hub into the variable\'s
   assert.equal(await exists(path.join(root, '.code-hub')), false);
 });
 
+// Invariant: the default legacy root is <projectsRoot()>/.code-hub whatever the
+// data dir's location — a data dir outside PROJECTS_ROOT must not move it, and
+// a legacy dir beside the data dir's ancestors is not the one moved.
+test('M1d (outside): CONDUCTOR_PLUGIN_DATA_DIR outside PROJECTS_ROOT still moves <PROJECTS_ROOT>/.code-hub', async (t) => {
+  const root = await mkRoot();
+  const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-elsewhere-'));
+  t.after(() => Promise.all([rmRoot(root), fs.rm(elsewhere, { recursive: true, force: true })]));
+  const dataDir = path.join(elsewhere, 'data', 'code-hub');
+  process.env.CONDUCTOR_PLUGIN_DATA_DIR = dataDir; // mkRoot's next call resets it
+  await fs.mkdir(path.join(root, '.code-hub'));
+  await fs.writeFile(path.join(root, '.code-hub', 'registrations.json'), '{"moved":1}');
+  await fs.mkdir(path.join(elsewhere, '.code-hub')); // a decoy beside the data dir's ancestors
+  assert.equal(await migrateLegacyStore(), 'moved');
+  assert.equal(await fs.readFile(path.join(dataDir, 'registrations.json'), 'utf8'), '{"moved":1}');
+  assert.equal(await exists(path.join(root, '.code-hub')), false);
+  assert.equal(await exists(path.join(elsewhere, '.code-hub')), true);
+});
+
 // Invariant: modes are kept exactly and the move is a rename (inodes survive, so
 // a running app's open log fd keeps writing into the moved file).
 test('M2: fresh move keeps modes, content and inodes; parent is 0755; an open fd follows the file', async (t) => {
@@ -63,13 +81,15 @@ test('M2: fresh move keeps modes, content and inodes; parent is 0755; an open fd
   for (const rel of Object.keys(before)) inodes[rel] = (await fs.lstat(path.join(legacyDir, rel))).ino;
   const fh = await fs.open(path.join(legacyDir, 'logs/a.log'), 'a');
   t.after(() => fh.close());
-  assert.equal(await migrateLegacyStore({ legacyDir, dataDir }), 'moved');
+  // Under umask 0 the default mkdir mode (0777) and the explicit 0755 diverge.
+  const oldUmask = process.umask(0);
+  try { assert.equal(await migrateLegacyStore({ legacyDir, dataDir }), 'moved'); } finally { process.umask(oldUmask); }
+  for (const d of [path.dirname(dataDir), path.dirname(path.dirname(dataDir))]) {
+    assert.equal((await fs.stat(d)).mode & 0o777, 0o755, d);
+  }
   assert.equal(await exists(legacyDir), false);
   assert.deepEqual(await snapshotTree(dataDir), before);
   for (const rel of Object.keys(before)) assert.equal((await fs.lstat(path.join(dataDir, rel))).ino, inodes[rel], rel);
-  const umask = process.umask(); // read-only: restore immediately
-  process.umask(umask);
-  assert.equal((await fs.stat(path.dirname(dataDir))).mode & 0o777, 0o755 & ~umask);
   await fh.write('after\n');
   assert.equal(await fs.readFile(path.join(dataDir, 'logs/a.log'), 'utf8'), 'line\nafter\n');
 });
@@ -132,12 +152,55 @@ test('M7: a legacy path that is a file or a symlink is refused, nothing touched'
   assert.equal(await exists(dataDir), false);
 });
 
-// Invariant: pointing the variable at the old dir is not a conflict.
+// Invariant: pointing the variable at the old dir — however spelled — is not a conflict.
 test('M8: legacyDir equal to dataDir → "same", tree unchanged', async (t) => {
   const { legacyDir } = await fixture(t);
   const before = await snapshotTree(legacyDir);
   assert.equal(await migrateLegacyStore({ legacyDir, dataDir: legacyDir }), 'same');
+  // "same" is the resolved path, not the string: the variable is returned verbatim.
+  assert.equal(await migrateLegacyStore({ legacyDir, dataDir: legacyDir + path.sep }), 'same');
+  assert.equal(await migrateLegacyStore({ legacyDir, dataDir: path.join(legacyDir, '..', path.basename(legacyDir)) }), 'same');
   assert.deepEqual(await snapshotTree(legacyDir), before);
+});
+
+// Invariant: a regular file at the data-dir path is refused, both paths named, nothing touched.
+test('M10: a regular file at the data dir path is refused untouched', async (t) => {
+  const { base, legacyDir, dataDir } = await fixture(t);
+  await fs.mkdir(path.dirname(dataDir), { recursive: true });
+  await fs.writeFile(dataDir, 'not a dir');
+  const before = await snapshotTree(base);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  assert.deepEqual(await snapshotTree(base), before);
+});
+
+// Invariant: a rename failure leaves the filesystem as found — parents this call
+// created are removed and an emptied target is recreated with its original mode.
+test('M11: a failed rename undoes the parents it created and the empty target it removed', async (t) => {
+  const { base, legacyDir, dataDir } = await fixture(t);
+  _setRename(async () => { throw Object.assign(new Error('boom'), { code: 'EIO' }); });
+  const before = await snapshotTree(base);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) => e.code === 'ESTOREMIGRATE' && e.message.includes(dataDir));
+  assert.deepEqual(await snapshotTree(base), before);
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.chmod(dataDir, 0o700);
+  const withTarget = await snapshotTree(base);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), { code: 'ESTOREMIGRATE' });
+  assert.deepEqual(await snapshotTree(base), withTarget);
+});
+
+// Invariant: an unreadable target or unwritable parent is a refusal too (ESTOREMIGRATE, both paths).
+test('M12: an unwritable parent is refused as ESTOREMIGRATE with nothing created', { skip: process.getuid?.() === 0 ? 'root ignores permissions' : false }, async (t) => {
+  const { base, legacyDir } = await fixture(t);
+  const ro = path.join(base, 'ro');
+  await fs.mkdir(ro, { mode: 0o500 });
+  t.after(() => fs.chmod(ro, 0o700).catch(() => {}));
+  const dataDir = path.join(ro, 'a', 'code-hub');
+  const before = await snapshotTree(legacyDir);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+  assert.deepEqual(await fs.readdir(ro), []);
 });
 
 // Invariant: the variable is resolved before anything is touched.

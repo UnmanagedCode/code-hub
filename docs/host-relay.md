@@ -155,7 +155,7 @@ WantedBy=multi-user.target
 ## Limitations
 
 - **Standalone code-hub with a data dir outside `<projectsRoot>/.code-conductor/plugins/data/code-hub` is not found by the relay.** There is no flag for an arbitrary data dir; use that layout (or `--projects-root` on a copy of it).
-- **The relay must see the same data dir.** A named volume or remote Docker needs `--projects-root` pointing at a directory holding a copy of it — and a copied `relay.json` goes stale when code-hub regenerates it.
+- **The relay must see the same data dir.** A named volume or remote Docker needs `--projects-root` pointing at a directory that holds the nested `.code-conductor/plugins/data/code-hub` layout with a copy of the data dir in it — and a copied `relay.json` goes stale when code-hub regenerates it.
 - **Native Linux: run the relay as the user that owns `<projectsRoot>/.code-conductor/plugins/data/code-hub/relay/`** (`0700`); otherwise it exits at startup with `cannot write …/host.json: Permission denied — run the relay as the user that owns …` (see Discovery).
 - **The secret lives in the container's store**, readable by code-hub's user and anything running as it.
 - **A `docker0` `--listen` is reachable from a LAN neighbour that adds a route** to it (the weak host model); there the challenge-response is the gate.
