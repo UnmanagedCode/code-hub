@@ -22,7 +22,7 @@ Without a relay, a LAN share from such a container is flagged container-internal
 
 - Python **3.9 or newer**, standard library only — nothing to `pip install`. macOS's Command Line Tools `python3` (3.9) is enough.
 - The `relay/` directory: `relay.py` plus `protocol.json`. **Keep the two files together**; the relay reads its protocol from `protocol.json` next to it. Run the copy from the code-hub checkout code-hub itself runs from, so the two speak the same protocol version.
-- The relay must see code-hub's store, `<projectsRoot>/.code-hub/`, as a directory on the host — true when the projects root is a bind mount (the usual devcontainer setup).
+- The relay must see code-hub's store, `$CONDUCTOR_PLUGIN_DATA_DIR/`, as a directory on the host — true when the projects root is a bind mount (the usual devcontainer setup).
 
 ## Running it
 
@@ -40,15 +40,15 @@ No flags are needed (the optional ones are under Configuration), and no environm
 
 ### Discovery
 
-The relay finds code-hub's store by walking **up from its own script's directory** (never the working directory) to the first ancestor holding a `.code-hub` directory. Running the copy inside the projects root — e.g. `<projectsRoot>/.plugins/code-hub/relay/relay.py` or `<projectsRoot>/code-hub/relay/relay.py` — finds `<projectsRoot>/.code-hub`.
+The relay finds code-hub's store by walking **up from its own script's directory** (never the working directory) to the first ancestor holding `.code-conductor/plugins/data/code-hub` (the data dir under code-conductor; see "Data dir" in `docs/protocol.md`). Running the copy inside the projects root — e.g. `<projectsRoot>/.plugins/code-hub/relay/relay.py` or `<projectsRoot>/code-hub/relay/relay.py` — finds `<projectsRoot>/.code-conductor/plugins/data/code-hub`.
 
-- `--projects-root <dir>` overrides the walk: the store is `<dir>/.code-hub`, which must exist.
-- Finding none exits non-zero: `code-hub-relay: no .code-hub found in any parent of <script dir> (searched: <dirs…>) — start code-hub once so it creates <projectsRoot>/.code-hub, or pass --projects-root <dir>`.
+- `--projects-root <dir>` overrides the walk: the store is `<dir>/.code-conductor/plugins/data/code-hub`, which must exist.
+- Finding none exits non-zero: `code-hub-relay: no .code-conductor/plugins/data/code-hub found in any parent of <script dir> (searched: <dirs…>) — start code-hub under code-conductor (or with CONDUCTOR_PLUGIN_DATA_DIR=<projectsRoot>/.code-conductor/plugins/data/code-hub) so it creates it, or pass --projects-root <dir>`.
 - A rendezvous dir or file the relay can't create, write or read exits (at startup) or refuses connections (the secret) with `cannot <create|write|read> <path>: <cause>`; for a permission failure it adds `— run the relay as the user that owns <dir>`. A secret file whose content can't be used is reported with the reason, naming the path — e.g. `<path> is not a regular file`, `<path> is larger than <maxRendezvousBytes> bytes`, or invalid JSON or no secret long enough (every refusal: `docs/protocol.md` → Rendezvous files, `hubFile` row). Only a failed control bind is reported as `cannot listen on <listen>: <cause>`.
 
 ### Rendezvous files
 
-Both live in `<projectsRoot>/.code-hub/relay/` (names from `rendezvous` in `protocol.json`; shapes in `docs/protocol.md`):
+Both live in `$CONDUCTOR_PLUGIN_DATA_DIR/relay/` (names from `rendezvous` in `protocol.json`; shapes in `docs/protocol.md`):
 
 | File | Written by | Holds |
 |---|---|---|
@@ -104,7 +104,7 @@ Pass `--advertise <ip>[,<ip>…]` when:
 |---|---|---|
 | `--listen <ip:port>` | the `docker0` address if the host has one, else `127.0.0.1`; port `7077` | Control listener code-hub dials (`:0` = any free port; `host.json` carries the real one). Refused when a wildcard, or a non-loopback address that is advertised or is the default-route address. |
 | `--advertise <ip,…>` | the default-route probe | Host LAN address(es) the `lan` scope binds and share URLs carry. |
-| `--projects-root <dir>` | the nearest parent of the script's directory holding `.code-hub` | Where code-hub's store is. |
+| `--projects-root <dir>` | the nearest parent of the script's directory holding `.code-conductor/plugins/data/code-hub` | Where code-hub's store is. |
 | `--accept-wait-ms <n>` | `10000` | How long a host client waits for code-hub to claim it. |
 | `CODEHUB_RELAY_PROBE_DEST` (env, tests only) | `192.0.2.1:9` | Route-probe destination (`<ipv4>:<port>`). |
 
@@ -128,7 +128,7 @@ After=network-online.target docker.service
 Wants=network-online.target docker.service
 
 [Service]
-User=<the user that owns <projectsRoot>/.code-hub>
+User=<the user that owns <projectsRoot>/.code-conductor/plugins/data/code-hub>
 ExecStart=/usr/bin/python3 <projectsRoot>/<path-to>/relay/relay.py
 Restart=on-failure
 RestartSec=5
@@ -137,7 +137,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-- `Restart=on-failure` covers code-hub's store not being there yet at boot (the relay exits until code-hub has created `<projectsRoot>/.code-hub`).
+- `Restart=on-failure` covers code-hub's store not being there yet at boot (the relay exits until code-hub has created `<projectsRoot>/.code-conductor/plugins/data/code-hub`).
 - It does **not** cover a missing `docker0`: without one the relay listens on `127.0.0.1:7077` and stays up — healthy to systemd, unreachable from a native-Linux container. The `After=`/`Wants=docker.service` ordering is what makes `docker0` exist first; if Docker can start later than the relay on your host, pass `--listen <docker0 address>:7077` instead, so a missing `docker0` fails the start and is retried.
 
 ## Security model
@@ -154,8 +154,9 @@ WantedBy=multi-user.target
 
 ## Limitations
 
-- **The relay must see the same `.code-hub`.** A named volume or remote Docker needs `--projects-root` pointing at a directory holding a copy of it — and a copied `relay.json` goes stale when code-hub regenerates it.
-- **Native Linux: run the relay as the user that owns `.code-hub/relay/`** (`0700`); otherwise it exits at startup with `cannot write …/host.json: Permission denied — run the relay as the user that owns …` (see Discovery).
+- **Standalone code-hub with a data dir outside `<projectsRoot>/.code-conductor/plugins/data/code-hub` is not found by the relay.** There is no flag for an arbitrary data dir; use that layout (or `--projects-root` on a copy of it).
+- **The relay must see the same data dir.** A named volume or remote Docker needs `--projects-root` pointing at a directory holding a copy of it — and a copied `relay.json` goes stale when code-hub regenerates it.
+- **Native Linux: run the relay as the user that owns `<projectsRoot>/.code-conductor/plugins/data/code-hub/relay/`** (`0700`); otherwise it exits at startup with `cannot write …/host.json: Permission denied — run the relay as the user that owns …` (see Discovery).
 - **The secret lives in the container's store**, readable by code-hub's user and anything running as it.
 - **A `docker0` `--listen` is reachable from a LAN neighbour that adds a route** to it (the weak host model); there the challenge-response is the gate.
 - **Loopback mirrors have no login**: any local process or user on the host can reach a mirrored app, like any local dev server.

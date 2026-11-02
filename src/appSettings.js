@@ -6,8 +6,8 @@ import { validateShareOptions, withFunnelPortDefault } from './shareOptions.js';
 // Per-app settings: the default login a NEW share of an app starts with (see
 // appManager.share), whether code-hub starts the app when it boots
 // (appManager.autoStartAll), and how it shares the app once a start reaches
-// ready (appManager.start → autoRun). Lives in code-hub's own dotfolder, never
-// in a project tree. Shape, keyed by exact app id (a worktree does NOT inherit
+// ready (appManager.start → autoRun). Lives in code-hub's data dir (storeRoot(),
+// CONDUCTOR_PLUGIN_DATA_DIR), never in a project tree. Shape, keyed by exact app id (a worktree does NOT inherit
 // its parent project's entry):
 //   { "<id>": { "username"?: string, "password"?: string,
 //               "autoStart"?: true, "autoShare"?: { mode, auth, tls?, funnelPort? },

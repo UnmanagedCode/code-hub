@@ -50,8 +50,8 @@ test('surfaces a broken manifest as a non-startable app', async (t) => {
 test('skips dot-prefixed dirs (the store itself)', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await fs.mkdir(path.join(root, '.code-hub'), { recursive: true });
-  await fs.writeFile(path.join(root, '.code-hub', '.hub.json'), '{"start":"x"}');
+  await fs.mkdir(path.join(root, '.code-conductor'), { recursive: true });
+  await fs.writeFile(path.join(root, '.code-conductor', '.hub.json'), '{"start":"x"}');
   const apps = await discoverApps();
   assert.equal(apps.length, 0);
 });

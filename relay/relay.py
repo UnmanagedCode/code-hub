@@ -10,7 +10,7 @@ the client. The relay never dials anything itself, never terminates TLS and
 never learns where code-hub sends the bytes. Python 3.9+, standard library only.
 
 The two sides meet through a rendezvous directory in code-hub's store
-(<projectsRoot>/.code-hub/relay/): code-hub writes the shared secret there, the
+(<projectsRoot>/.code-conductor/plugins/data/code-hub/relay/): code-hub writes the shared secret there, the
 relay writes its listen address. The wire protocol (frames, MAC labels, caps,
 timings, error codes) lives in protocol.json next to this file; keep the two
 files together. See docs/host-relay.md and docs/protocol.md.
@@ -67,7 +67,11 @@ LISTEN_BACKLOG = 128
 KEEPALIVE_IDLE_S = 15
 KEEPALIVE_INTERVAL_S = 5
 
-STORE_DIRNAME = ".code-hub"
+# code-hub's data dir under a projects root: code-conductor's pluginDataDir layout
+# (code-conductor docs/plugins.md, "Child env"); the last component is `id` in
+# conductor.plugin.json.
+STORE_REL = ".code-conductor/plugins/data/code-hub"
+STORE_SUBPATH = tuple(STORE_REL.split("/"))
 DEFAULT_LISTEN_PORT = 7077
 DEFAULT_ACCEPT_WAIT_MS = 10000
 # The only address a loopback-scope listener ever binds.
@@ -236,21 +240,22 @@ def control_listen_problem(listen_host, addresses, default_route=None):
 # --- rendezvous ---------------------------------------------------------------
 
 def find_store(script_path, override=None):
-    """(store_dir or None, searched): code-hub's .code-hub store.
+    """(store_dir or None, searched): code-hub's data dir.
 
-    With `override` (--projects-root), <override>/.code-hub. Otherwise the
-    nearest ancestor of the script's directory holding a .code-hub directory,
-    so the answer never depends on the working directory.
+    With `override` (--projects-root), <override>/<STORE_REL>. Otherwise the
+    nearest ancestor of the script's directory holding <STORE_REL>, so the
+    answer never depends on the working directory.
     """
     if override is not None:
         root = Path(override).resolve()
-        store = root / STORE_DIRNAME
+        store = root.joinpath(*STORE_SUBPATH)
         return (store if store.is_dir() else None), [str(root)]
     searched = []
     for parent in Path(script_path).resolve().parent.parents:
         searched.append(str(parent))
-        if (parent / STORE_DIRNAME).is_dir():
-            return parent / STORE_DIRNAME, searched
+        store = parent.joinpath(*STORE_SUBPATH)
+        if store.is_dir():
+            return store, searched
     return None, searched
 
 
@@ -944,7 +949,7 @@ def parse_args(argv, default_host=default_listen_host):
     parser.add_argument("--advertise", metavar="IP[,IP...]",
                         help="host LAN address(es) to expose shares on (default: the default-route IPv4)")
     parser.add_argument("--projects-root", metavar="DIR",
-                        help="code-hub's projects root, holding .code-hub (default: the nearest parent of this script's directory that has one)")
+                        help="code-hub's projects root, holding %s (default: the nearest parent of this script's directory that has one)" % STORE_REL)
     parser.add_argument("--accept-wait-ms", type=int, default=DEFAULT_ACCEPT_WAIT_MS, metavar="N",
                         help="how long a host client waits for code-hub to claim it (default %(default)s)")
     args = parser.parse_args(argv)
@@ -1058,11 +1063,12 @@ def main(argv=None):
     store, searched = find_store(__file__, args.projects_root)
     if store is None:
         if args.projects_root is not None:
-            sys.exit("code-hub-relay: no %s directory in %s — start code-hub once with that projects root so it creates one"
-                     % (STORE_DIRNAME, searched[0]))
-        sys.exit("code-hub-relay: no %s found in any parent of %s (searched: %s) — start code-hub once so it creates "
-                 "<projectsRoot>/%s, or pass --projects-root <dir>"
-                 % (STORE_DIRNAME, Path(__file__).resolve().parent, ", ".join(searched), STORE_DIRNAME))
+            sys.exit("code-hub-relay: no %s directory in %s — start code-hub under code-conductor with that projects root "
+                     "(or with CONDUCTOR_PLUGIN_DATA_DIR=%s/%s) so it creates one"
+                     % (STORE_REL, searched[0], searched[0], STORE_REL))
+        sys.exit("code-hub-relay: no %s found in any parent of %s (searched: %s) — start code-hub under code-conductor "
+                 "(or with CONDUCTOR_PLUGIN_DATA_DIR=<projectsRoot>/%s) so it creates it, or pass --projects-root <dir>"
+                 % (STORE_REL, Path(__file__).resolve().parent, ", ".join(searched), STORE_REL))
     try:
         rdir = relay_dir(store)
         asyncio.run(serve(args, rdir, store))

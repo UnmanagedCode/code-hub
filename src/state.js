@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { storeRoot } from './projects.js';
 
-// Running-app state lives in code-hub's OWN dotfolder at the projects root,
+// Running-app state lives in code-hub's data dir (storeRoot(), CONDUCTOR_PLUGIN_DATA_DIR),
 // deliberately outside every project dir — so a running server can still be
 // stopped after its source/worktree has been deleted. Shape:
 //   { apps: { <id>: RunningRecord } }

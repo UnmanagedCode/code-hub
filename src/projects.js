@@ -23,7 +23,6 @@ export const MAX_FIXED_PORT = 65535;
 export function isValidFixedPort(v) {
   return Number.isInteger(v) && v >= MIN_FIXED_PORT && v <= MAX_FIXED_PORT;
 }
-export const STORE_DIRNAME = '.code-hub';
 export const REGISTRY_FILENAME = 'registrations.json';
 
 // code-conductor nests every worktree under one root as
@@ -43,8 +42,23 @@ export function projectsRoot() {
   return process.env.PROJECTS_ROOT ?? DEFAULT_PROJECTS_ROOT;
 }
 
+// code-hub's data dir: every file it persists (state, registrations, settings,
+// logs, relay rendezvous) lives here. It comes from CONDUCTOR_PLUGIN_DATA_DIR
+// only — code-conductor provides it; standalone, the user sets it. Read per
+// call, like projectsRoot().
+export const DATA_DIR_ENV = 'CONDUCTOR_PLUGIN_DATA_DIR';
+
 export function storeRoot() {
-  return path.join(projectsRoot(), STORE_DIRNAME);
+  const v = process.env[DATA_DIR_ENV];
+  if (v === undefined) {
+    throw Object.assign(new Error(
+      `${DATA_DIR_ENV} is not set — code-hub keeps its data in the directory code-conductor provides; `
+      + `to run code-hub standalone, set ${DATA_DIR_ENV} to an absolute directory path`), { code: 'ENODATADIR' });
+  }
+  if (!v || !path.isAbsolute(v)) {
+    throw Object.assign(new Error(`${DATA_DIR_ENV} must be an absolute path (got ${JSON.stringify(v)})`), { code: 'ENODATADIR' });
+  }
+  return v;
 }
 
 function worktreesRoot() {

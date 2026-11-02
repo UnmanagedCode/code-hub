@@ -5,7 +5,8 @@ import path from 'node:path';
 import { storeRoot } from './projects.js';
 import { PROTOCOL } from './relayProtocol.js';
 
-// The host relay's rendezvous directory, <projectsRoot>/.code-hub/relay/: two
+// The host relay's rendezvous directory, `relay/` under code-hub's data dir (storeRoot(),
+// CONDUCTOR_PLUGIN_DATA_DIR): two
 // files, each with a single writer. code-hub writes the shared secret (the
 // hub file); the relay writes where it listens (the relay file). The relay
 // finds this directory by walking up from its own script, so neither side

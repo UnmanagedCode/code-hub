@@ -1,6 +1,6 @@
 // A stand-in code-hub process for relay tests: in a "container" (the probe is
 // forced), it runs src/hostRelay.js against the relay published under
-// PROJECTS_ROOT, exposes one echo server in every scope named on the command
+// CONDUCTOR_PLUGIN_DATA_DIR, exposes one echo server in every scope named on the command
 // line, prints `{"hostPorts":{<scope>:<port>,…}}` once all are bound, and stays
 // alive until killed. RELAY_CLIENT_TIMINGS (JSON) shortens the session timings.
 import net from 'node:net';

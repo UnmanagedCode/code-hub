@@ -8,7 +8,7 @@ import path from 'node:path';
 import { promises as fs, existsSync, readFileSync, writeFileSync, statSync, openSync, closeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as appLog from '../src/appLog.js';
-import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd, openFdsOf } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, waitFor, pidAlive, fakeAppCmd, openFdsOf, dataDirIn } from './helpers.mjs';
 
 function get(port) {
   return new Promise((resolve, reject) => {
@@ -236,7 +236,7 @@ test('an app keeps running, writing and serving after the code-hub that launched
 
   const launcher = spawn(process.execPath,
     [new URL('./fixtures/launch-app.mjs', import.meta.url).pathname, 'chat', dir, start, String(port)],
-    { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, PROJECTS_ROOT: root } });
+    { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, PROJECTS_ROOT: root, CONDUCTOR_PLUGIN_DATA_DIR: dataDirIn(root) } });
   t.after(() => launcher.kill('SIGKILL'));
   let out = '';
   launcher.stdout.on('data', (d) => { out += d; });
