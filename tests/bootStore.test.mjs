@@ -38,7 +38,7 @@ async function scratch(t) {
 }
 
 // Invariant: boot refuses without the variable and writes nothing.
-test('B1: unset CONDUCTOR_PLUGIN_DATA_DIR → non-zero exit naming it, no listening, tree untouched', async (t) => {
+test('B1: unset CONDUCTOR_PLUGIN_DATA_DIR → non-zero exit naming it, no listening, tree unchanged', async (t) => {
   const { root } = await scratch(t);
   const before = await snapshotTree(root);
   const r = await runServer(root);

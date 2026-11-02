@@ -62,7 +62,9 @@ test('M1d (outside): CONDUCTOR_PLUGIN_DATA_DIR outside PROJECTS_ROOT still moves
   const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-elsewhere-'));
   t.after(() => Promise.all([rmRoot(root), fs.rm(elsewhere, { recursive: true, force: true })]));
   const dataDir = path.join(elsewhere, 'data', 'code-hub');
-  process.env.CONDUCTOR_PLUGIN_DATA_DIR = dataDir; // mkRoot's next call resets it
+  const prevDataDir = process.env.CONDUCTOR_PLUGIN_DATA_DIR;
+  t.after(() => { if (prevDataDir === undefined) delete process.env.CONDUCTOR_PLUGIN_DATA_DIR; else process.env.CONDUCTOR_PLUGIN_DATA_DIR = prevDataDir; });
+  process.env.CONDUCTOR_PLUGIN_DATA_DIR = dataDir;
   await fs.mkdir(path.join(root, '.code-hub'));
   await fs.writeFile(path.join(root, '.code-hub', 'registrations.json'), '{"moved":1}');
   await fs.mkdir(path.join(elsewhere, '.code-hub')); // a decoy beside the data dir's ancestors
@@ -95,7 +97,7 @@ test('M2: fresh move keeps modes, content and inodes; parent is 0755; an open fd
 });
 
 // Invariant: never merges or overwrites; nothing is lost.
-test('M3: a non-empty target is refused with both paths named and both trees untouched', async (t) => {
+test('M3: a non-empty target is refused with both paths named and both trees unchanged', async (t) => {
   const { legacyDir, dataDir } = await fixture(t);
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(path.join(dataDir, 'registrations.json'), '{"other":1}');
@@ -137,7 +139,7 @@ test('M6: EXDEV is refused naming both paths and an mv command; nothing changes'
 });
 
 // Invariant: only a real directory is migrated.
-test('M7: a legacy path that is a file or a symlink is refused, nothing touched', async (t) => {
+test('M7: a legacy path that is a file or a symlink is refused, trees unchanged', async (t) => {
   const { base, legacyDir, dataDir } = await fixture(t);
   const real = path.join(base, 'real');
   await fs.rename(legacyDir, real);
@@ -163,8 +165,8 @@ test('M8: legacyDir equal to dataDir → "same", tree unchanged', async (t) => {
   assert.deepEqual(await snapshotTree(legacyDir), before);
 });
 
-// Invariant: a regular file at the data-dir path is refused, both paths named, nothing touched.
-test('M10: a regular file at the data dir path is refused untouched', async (t) => {
+// Invariant: a regular file at the data-dir path is refused, both paths named, trees unchanged.
+test('M10: a regular file at the data dir path is refused, trees unchanged', async (t) => {
   const { base, legacyDir, dataDir } = await fixture(t);
   await fs.mkdir(path.dirname(dataDir), { recursive: true });
   await fs.writeFile(dataDir, 'not a dir');
@@ -174,19 +176,24 @@ test('M10: a regular file at the data dir path is refused untouched', async (t) 
   assert.deepEqual(await snapshotTree(base), before);
 });
 
-// Invariant: a rename failure leaves the filesystem as found — parents this call
-// created are removed and an emptied target is recreated with its original mode.
-test('M11: a failed rename undoes the parents it created and the empty target it removed', async (t) => {
-  const { base, legacyDir, dataDir } = await fixture(t);
+// Invariant: a failed rename never modifies the legacy tree and puts no data in
+// the target (empty parents it created may remain), with the target absent or an
+// empty directory; a re-run once the cause is gone succeeds.
+test('M11: a failed rename leaves the legacy tree identical and no data in the target', async (t) => {
+  const { legacyDir, dataDir } = await fixture(t);
+  const before = await snapshotTree(legacyDir);
   _setRename(async () => { throw Object.assign(new Error('boom'), { code: 'EIO' }); });
-  const before = await snapshotTree(base);
-  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) => e.code === 'ESTOREMIGRATE' && e.message.includes(dataDir));
-  assert.deepEqual(await snapshotTree(base), before);
-  await fs.mkdir(dataDir, { recursive: true });
-  await fs.chmod(dataDir, 0o700);
-  const withTarget = await snapshotTree(base);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+  assert.equal(await exists(path.join(dataDir, 'state.json')), false);
+  await fs.mkdir(dataDir, { recursive: true }); // the empty-target case
   await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), { code: 'ESTOREMIGRATE' });
-  assert.deepEqual(await snapshotTree(base), withTarget);
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+  assert.equal(await exists(path.join(dataDir, 'state.json')), false);
+  _setRename(null);
+  assert.equal(await migrateLegacyStore({ legacyDir, dataDir }), 'moved');
+  assert.deepEqual(await snapshotTree(dataDir), before);
 });
 
 // Invariant: an unreadable target or unwritable parent is a refusal too (ESTOREMIGRATE, both paths).
@@ -203,8 +210,21 @@ test('M12: an unwritable parent is refused as ESTOREMIGRATE with nothing created
   assert.deepEqual(await fs.readdir(ro), []);
 });
 
+// Invariant: an unreadable (empty, mode 0300) target is refused as ESTOREMIGRATE
+// naming both paths, and the legacy tree is unchanged.
+test('M13: an unreadable target is refused', { skip: process.getuid?.() === 0 ? 'root ignores permissions' : false }, async (t) => {
+  const { legacyDir, dataDir } = await fixture(t);
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.chmod(dataDir, 0o300);
+  t.after(() => fs.chmod(dataDir, 0o700).catch(() => {}));
+  const before = await snapshotTree(legacyDir);
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+});
+
 // Invariant: the variable is resolved before anything is touched.
-test('M9: an unset variable rejects ENODATADIR with the legacy dir untouched', async (t) => {
+test('M9: an unset variable rejects ENODATADIR with the legacy dir unchanged', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-migrate-unset-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   await fs.mkdir(path.join(root, '.code-hub'));
