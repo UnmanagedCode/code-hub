@@ -50,7 +50,7 @@ test('B1: unset CONDUCTOR_PLUGIN_DATA_DIR → non-zero exit naming it, no listen
 });
 
 // Invariant: a migration refusal blocks boot, losslessly.
-test('B2: legacy store plus a non-empty data dir → non-zero exit naming both paths, nothing changed', async (t) => {
+test('B2: legacy store plus a non-empty data dir → non-zero exit naming both paths, trees unchanged', async (t) => {
   const { root, legacy } = await scratch(t);
   const dataDir = dataDirIn(root);
   await fs.mkdir(dataDir, { recursive: true });

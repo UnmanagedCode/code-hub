@@ -127,7 +127,7 @@ test('M5: a second run returns "absent" and changes nothing', async (t) => {
 });
 
 // Invariant: a cross-device move refuses without loss and names the manual fix.
-test('M6: EXDEV is refused naming both paths and an mv command; nothing changes', async (t) => {
+test('M6: EXDEV is refused naming both paths and an mv command; legacy data unchanged, no data in the target', async (t) => {
   const { legacyDir, dataDir } = await fixture(t);
   const before = await snapshotTree(legacyDir);
   _setRename(async () => { throw Object.assign(new Error('cross-device link not permitted'), { code: 'EXDEV' }); });
@@ -177,8 +177,8 @@ test('M10: a regular file at the data dir path is refused, trees unchanged', asy
 });
 
 // Invariant: a failed rename never modifies the legacy tree and puts no data in
-// the target (empty parents it created may remain), with the target absent or an
-// empty directory; a re-run once the cause is gone succeeds.
+// the target; the target path does not exist afterwards (an emptied target stays
+// removed, nothing is recreated), with the target absent or an empty directory; a re-run once the cause is gone succeeds.
 test('M11: a failed rename leaves the legacy tree identical and no data in the target', async (t) => {
   const { legacyDir, dataDir } = await fixture(t);
   const before = await snapshotTree(legacyDir);
@@ -186,11 +186,12 @@ test('M11: a failed rename leaves the legacy tree identical and no data in the t
   await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
     e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
   assert.deepEqual(await snapshotTree(legacyDir), before);
-  assert.equal(await exists(path.join(dataDir, 'state.json')), false);
+  assert.equal(await exists(dataDir), false);
   await fs.mkdir(dataDir, { recursive: true }); // the empty-target case
-  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), { code: 'ESTOREMIGRATE' });
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
   assert.deepEqual(await snapshotTree(legacyDir), before);
-  assert.equal(await exists(path.join(dataDir, 'state.json')), false);
+  assert.equal(await exists(dataDir), false, 'the emptied target stays removed, nothing is recreated');
   _setRename(null);
   assert.equal(await migrateLegacyStore({ legacyDir, dataDir }), 'moved');
   assert.deepEqual(await snapshotTree(dataDir), before);
@@ -221,6 +222,40 @@ test('M13: an unreadable target is refused', { skip: process.getuid?.() === 0 ? 
   await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
     e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
   assert.deepEqual(await snapshotTree(legacyDir), before);
+});
+
+// Invariant: an lstat that fails (EACCES) on the data dir or on the legacy dir is
+// a refusal — ESTOREMIGRATE, both paths named — and the legacy data is unchanged.
+const posixOnly = { skip: process.getuid?.() === 0 ? 'root ignores permissions' : false };
+test('M14: an unsearchable parent of the data dir is refused', posixOnly, async (t) => {
+  const { base, legacyDir } = await fixture(t);
+  const locked = path.join(base, 'locked');
+  await fs.mkdir(locked);
+  const dataDir = path.join(locked, 'code-hub');
+  const before = await snapshotTree(legacyDir);
+  await fs.chmod(locked, 0o600);
+  t.after(() => fs.chmod(locked, 0o700).catch(() => {}));
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  await fs.chmod(locked, 0o700);
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+  assert.deepEqual(await fs.readdir(locked), []);
+});
+
+test('M15: an unsearchable parent of the legacy dir is refused', posixOnly, async (t) => {
+  const { base, legacyDir: orig, dataDir } = await fixture(t);
+  const locked = path.join(base, 'lp');
+  await fs.mkdir(locked);
+  const legacyDir = path.join(locked, '.code-hub');
+  await fs.rename(orig, legacyDir);
+  const before = await snapshotTree(legacyDir);
+  await fs.chmod(locked, 0o600);
+  t.after(() => fs.chmod(locked, 0o700).catch(() => {}));
+  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  await fs.chmod(locked, 0o700);
+  assert.deepEqual(await snapshotTree(legacyDir), before);
+  assert.equal(await exists(dataDir), false);
 });
 
 // Invariant: the variable is resolved before anything is touched.

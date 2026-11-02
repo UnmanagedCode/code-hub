@@ -6,10 +6,11 @@ import { projectsRoot, storeRoot } from './projects.js';
 // into the data dir (storeRoot()). This is the only code naming the legacy
 // path. Every refusal throws ESTOREMIGRATE naming both paths and the fix, and
 // aborts boot rather than starting on an empty store beside the real one.
-// A refusal never moves or modifies the store's data: the legacy dir stays
-// intact and no data lands in the target. One after the parent-creation step
-// may leave the empty parent dirs it created, and an empty target it removed
-// stays removed. Both are harmless: a re-run after fixing the cause succeeds.
+// A refusal never moves or modifies the store's data: the legacy dir's data
+// stays intact and no data lands in the target. Once it has removed an empty
+// target or started creating the parent dirs, a refusal may leave the empty
+// dirs it created (an emptied target stays removed). Both are harmless: a
+// re-run after fixing the cause succeeds.
 export const LEGACY_STORE_DIRNAME = '.code-hub';
 
 let renameImpl = fs.rename;
