@@ -7,7 +7,7 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, writeRegistrations, ALT_LOOPBACK, altLoopbackBindable, nonEphemeralPort } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, writeRegistrations, ALT_LOOPBACK, altLoopbackBindable, nonEphemeralPort, FIXED_PORT_SKIP } from './helpers.mjs';
 
 // The app's Settings `port` as the fixed port: Settings beats the manifest, a
 // blank falls back, and every fixed-port rule (busy refusal, no fallback, LAN
@@ -53,7 +53,7 @@ const setPort = (base, port, id = 'app') => j(base, 'PUT', `/api/apps/${encodeUR
 const up = (base, id = 'app') => waitFor(async () => ['ready', 'running'].includes((await getApp(base, id)).status));
 
 // Invariant: the Settings port beats the manifest's, and survives a restart.
-test('a Settings port beats the manifest port, on start and on restart', async (t) => {
+test('a Settings port beats the manifest port, on start and on restart', { skip: FIXED_PORT_SKIP }, async (t) => {
   const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   assert.equal((await setPort(base, b)).status, 200);
@@ -69,7 +69,7 @@ test('a Settings port beats the manifest port, on start and on restart', async (
 });
 
 // Invariant: clearing the Settings port falls back to the manifest's.
-test('a blank Settings port falls back to the manifest port', async (t) => {
+test('a blank Settings port falls back to the manifest port', { skip: FIXED_PORT_SKIP }, async (t) => {
   const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   await setPort(base, b);
@@ -82,7 +82,7 @@ test('a blank Settings port falls back to the manifest port', async (t) => {
 
 // Invariant: a Settings port pins an app that has no manifest port, and
 // clearing it returns the app to a free port.
-test('a Settings port pins an app with no manifest port; clearing returns to a free port', async (t) => {
+test('a Settings port pins an app with no manifest port; clearing returns to a free port', { skip: FIXED_PORT_SKIP }, async (t) => {
   const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await setPort(base, b);
@@ -99,7 +99,7 @@ test('a Settings port pins an app with no manifest port; clearing returns to a f
 });
 
 // Invariant: a change made while the app runs applies only on the next start.
-test('a Settings port changed while running applies on the next restart only', async (t) => {
+test('a Settings port changed while running applies on the next restart only', { skip: FIXED_PORT_SKIP }, async (t) => {
   const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   await j(base, 'POST', '/api/apps/app/start');
@@ -112,7 +112,7 @@ test('a Settings port changed while running applies on the next restart only', a
 
 // Invariant: a busy Settings port refuses the start (never falls back to a free
 // port), whether an unrelated process or another app's record holds it.
-test('a busy Settings port refuses the start and never falls back', async (t) => {
+test('a busy Settings port refuses the start and never falls back', { skip: FIXED_PORT_SKIP }, async (t) => {
   const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }], ['other', { start: fakeAppCmd() }]]);
   await setPort(base, b);
@@ -138,7 +138,7 @@ test('a busy Settings port refuses the start and never falls back', async (t) =>
 
 // Invariant: a worktree never takes a Settings port, even one written by hand
 // past the API guard.
-test('a worktree ignores a hand-written Settings port', async (t) => {
+test('a worktree ignores a hand-written Settings port', { skip: FIXED_PORT_SKIP }, async (t) => {
   const b = await nonEphemeralPort(t);
   const { root, base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await mkWorktree(root, 'app', 'feat', { start: fakeAppCmd() }, { git: true });
@@ -151,7 +151,7 @@ test('a worktree ignores a hand-written Settings port', async (t) => {
 
 // Invariant: a LAN share reuses a Settings fixed port exactly as it does a
 // manifest one.
-test('the LAN share reuses a Settings fixed port', async (t) => {
+test('the LAN share reuses a Settings fixed port', { skip: FIXED_PORT_SKIP }, async (t) => {
   if (!HAS_LAN) return t.skip('no LAN interface on this host');
   const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
@@ -166,7 +166,7 @@ test('the LAN share reuses a Settings fixed port', async (t) => {
 
 // Invariant: a Settings port that is busy at boot fails the auto-start, and the
 // failure shows on the card.
-test('a Settings port busy at boot fails the auto-start on the card', async (t) => {
+test('a Settings port busy at boot fails the auto-start on the card', { skip: FIXED_PORT_SKIP }, async (t) => {
   const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await appSettings.update('app', { autoStart: true, port: b });
@@ -186,7 +186,7 @@ test('a Settings port busy at boot fails the auto-start on the card', async (t) 
 // Invariant: the availability pre-check applies to a Settings port too — one held
 // only on another local address (which the app, binding loopback, could still
 // start beside) is refused, so the check can't be gated on the manifest's port.
-test('a Settings port held only on another local address is refused', async (t) => {
+test('a Settings port held only on another local address is refused', { skip: FIXED_PORT_SKIP }, async (t) => {
   const lanIp = localIPv4s({ lanFallback: true })[0];
   const host = (await altLoopbackBindable()) ? ALT_LOOPBACK : lanIp;
   if (!host) return t.skip('no alternate local address on this host');
@@ -205,7 +205,7 @@ test('a Settings port held only on another local address is refused', async (t) 
 // Invariant: a Settings-port child that hits EADDRINUSE after a clean pre-check is
 // refused and never retried onto another port, so the runner's `fixed` flag
 // can't be derived from the manifest's port.
-test('a Settings-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', async (t) => {
+test('a Settings-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', { skip: FIXED_PORT_SKIP }, async (t) => {
   const b = await nonEphemeralPort(t);
   const root0 = await mkRoot();
   const marker = path.join(root0, 'flaky-marker');

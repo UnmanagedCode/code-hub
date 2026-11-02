@@ -519,8 +519,10 @@ export function openFdsOf(file, { writable = false } = {}) {
 // including sibling checkouts' test runs) and the selection probe (services
 // already listening) cover. Never `listen(0)`-then-close: a released ephemeral
 // port can be re-allocated before the code under test binds it.
-const PORT_RANGE_FILE = '/proc/sys/net/ipv4/ip_local_port_range';
-const PORT_CLAIM_DIR = path.join(os.tmpdir(), 'codehub-test-port-claims');
+export const PORT_CLAIM_DIR = path.join(os.tmpdir(), `codehub-test-port-claims-${process.getuid?.() ?? 'nouid'}`);
+export const PORT_RANGE_FILE = '/proc/sys/net/ipv4/ip_local_port_range';
+// `skip` value for a test that calls nonEphemeralPort: the band is read from /proc.
+export const FIXED_PORT_SKIP = process.platform !== 'linux' && `${PORT_RANGE_FILE} is Linux-only`;
 const PORT_PICK_ATTEMPTS = 50;
 let fixedPortBand;
 function fixedPortBandOrThrow() {
