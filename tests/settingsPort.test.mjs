@@ -82,6 +82,19 @@ test('restart of a fixed-port app whose old process exits slowly returns 200 on 
   assert.equal(restarted.body.fixedPort, a);
 });
 
+// Invariant: the restart waits for the whole old process group, not just its
+// leader: a wrapper that exits at once while its child still holds the port must
+// not make the restart 409.
+test('restart of a fixed-port app whose leader exits at once but a group child holds the port returns 200', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('groupchild'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+});
+
 // Invariant: clearing the Settings port falls back to the manifest's.
 test('a blank Settings port falls back to the manifest port', { skip: FIXED_PORT_SKIP }, async (t) => {
   const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];

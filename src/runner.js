@@ -7,6 +7,11 @@ import { createReadyMatcher } from './readyWhen.js';
 import * as appLog from './appLog.js';
 
 const GRACE_MS = 3000;       // SIGTERM → SIGKILL grace period
+// How long a caller waits for a stopped group to be gone: the SIGKILL grace plus
+// time for the kernel to deliver it and the group to be reaped.
+const STOP_WAIT_MARGIN_MS = 1000;
+export const STOP_WAIT_MS = GRACE_MS + STOP_WAIT_MARGIN_MS;
+const GONE_POLL_MS = 20;
 const READY_TIMEOUT_MS = 30000;
 const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring, fed from the log file; also caps each read
 const EADDRINUSE_RETRIES = 3;
@@ -199,4 +204,26 @@ export function stop({ id, pgid }) {
     if (pidAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
   }, GRACE_MS);
   t.unref();
+}
+
+// True while any member of process group `pgid` exists (the leader alone is not
+// enough: a wrapper can exit while its child keeps holding the port).
+function groupAlive(pgid) {
+  try { process.kill(-pgid, 0); return true; } catch (e) {
+    if (e.code === 'ESRCH') return false;
+    if (e.code === 'EPERM') return true; // exists, not ours to signal
+    throw e;
+  }
+}
+
+// Resolves true once no member of the group is left, false if some still live
+// after `timeoutMs`. It signals nothing — pair it with stop().
+export async function waitGone(pgid, timeoutMs) {
+  if (!pgid) return true;
+  const deadline = Date.now() + timeoutMs;
+  while (groupAlive(pgid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, GONE_POLL_MS));
+  }
+  return true;
 }

@@ -399,3 +399,35 @@ test('openFdsOf reports a writable fd on an open file', { skip: process.platform
   }
   assert.deepEqual(openFdsOf(file), []);
 });
+
+// A live detached group of one `sleep`; killed with the group at test end.
+function spawnGroup(t) {
+  const c = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } });
+  return c;
+}
+
+// Pins: a live group is reported not-gone once the bound passes (the caller can
+// then refuse), rather than waiting forever or claiming it is gone.
+test('waitGone reports a live process group as not gone when the timeout passes', async (t) => {
+  const c = spawnGroup(t);
+  assert.equal(await runner.waitGone(c.pid, 50), false);
+});
+
+// Pins: waitGone resolves true once the group has exited, so restart proceeds.
+test('waitGone resolves true once the process group has exited', async (t) => {
+  const c = spawnGroup(t);
+  process.kill(-c.pid, 'SIGTERM');
+  assert.equal(await runner.waitGone(c.pid, runner.STOP_WAIT_MS), true);
+});
+
+// Pins: the group is probed, not just the leader — a group whose leader has
+// exited but whose member lives on is not gone.
+test('waitGone stays false while only a non-leader member of the group lives', async (t) => {
+  const leader = spawn('sh', ['-c', 'sleep 30 & echo $!; exit 0'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  const member = Number(await new Promise((r) => leader.stdout.once('data', (d) => r(String(d).trim()))));
+  t.after(() => { try { process.kill(-leader.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((r) => leader.once('exit', r));
+  assert.ok(pidAlive(member));
+  assert.equal(await runner.waitGone(leader.pid, 50), false);
+});
