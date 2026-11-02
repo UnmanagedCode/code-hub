@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { WORKTREES_DIRNAME, STORE_DIRNAME, storeRoot } from '../src/projects.js';
+import { WORKTREES_DIRNAME, storeRoot } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import * as appSettings from '../src/appSettings.js';
 import * as hubSettings from '../src/hubSettings.js';
@@ -61,11 +61,35 @@ export function altLoopbackBindable() {
   });
 }
 
+// code-conductor's data dir for code-hub under a projects root (its
+// pluginDataDir layout) — also where the relay's walk-up and --projects-root look.
+export const dataDirIn = (root) => path.join(root, '.code-conductor', 'plugins', 'data', 'code-hub');
+
+// Every entry under `dir` as { relPath: { mode, kind, content } } (content only
+// for files), so a refusal test can assert the filesystem is untouched.
+export async function snapshotTree(dir) {
+  const out = {};
+  const walk = async (abs, rel) => {
+    const st = await fs.lstat(abs);
+    const mode = st.mode & 0o7777;
+    if (st.isDirectory()) {
+      out[rel || '.'] = { mode, kind: 'dir', content: null };
+      for (const name of (await fs.readdir(abs)).sort()) await walk(path.join(abs, name), path.join(rel, name));
+    } else if (st.isSymbolicLink()) {
+      out[rel] = { mode, kind: 'symlink', content: await fs.readlink(abs) };
+    } else {
+      out[rel] = { mode, kind: 'file', content: (await fs.readFile(abs)).toString('base64') };
+    }
+  };
+  await walk(dir, '');
+  return out;
+}
+
 // Fresh temp projects root; sets PROJECTS_ROOT so all modules resolve to it.
 // The bridge-address fallback is turned off in it unless `bridgeFallback` is
 // true (then no hub-settings file is written, so the default applies): run in a
 // bridge container, an app's URLs would otherwise depend on the host's network.
-// The file is complete before PROJECTS_ROOT names the root — a late callback of
+// The file is complete before the env names the root — a late callback of
 // the previous test (an app exit, a settle) may read the hub settings at any
 // await — and the settings cache is dropped once it does.
 //
@@ -76,13 +100,14 @@ export function altLoopbackBindable() {
 export async function mkRoot({ bridgeFallback = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-test-'));
   if (!bridgeFallback) {
-    const store = path.join(root, STORE_DIRNAME);
+    const store = dataDirIn(root);
     await fs.mkdir(store, { recursive: true });
     const tmp = path.join(store, `.${HUB_SETTINGS_FILENAME}.tmp`);
     await fs.writeFile(tmp, JSON.stringify({ bridgeFallback: false }));
     await fs.rename(tmp, path.join(store, HUB_SETTINGS_FILENAME));
   }
   process.env.PROJECTS_ROOT = root;
+  process.env.CONDUCTOR_PLUGIN_DATA_DIR = dataDirIn(root);
   process.env.FAKE_TAILSCALE_PORT_DIR = fakeTailscalePortDir(root);
   hubSettings._reset();
   return root;
@@ -120,11 +145,11 @@ export async function mkProject(root, name, manifest, { git = false } = {}) {
 export const mkWorktree = (root, project, key, manifest, opts) =>
   mkProject(root, path.join(WORKTREES_DIRNAME, project, key), manifest, opts);
 
-// Write <root>/.code-hub/registrations.json directly, bypassing appManager,
+// Write <dataDirIn(root)>/registrations.json directly, bypassing appManager,
 // so tests can set up registry state (including deliberately malformed raw
 // content) without going through registerApp.
 export async function writeRegistrations(root, contents) {
-  const dir = path.join(root, '.code-hub');
+  const dir = dataDirIn(root);
   await fs.mkdir(dir, { recursive: true });
   const raw = typeof contents === 'string' ? contents : JSON.stringify(contents, null, 2);
   await fs.writeFile(path.join(dir, 'registrations.json'), raw);
@@ -262,7 +287,7 @@ export async function patchedRelayDir(t, overrides = {}) {
 }
 
 // Spawn the real relay on loopback, finding code-hub's store through
-// `--projects-root <projectsRoot>` (which must hold a .code-hub dir). The
+// `--projects-root <projectsRoot>` (which must hold the data dir, `dataDirIn`). The
 // relay probes the default route at startup in every run (its listen guard
 // compares against the answer); `advertise` null also makes that answer the
 // advertised address, and CODEHUB_RELAY_PROBE_DEST (via `env`) is the seam that
@@ -413,7 +438,7 @@ export async function relayLogin(port, secret, { role = RELAY_PROTOCOL.roles.con
 
 // The secret code-hub provisioned under `projectsRoot`.
 export async function relaySecret(projectsRoot) {
-  const raw = await fs.readFile(path.join(projectsRoot, '.code-hub', RELAY_PROTOCOL.rendezvous.dir, RELAY_PROTOCOL.rendezvous.hubFile), 'utf8');
+  const raw = await fs.readFile(path.join(dataDirIn(projectsRoot), RELAY_PROTOCOL.rendezvous.dir, RELAY_PROTOCOL.rendezvous.hubFile), 'utf8');
   return JSON.parse(raw).secret;
 }
 

@@ -14,7 +14,7 @@ import { _setContainerProbe, _setBridgeProbe } from '../src/net.js';
 import { storeRoot } from '../src/projects.js';
 import {
   requirePython, startRelay, canConnect, waitFor, relaySecret, RELAY_PROTOCOL as P,
-  mkRoot, rmRoot, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ALT_LOOPBACK, altLoopbackBindable,
+  mkRoot, rmRoot, dataDirIn, mkProject, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, ALT_LOOPBACK, altLoopbackBindable,
 } from './helpers.mjs';
 
 // In-process code-hub (appManager + hostRelay, as server.js wires them) in a
@@ -139,7 +139,7 @@ test('W2: a relay started after the share picks it up, SAN included', async (t) 
 test('W3: relay first, a hub restart and a relay restart all converge', async (t) => {
   if (!requirePython(t)) return;
   const root = await mkRoot();
-  await fs.mkdir(path.join(root, '.code-hub'), { recursive: true });
+  await fs.mkdir(dataDirIn(root), { recursive: true });
   await relayStore.ensureSecret();
   const first = await relayFor(t, { projectsRoot: root });
   // The relay is up before code-hub boots (boot() makes its own root, so point it here).
@@ -175,6 +175,7 @@ async function bootAt(t, root) {
   process.env.CODEHUB_CLOUDFLARED_BIN = fakeCloudflaredBin;
   process.env.CODEHUB_TAILSCALE_BIN = fakeTailscaleBin;
   process.env.PROJECTS_ROOT = root;
+  process.env.CONDUCTOR_PLUGIN_DATA_DIR = dataDirIn(root);
   _setContainerProbe(() => true);
   _setBridgeProbe(() => false);
   hostRelay._setLoopbackDialHost('127.0.0.1');

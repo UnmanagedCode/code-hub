@@ -173,7 +173,7 @@ class ControlListenProblem(unittest.TestCase):
                 tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(relay, "log"), \
                 mock.patch.object(relay, "default_route_ipv4", side_effect=OSError("no route")):
-            os.mkdir(os.path.join(tmp, ".code-hub"))
+            os.makedirs(os.path.join(tmp, *relay.STORE_SUBPATH))
             root = ["--projects-root", tmp]
             # A padded wildcard is the wildcard, refused before any bind.
             self.assertEqual(relay.parse_args(["--listen", "000.000.000.000:7077"]).listen_host, "0.0.0.0")
@@ -203,7 +203,7 @@ class ControlListenProblem(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(relay, "default_route_ipv4", lambda dest=None: "192.168.1.20"), \
                 mock.patch.object(relay, "bind_listener", side_effect=AssertionError("bound a socket")):
-            os.mkdir(os.path.join(tmp, ".code-hub"))
+            os.makedirs(os.path.join(tmp, *relay.STORE_SUBPATH))
             with self.assertRaises(SystemExit) as caught:
                 relay.main(["--listen", "192.168.1.20:0", "--advertise", "10.0.0.5", "--projects-root", tmp])
         self.assertIn("default-route", str(caught.exception.code))
@@ -421,7 +421,7 @@ def mac_compare_problems(tree):
 
 class Discovery(unittest.TestCase):
     """P-Discovery (S7): the store is the nearest ancestor of the script's
-    directory holding .code-hub; --projects-root overrides; `searched` lists
+    directory holding the data dir (STORE_SUBPATH); --projects-root overrides; `searched` lists
     every directory looked at."""
 
     def setUp(self):
@@ -430,19 +430,33 @@ class Discovery(unittest.TestCase):
         self.script = self.tmp / "root" / "a" / "b" / "relay" / "relay.py"
         self.script.parent.mkdir(parents=True)
 
+    def sub(self, base):
+        return base.joinpath(*relay.STORE_SUBPATH)
+
     def test_nearest_ancestor_wins(self):
-        (self.tmp / "root" / ".code-hub").mkdir()
+        self.sub(self.tmp / "root").mkdir(parents=True)
         store, searched = relay.find_store(self.script)
-        self.assertEqual(store, (self.tmp / "root" / ".code-hub").resolve())
+        self.assertEqual(store, self.sub(self.tmp / "root").resolve())
         self.assertEqual(searched, [str((self.tmp / "root" / "a" / "b").resolve()), str((self.tmp / "root" / "a").resolve()), str((self.tmp / "root").resolve())])
-        (self.tmp / "root" / "a" / ".code-hub").mkdir()
-        self.assertEqual(relay.find_store(self.script)[0], (self.tmp / "root" / "a" / ".code-hub").resolve())
+        self.sub(self.tmp / "root" / "a").mkdir(parents=True)
+        self.assertEqual(relay.find_store(self.script)[0], self.sub(self.tmp / "root" / "a").resolve())
+
+    def test_legacy_store_is_not_found(self):
+        (self.tmp / "root" / ".code-hub").mkdir()
+        store, _ = relay.find_store(self.script)
+        self.assertIsNone(store)
+        self.assertEqual(relay.find_store(self.script, str(self.tmp / "root"))[0], None)
+
+    def test_layout_tracks_conductor_and_manifest(self):
+        self.assertEqual(relay.STORE_SUBPATH[:3], (".code-conductor", "plugins", "data"))
+        manifest = json.loads((Path(relay.__file__).resolve().parent.parent / "conductor.plugin.json").read_text())
+        self.assertEqual(relay.STORE_SUBPATH[-1], manifest["id"])
 
     def test_override_and_none(self):
         other = self.tmp / "other"
         self.assertEqual(relay.find_store(self.script, str(other)), (None, [str(other.resolve())]))
-        (other / ".code-hub").mkdir(parents=True)
-        self.assertEqual(relay.find_store(self.script, str(other))[0], (other / ".code-hub").resolve())
+        self.sub(other).mkdir(parents=True)
+        self.assertEqual(relay.find_store(self.script, str(other))[0], self.sub(other).resolve())
         store, searched = relay.find_store(self.script)
         if store is None:
             self.assertEqual(searched, [str(p) for p in self.script.resolve().parent.parents])
@@ -498,7 +512,8 @@ class StartupErrors(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(str(self.tmp), ignore_errors=True))
-        (self.tmp / ".code-hub").mkdir()
+        self.store = self.tmp.joinpath(*relay.STORE_SUBPATH)
+        self.store.mkdir(parents=True)
 
     def run_main(self, **patches):
         argv = ["--listen", "127.0.0.1:0", "--advertise", "127.0.0.1", "--projects-root", str(self.tmp)]
@@ -519,7 +534,7 @@ class StartupErrors(unittest.TestCase):
         self.assertIn("run the relay as the user that owns %s" % self.tmp, str(caught.exception))
         with mock.patch.object(relay.os, "makedirs", side_effect=denied):
             with self.assertRaises(relay.RendezvousError) as caught:
-                relay.relay_dir(self.tmp / ".code-hub")
+                relay.relay_dir(self.store)
         self.assertIn("cannot create", str(caught.exception))
         self.assertIn("run the relay as the user that owns", str(caught.exception))
         with mock.patch.object(relay.os, "open", side_effect=denied):

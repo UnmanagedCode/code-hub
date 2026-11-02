@@ -16,7 +16,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { RELAY_PROTOCOL as P, protoMac, frameStream, relaySecret } from '../helpers.mjs';
+import { RELAY_PROTOCOL as P, protoMac, frameStream, relaySecret, dataDirIn } from '../helpers.mjs';
 
 const send = (socket, frame) => { if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`); };
 
@@ -93,7 +93,7 @@ export async function startFakeRelay({ root, impostor = false, impostorData = fa
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   fake.port = server.address().port;
-  fake.hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
+  fake.hostFile = path.join(dataDirIn(root), P.rendezvous.dir, P.rendezvous.relayFile);
   fake.publish = (over = {}) => fs.writeFile(fake.hostFile, JSON.stringify({ protocolVersion: P.protocolVersion, listen: `127.0.0.1:${fake.port}`, pid: process.pid, ...over }));
   fake.control = () => fake.controls.at(-1);
   fake.send = (frame) => send(fake.control().socket, frame);

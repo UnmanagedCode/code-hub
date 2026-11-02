@@ -14,7 +14,7 @@ import { _setContainerProbe, _setBridgeProbe } from '../src/net.js';
 import { generateSelfSigned } from '../src/selfsigned.js';
 import {
   REPO_ROOT, RELAY_PROTOCOL as PROTOCOL, requirePython, startRelay, runRelay, patchedRelayDir, canConnect, waitFor,
-  mkRoot, rmRoot, relayLogin, relaySecret, protoMac, frameStream, tcpConnect, ALT_LOOPBACK, altLoopbackBindable, listeningAddrs,
+  mkRoot, rmRoot, dataDirIn, relayLogin, relaySecret, protoMac, frameStream, tcpConnect, ALT_LOOPBACK, altLoopbackBindable, listeningAddrs,
 } from './helpers.mjs';
 
 // The real Python relay (relay/relay.py) over loopback, driven by a raw
@@ -94,7 +94,7 @@ function collect(socket) {
 
 // Spawn the stand-in hub exposing an echo server in `scopes`: { proc, hostPorts }.
 async function standInHub(t, root, scopes, env = {}) {
-  const proc = spawn(process.execPath, [STAND_IN_HUB, ...scopes], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PROJECTS_ROOT: root, ...env } });
+  const proc = spawn(process.execPath, [STAND_IN_HUB, ...scopes], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PROJECTS_ROOT: root, CONDUCTOR_PLUGIN_DATA_DIR: dataDirIn(root), ...env } });
   t.after(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } });
   let out = '', err = '';
   proc.stderr.on('data', (d) => { err += d; });
@@ -169,9 +169,9 @@ test('V3: no byte between code-hub and the relay carries the secret', async (t) 
   // The stand-in hub's own root: the same secret, and a relay file naming the tap.
   const hubRootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-tapped-'));
   t.after(() => fs.rm(hubRootDir, { recursive: true, force: true }));
-  const rdir = path.join(hubRootDir, '.code-hub', PROTOCOL.rendezvous.dir);
+  const rdir = path.join(dataDirIn(hubRootDir), PROTOCOL.rendezvous.dir);
   await fs.mkdir(rdir, { recursive: true });
-  await fs.copyFile(path.join(relayRoot, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile), path.join(rdir, PROTOCOL.rendezvous.hubFile));
+  await fs.copyFile(path.join(dataDirIn(relayRoot), PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile), path.join(rdir, PROTOCOL.rendezvous.hubFile));
   const wire = await tap(t, relay.port);
   await fs.writeFile(path.join(rdir, PROTOCOL.rendezvous.relayFile), JSON.stringify({ protocolVersion: PROTOCOL.protocolVersion, listen: `127.0.0.1:${wire.port}`, pid: 1 }));
   const { hostPorts } = await standInHub(t, hubRootDir, [SCOPES.loopback]);
@@ -446,7 +446,7 @@ test('V13: the relay refuses a wildcard, an advertised or a default-route --list
   assert.match(loopback.output().stdout, /code-hub-relay listening on 127\.0\.0\.1:\d+/);
 });
 
-const hostFileIn = (root) => path.join(root, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.relayFile);
+const hostFileIn = (root) => path.join(dataDirIn(root), PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.relayFile);
 const exists = (p) => fs.access(p).then(() => true, () => false);
 
 // Invariant (S7): with no flags the relay finds code-hub's store by walking up
@@ -459,9 +459,9 @@ test('V14: discovery walks up from the script, --projects-root overrides, and no
   const plugin = path.join(tmp, 'root', '.plugins', 'code-hub', 'relay');
   await fs.mkdir(plugin, { recursive: true });
   for (const f of ['relay.py', 'protocol.json']) await fs.copyFile(path.join(REPO_ROOT, 'relay', f), path.join(plugin, f));
-  await fs.mkdir(path.join(tmp, 'root', '.code-hub'));
+  await fs.mkdir(dataDirIn(path.join(tmp, 'root')), { recursive: true });
   const decoy = path.join(tmp, 'decoy');
-  await fs.mkdir(path.join(decoy, '.code-hub'), { recursive: true });
+  await fs.mkdir(dataDirIn(decoy), { recursive: true });
 
   const found = await startRelay({ relayDir: plugin, cwd: decoy });
   t.after(() => found.stop());
@@ -470,7 +470,7 @@ test('V14: discovery walks up from the script, --projects-root overrides, and no
   await found.stop('SIGTERM');
 
   const other = path.join(tmp, 'other');
-  await fs.mkdir(path.join(other, '.code-hub'), { recursive: true });
+  await fs.mkdir(dataDirIn(other), { recursive: true });
   const overridden = await startRelay({ relayDir: plugin, cwd: decoy, projectsRoot: other });
   t.after(() => overridden.stop());
   await waitFor(() => exists(hostFileIn(other)));
@@ -484,6 +484,17 @@ test('V14: discovery walks up from the script, --projects-root overrides, and no
   assert.ok(none.stderr.includes(path.join(tmp, 'lonely')), none.stderr);
   assert.ok(none.stderr.includes(tmp), 'names the searched dirs');
   assert.match(none.stderr, /--projects-root/);
+
+  // A legacy `.code-hub` store is never found: discovery knows the new location only.
+  const legacyOnly = path.join(tmp, 'legacy-only');
+  const legacyRelay = path.join(legacyOnly, '.plugins', 'code-hub', 'relay');
+  await fs.mkdir(legacyRelay, { recursive: true });
+  await fs.mkdir(path.join(legacyOnly, '.code-hub'));
+  for (const f of ['relay.py', 'protocol.json']) await fs.copyFile(path.join(REPO_ROOT, 'relay', f), path.join(legacyRelay, f));
+  const legacy = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1'], { relayDir: legacyRelay, cwd: decoy });
+  assert.notEqual(legacy.code, 0);
+  assert.ok(legacy.stderr.includes('.code-conductor/plugins/data/code-hub'), legacy.stderr);
+  assert.match(legacy.stderr, /--projects-root/);
 });
 
 // Invariant (S2/S7): the relay file names where the relay really listens and
@@ -517,7 +528,7 @@ test('V16: a relay started before the secret exists waits for it, and picks up a
   if (!requirePython(t)) return;
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  await fs.mkdir(path.join(root, '.code-hub'), { recursive: true });
+  await fs.mkdir(dataDirIn(root), { recursive: true });
   const relay = await relayFor(t, { projectsRoot: root });
   await waitFor(() => /waiting for code-hub to create .*relay\.json/.test(relay.output().stderr));
   const early = await relayLogin(relay.port, 'z'.repeat(43));
@@ -527,7 +538,7 @@ test('V16: a relay started before the secret exists waits for it, and picks up a
   const s = await relayLogin(relay.port, secret);
   assert.equal(s.reply.t, F.welcome);
   s.socket.destroy();
-  const hubFile = path.join(root, '.code-hub', PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile);
+  const hubFile = path.join(dataDirIn(root), PROTOCOL.rendezvous.dir, PROTOCOL.rendezvous.hubFile);
   await fs.writeFile(hubFile, 'not json');
   await relayStore.ensureSecret(); // replaces the invalid file with a fresh secret
   const fresh = await relaySecret(root);
@@ -800,7 +811,7 @@ test('V24: an auth of another protocol version gets version_mismatch, not auth_f
 test('V25: store permission failures and a busy --listen each give their own message', { skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'needs POSIX permissions enforced (not root)' : false }, async (t) => {
   if (!requirePython(t)) return;
   const { root } = await hubRoot(t);
-  const rdir = path.join(root, '.code-hub', PROTOCOL.rendezvous.dir);
+  const rdir = path.join(dataDirIn(root), PROTOCOL.rendezvous.dir);
   await fs.chmod(rdir, 0o500);
   t.after(() => fs.chmod(rdir, 0o700).catch(() => {}));
   const unwritable = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1', '--projects-root', root]);
@@ -810,8 +821,9 @@ test('V25: store permission failures and a busy --listen each give their own mes
   await fs.chmod(rdir, 0o700);
 
   const bare = await fs.mkdtemp(path.join(os.tmpdir(), 'codehub-bare-'));
-  t.after(async () => { await fs.chmod(path.join(bare, '.code-hub'), 0o700).catch(() => {}); await fs.rm(bare, { recursive: true, force: true }); });
-  await fs.mkdir(path.join(bare, '.code-hub'), { mode: 0o500 });
+  t.after(async () => { await fs.chmod(dataDirIn(bare), 0o700).catch(() => {}); await fs.rm(bare, { recursive: true, force: true }); });
+  await fs.mkdir(dataDirIn(bare), { recursive: true });
+  await fs.chmod(dataDirIn(bare), 0o500);
   const noDir = await runRelay(['--listen', '127.0.0.1:0', '--advertise', '127.0.0.1', '--projects-root', bare]);
   assert.notEqual(noDir.code, 0);
   assert.match(noDir.stderr, /cannot create \S+: Permission denied — run the relay as the user that owns/);

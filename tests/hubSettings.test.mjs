@@ -4,7 +4,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import * as hubSettings from '../src/hubSettings.js';
 import { storeRoot } from '../src/projects.js';
-import { mkRoot, rmRoot } from './helpers.mjs';
+import { mkRoot, rmRoot, dataDirIn } from './helpers.mjs';
 
 // A root with no hub-settings file at all.
 async function freshRoot(t) {
@@ -92,5 +92,6 @@ test('mkRoot: a read racing it never leaves the new root on the default', async 
   t.after(() => rmRoot(root));
   assert.ok(polls > 1, 'reads interleaved with mkRoot');
   assert.equal(process.env.PROJECTS_ROOT, root);
+  assert.equal(process.env.CONDUCTOR_PLUGIN_DATA_DIR, dataDirIn(root));
   assert.deepEqual(hubSettings.get(), { bridgeFallback: false });
 });

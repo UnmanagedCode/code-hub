@@ -7,7 +7,7 @@ import * as hostRelay from '../src/hostRelay.js';
 import * as relayStore from '../src/relayStore.js';
 import { _setTimings } from '../src/relaySession.js';
 import { _setContainerProbe, _setBridgeProbe, parseDefaultGateway } from '../src/net.js';
-import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor, relaySecret } from './helpers.mjs';
+import { RELAY_PROTOCOL as P, mkRoot, rmRoot, waitFor, relaySecret, dataDirIn } from './helpers.mjs';
 import { startFakeRelay } from './fixtures/fake-relay.mjs';
 
 // src/hostRelay.js (with relayStore.js and relaySession.js) against FAKE relays
@@ -154,7 +154,7 @@ test('H4: backoff gaps grow, and a relay-file change cuts the wait short', async
   const refuser = net.createServer((s) => { times.push(Date.now()); s.destroy(); });
   await new Promise((r) => refuser.listen(0, '127.0.0.1', r));
   t.after(() => refuser.close());
-  const hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
+  const hostFile = path.join(dataDirIn(root), P.rendezvous.dir, P.rendezvous.relayFile);
   const publish = (pid) => fs.writeFile(hostFile, JSON.stringify({ protocolVersion: P.protocolVersion, listen: `127.0.0.1:${refuser.address().port}`, pid }));
   await publish(1);
   const { handle } = exposeFor(t, 40004, SCOPES.lan);
@@ -217,7 +217,7 @@ test('H6: ports frames carry the full set, both scopes, on connect, on change an
 test('H7: relay.json is created 0700/0600, kept when valid, replaced when invalid or short', async (t) => {
   const root = await mkRoot();
   t.after(() => rmRoot(root));
-  const dir = path.join(root, '.code-hub', P.rendezvous.dir);
+  const dir = path.join(dataDirIn(root), P.rendezvous.dir);
   const file = path.join(dir, P.rendezvous.hubFile);
   await fs.mkdir(dir, { recursive: true, mode: 0o755 });
   await fs.chmod(dir, 0o755);
@@ -249,7 +249,7 @@ test('H12: rendezvous reads refuse FIFOs and oversize files; the tmp write never
   const root = await mkRoot();
   t.after(() => rmRoot(root));
   const { execFileSync } = await import('node:child_process');
-  const dir = path.join(root, '.code-hub', P.rendezvous.dir);
+  const dir = path.join(dataDirIn(root), P.rendezvous.dir);
   const hubFile = path.join(dir, P.rendezvous.hubFile);
   const hostFile = path.join(dir, P.rendezvous.relayFile);
   await relayStore.ensureSecret();
@@ -463,7 +463,7 @@ test('H20b: a file that grew past its stat size is read no further than the boun
   const root = await setup(t);
   const { createRequire, syncBuiltinESMExports } = await import('node:module');
   const fsCjs = createRequire(import.meta.url)('node:fs');
-  const hostFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.relayFile);
+  const hostFile = path.join(dataDirIn(root), P.rendezvous.dir, P.rendezvous.relayFile);
   await fs.writeFile(hostFile, 'x'.repeat(P.maxRendezvousBytes * 64));
   const limit = P.maxRendezvousBytes + 1;
   const lying = (info) => Object.assign(Object.create(Object.getPrototypeOf(info)), info, { size: 10 });
@@ -542,7 +542,7 @@ test('H22: an unusable relay file waits for a change; it is not retried', { skip
 // next boot keeps the same secret instead of failing to read it.
 test('H21: ensureSecret writes relay.json 0600 under a restrictive umask', { skip: posixOnly }, async (t) => {
   const root = await setup(t);
-  const hubFile = path.join(root, '.code-hub', P.rendezvous.dir, P.rendezvous.hubFile);
+  const hubFile = path.join(dataDirIn(root), P.rendezvous.dir, P.rendezvous.hubFile);
   await fs.rm(hubFile);
   const old = process.umask(0o477);
   t.after(() => process.umask(old));

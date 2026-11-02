@@ -23,7 +23,15 @@ Readiness precedence: `readyWhen` → `healthPath` → default TCP connect probe
 
 There is **no `stop` command**: code-hub owns the lifecycle and stops an app by killing the tracked process group (SIGTERM, then SIGKILL after a 3s grace period).
 
-## App output logs: `<projectsRoot>/.code-hub/logs/`
+## Data dir: `$CONDUCTOR_PLUGIN_DATA_DIR`
+
+Every file code-hub persists (logs, `registrations.json`, `app-settings.json`, `hub-settings.json`, `state.json`, the `relay/` rendezvous dir) lives in its data dir, `$CONDUCTOR_PLUGIN_DATA_DIR` — under code-conductor `<projectsRoot>/.code-conductor/plugins/data/code-hub/`. This page and the others write paths relative to it.
+
+- The variable must be a non-empty absolute path. Otherwise boot exits non-zero, printing `CONDUCTOR_PLUGIN_DATA_DIR is not set — code-hub keeps its data in the directory code-conductor provides; to run code-hub standalone, set CONDUCTOR_PLUGIN_DATA_DIR to an absolute directory path` (a relative or empty value prints `… must be an absolute path (got …)`). Error code `ENODATADIR`.
+- Standalone: `CONDUCTOR_PLUGIN_DATA_DIR=<dir> npm start`. code-hub creates `<dir>` lazily on first write.
+- `PROJECTS_ROOT` still names the scanned projects root; it is not the data dir's base.
+
+## App output logs: `$CONDUCTOR_PLUGIN_DATA_DIR/logs/`
 
 - code-hub opens `<id>.log` (`O_APPEND`) and hands the fd to the app as both stdout and stderr; the app doesn't open it. `<id>` is `encodeURIComponent(app id)` (`appLog.logFile`). Directory mode `0700`, file mode `0600`. A failed open fails the start with the path in the error.
 - Stdout and stderr are interleaved in the order of the app's `write(2)` calls; an app's own stdio buffering can reorder its logical output.
@@ -34,13 +42,13 @@ There is **no `stop` command**: code-hub owns the lifecycle and stops an app by 
 - Limitations: lines written between the copy and the truncate are lost. Nothing rotates while no code-hub runs, so the log can grow far past `LOG_CAP_BYTES`; the first sweep at boot keeps only its last `LOG_CAP_BYTES` in `.log.1` and drops the rest of the backlog. That `.log.1` stays until the next rotation overwrites it, the app's next start deletes it, or — for an id that is not running — retention removes it after `LOG_RETENTION_MS`.
 - Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
 
-## Machine-local registration: `registrations.json` (`<projectsRoot>/.code-hub/registrations.json`)
+## Machine-local registration: `registrations.json` (`$CONDUCTOR_PLUGIN_DATA_DIR/registrations.json`)
 
 A JSON object keyed by **app id** — a project's directory basename, or `<project>:<key>` for a worktree (see "Worktree manifest inheritance") — each value the same shape as a `.hub.json` body above (validated with the identical schema — `start` required, `name`/`healthPath`/`readyWhen`/`port`/`routes` optional). Fills in a manifest for a project dir or worktree checkout that has **no** `.hub.json` of its own; a real `.hub.json`, even a broken one, always wins over a registration for the same id. Managed via the `register_app`/`unregister_app` MCP tools below, or by hand-editing the file directly (needed for `routes`, since it isn't expressible in `register_app`'s tool schema).
 
 Robustness, mirroring `.hub.json`/`state.json` conventions: whole-file JSON that fails to parse, or isn't a JSON object, is logged (`console.warn`) and treated as an empty registry — it never hides real `.hub.json` apps. A per-entry validation failure (e.g. missing `start`) surfaces that one app as non-startable with `manifestError`, exactly like a broken `.hub.json` does. A registry entry whose key names no discovered app is logged and skipped — no phantom app. One exception is deliberately silent: a key naming a project with at least one **servable** worktree under `<projectsRoot>/.worktrees/` never warns, since that registration is legitimately consumed by those worktrees (the adopted / out-of-root project case). "Servable" excludes a checkout refused for the reserved `:` (below) — nothing consumes a refused one, so a key whose only worktrees are refused **does** warn as orphaned, on every listing, alongside the refusal warning naming the checkout. If you are hand-editing this file, that pair of warnings is the signal to rename the offending directory rather than to re-add the key.
 
-## App settings: `app-settings.json` (`<projectsRoot>/.code-hub/app-settings.json`)
+## App settings: `app-settings.json` (`$CONDUCTOR_PLUGIN_DATA_DIR/app-settings.json`)
 
 Per-app settings (`src/appSettings.js`): the default login a **new** share of the app starts with, in every mode; the app's fixed port; the app's fixed port; whether code-hub starts the app at boot; and how it shares the app once a start reaches ready. Managed via `GET`/`PUT`/`DELETE /api/apps/:id/settings` (below), which the UI's per-card **Settings** dialog uses.
 
@@ -57,14 +65,14 @@ Per-app settings (`src/appSettings.js`): the default login a **new** share of th
 
   An entry with none of the five is deleted, never kept. `autoShare` is stored **normalised** by the same validation `POST …/share` uses (`validateShareOptions` in `src/shareOptions.js`): `auth` defaults to `true`, `tls` is kept for `lan` only and defaults to `true`, `funnelPort` is kept for `tailscale` only and defaults to `443`, any other key is dropped. A stored `tailscale` `autoShare` with no `funnelPort` is read — and reported by `GET …/settings` and the listing's `settings.autoShare` — as `funnelPort: 443`; the file itself is not rewritten.
 - **Main checkouts only:** `autoStart`, `autoShare` and `port` act on a project's main checkout. Enabling any (`autoStart: true`, a non-null `autoShare`, or a non-null `port`) for a **worktree** is refused with `400` (`auto-start, auto-share and a fixed port apply only to a project's main checkout — '<id>' is a worktree`). The **host code-conductor** (`alwaysOn`) takes `autoShare`; `autoStart: true` or a non-null `port` for it is refused with `400` (`auto-start and a fixed port don't apply to '<id>' — it is the host code-conductor, which is always on (auto-share does apply)`), the whole body included. A refused body writes nothing. Clearing them is always accepted, and a hand-written `autoStart` on the host conductor's entry is ignored (`autoStartAll()` excludes it). Whether an id is a worktree comes from discovery (or the running record of a source-removed app), never from the id's shape. A hand-written toggle or port on a worktree entry is ignored: no auto-start, no auto-share, a free port; a hand-written port on the host conductor's entry is ignored too (code-hub never starts it).
-- **Location:** always under `<projectsRoot>/.code-hub/`, never in a project tree.
+- **Location:** always under `$CONDUCTOR_PLUGIN_DATA_DIR/`, never in a project tree.
 - **Mode `0600`:** every write goes to a tmp file created `0600`, `chmod 0600`, then renamed over the file — so the file is owner-only even if it pre-existed looser. `state.json`/`registrations.json` are written with the process umask. **Plaintext at rest** — the file mode is the only protection.
 - **Read on every call** (no in-memory cache). Writes (`update`/`clear`) are serialised in-process, so concurrent PUTs for different ids don't drop each other's entry.
 - **Corrupt file:** invalid JSON is renamed to `app-settings.json.corrupt` (chmodded `0600`, since it may still hold passwords) with a `console.warn` that omits the parse error (its message can quote the file), and treated as empty; valid JSON that isn't an object is warned about and treated as empty.
 - **Not auto-deleted** when an app is unregistered or removed; `DELETE …/settings` clears a stale entry.
 - **Migration from `share-defaults.json`** (`migrateLegacyFile()`, first thing in `appManager.init()`): `share-defaults.json` present and `app-settings.json` absent → renamed to `app-settings.json` (contents unchanged — its `username`/`password` entries are valid entries here, with both toggles off) and chmodded `0600`. Both present → neither is touched, `app-settings.json` is used, and a `console.warn` names both paths. Otherwise nothing happens. Idempotent.
 
-## Hub settings: `hub-settings.json` (`<projectsRoot>/.code-hub/hub-settings.json`)
+## Hub settings: `hub-settings.json` (`$CONDUCTOR_PLUGIN_DATA_DIR/hub-settings.json`)
 
 Hub-wide settings (`src/hubSettings.js`, filename `HUB_SETTINGS_FILENAME`). Managed via `PUT /api/hub-settings` (below), which the UI's toolbar **Hub settings** dialog uses; the current values ride on every `GET /api/apps` as `hubSettings`.
 
@@ -237,7 +245,7 @@ Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot s
 
 The contract between code-hub (`src/hostRelay.js`, `src/relaySession.js`, `src/relayStore.js`, all reading it through `src/relayProtocol.js`) and the host relay (`relay/relay.py`). **`relay/protocol.json` is its single source**, read at load by both sides: the version, the rendezvous file names, the MAC labels, every frame type, role, scope and error code, the port range, and every cap and timing (`maxAddresses`, `maxRendezvousBytes`, `maxPorts`, `maxFrameBytes`, `maxPendingHandshakes`, `maxHubHandshakes`, `maxIncomingPerPort`, `maxIncomingTotal`, `nonceBytes`, `minSecretLength`, `handshakeTimeoutMs`, `pingIntervalMs`, `keepaliveTimeoutMs`). Tests fail if a source file restates a frame type, role, scope, MAC label, error code or file name inside a string literal (`tests/python/test_relay.py` for `relay.py`; `tests/relay.test.mjs` V17 for the code-hub relay modules); comments, docstrings, a frame's own key names and Node event names are not scanned. Operator guide: `docs/host-relay.md`.
 
-### Rendezvous files — `<projectsRoot>/.code-hub/<rendezvous.dir>/`
+### Rendezvous files — `$CONDUCTOR_PLUGIN_DATA_DIR/<rendezvous.dir>/`
 
 | File (`rendezvous.*`) | Writer | Shape | Rules |
 |---|---|---|---|
