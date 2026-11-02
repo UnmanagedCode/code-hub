@@ -176,9 +176,10 @@ test('M10: a regular file at the data dir path is refused, trees unchanged', asy
   assert.deepEqual(await snapshotTree(base), before);
 });
 
-// Invariant: a failed rename never modifies the legacy tree and puts no data in
-// the target; the target path does not exist afterwards (an emptied target stays
-// removed, nothing is recreated), with the target absent or an empty directory; a re-run once the cause is gone succeeds.
+// Invariant: starting with the target absent or an empty directory, a failed
+// rename never modifies the legacy tree and puts no data in the target; the
+// target path does not exist afterwards (an emptied target stays removed,
+// nothing is recreated); a re-run once the cause is gone succeeds.
 test('M11: a failed rename leaves the legacy tree identical and no data in the target', async (t) => {
   const { legacyDir, dataDir } = await fixture(t);
   const before = await snapshotTree(legacyDir);
@@ -234,10 +235,10 @@ test('M14: an unsearchable parent of the data dir is refused', posixOnly, async 
   const dataDir = path.join(locked, 'code-hub');
   const before = await snapshotTree(legacyDir);
   await fs.chmod(locked, 0o600);
-  t.after(() => fs.chmod(locked, 0o700).catch(() => {}));
-  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
-    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
-  await fs.chmod(locked, 0o700);
+  try {
+    await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+      e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  } finally { await fs.chmod(locked, 0o700); } // before any after-hook removes the tree
   assert.deepEqual(await snapshotTree(legacyDir), before);
   assert.deepEqual(await fs.readdir(locked), []);
 });
@@ -250,10 +251,10 @@ test('M15: an unsearchable parent of the legacy dir is refused', posixOnly, asyn
   await fs.rename(orig, legacyDir);
   const before = await snapshotTree(legacyDir);
   await fs.chmod(locked, 0o600);
-  t.after(() => fs.chmod(locked, 0o700).catch(() => {}));
-  await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
-    e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
-  await fs.chmod(locked, 0o700);
+  try {
+    await assert.rejects(migrateLegacyStore({ legacyDir, dataDir }), (e) =>
+      e.code === 'ESTOREMIGRATE' && e.message.includes(legacyDir) && e.message.includes(dataDir));
+  } finally { await fs.chmod(locked, 0o700); } // before any after-hook removes the tree
   assert.deepEqual(await snapshotTree(legacyDir), before);
   assert.equal(await exists(dataDir), false);
 });
