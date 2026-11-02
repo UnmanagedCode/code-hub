@@ -34,6 +34,9 @@
 //                 stdout/stderr. An 'error' on stdout/stderr or an uncaught
 //                 exception is appended to $FAKE_APP_MARKER and the app keeps
 //                 running, as Next's dev server does.
+//   slowexit    → same as default, but on SIGTERM it keeps holding $PORT for
+//                 FAKE_APP_EXIT_DELAY_MS (default 400) before exiting, as an app
+//                 with a slow shutdown does.
 import http from 'node:http';
 import { READY_OVERLAP_CHARS } from '../../src/readyWhen.js';
 
@@ -96,4 +99,8 @@ if (process.env.FAKE_APP_MODE === 'chatty') {
 
 // Keep the process alive and exit cleanly on SIGTERM so process-group kill is
 // observable in tests.
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+if (process.env.FAKE_APP_MODE === 'slowexit') {
+  process.on('SIGTERM', () => setTimeout(() => server.close(() => process.exit(0)), Number(process.env.FAKE_APP_EXIT_DELAY_MS ?? 400)));
+} else {
+  process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+}

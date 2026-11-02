@@ -68,6 +68,20 @@ test('a Settings port beats the manifest port, on start and on restart', { skip:
   assert.equal(restarted.body.fixedPort, b);
 });
 
+// Invariant: a restart of a fixed-port app takes the same port back even when the
+// old process holds it past SIGTERM (a slow shutdown); the start never 409s on
+// the process it just stopped.
+test('restart of a fixed-port app whose old process exits slowly returns 200 on the same port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('slowexit'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+  assert.equal(restarted.body.fixedPort, a);
+});
+
 // Invariant: clearing the Settings port falls back to the manifest's.
 test('a blank Settings port falls back to the manifest port', { skip: FIXED_PORT_SKIP }, async (t) => {
   const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
