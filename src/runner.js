@@ -199,19 +199,28 @@ function httpOk(port, path) {
 // only need the pgid. Safe to call on an already-dead group.
 export function stop({ id, pgid }) {
   children.delete(id);
+  // A missing/zero pgid would make kill(-pgid) target this process's own group.
+  if (!validPgid(pgid)) return;
   try { process.kill(-pgid, 'SIGTERM'); } catch { /* already gone */ }
   const t = setTimeout(() => {
-    // Gate on the group, not the leader: a member can outlive an exited leader. A
-    // pgid cannot be recycled while any member of the group exists, so a live
-    // group is still ours to kill.
-    if (groupAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
+    // Gate on the group, not the leader: a member can outlive an exited leader.
+    // A live group is the same group the record named; that is not proof the
+    // record's processes are the ones in it, only that the pgid is not free.
+    try {
+      if (groupAlive(pgid)) process.kill(-pgid, 'SIGKILL');
+    } catch { /* gone, or not ours to signal */ }
   }, GRACE_MS);
   t.unref();
 }
 
 // True while any member of process group `pgid` exists (the leader alone is not
 // enough: a wrapper can exit while its child keeps holding the port).
-function groupAlive(pgid) {
+function validPgid(pgid) { return Number.isInteger(pgid) && pgid > 0; }
+
+// A non-positive or missing pgid is never a group: kill(-0, 0) would probe this
+// process's own group.
+export function groupAlive(pgid) {
+  if (!validPgid(pgid)) return false;
   try { process.kill(-pgid, 0); return true; } catch (e) {
     if (e.code === 'ESRCH') return false;
     if (e.code === 'EPERM') return true; // exists, not ours to signal
@@ -222,7 +231,6 @@ function groupAlive(pgid) {
 // Resolves true once no member of the group is left, false if some still live
 // after `timeoutMs`. It signals nothing — pair it with stop().
 export async function waitGone(pgid, timeoutMs) {
-  if (!pgid) return true;
   const deadline = Date.now() + timeoutMs;
   while (groupAlive(pgid)) {
     if (Date.now() >= deadline) return false;

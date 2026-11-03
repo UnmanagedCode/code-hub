@@ -444,5 +444,18 @@ test('stop escalates to SIGKILL for a group whose leader is gone but a member ig
   t.after(() => { try { process.kill(-rec.pgid, 'SIGKILL'); } catch { /* gone */ } });
   await rec.settled;
   runner.stop({ id: 'app', pgid: rec.pgid });
+  // Not killed at once: the escalation waits out the grace for the member.
+  assert.equal(runner.groupAlive(rec.pgid), true);
   assert.equal(await runner.waitGone(rec.pgid, runner.STOP_WAIT_MS), true);
+});
+
+// Pins: a missing or non-positive pgid is never a group (kill(-0, 0) would probe
+// this process's own group), so it can neither be reported alive nor escalated.
+test('groupAlive is false for a missing or non-positive pgid', () => {
+  for (const pgid of [0, null, undefined, -1, NaN, '123']) assert.equal(runner.groupAlive(pgid), false, String(pgid));
+});
+
+// Pins: stop() with no pgid signals and schedules nothing instead of throwing.
+test('stop with an undefined pgid does not throw', () => {
+  assert.doesNotThrow(() => runner.stop({ id: 'ghost', pgid: undefined }));
 });
