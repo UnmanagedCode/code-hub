@@ -399,3 +399,63 @@ test('openFdsOf reports a writable fd on an open file', { skip: process.platform
   }
   assert.deepEqual(openFdsOf(file), []);
 });
+
+// A live detached group of one `sleep`; killed with the group at test end.
+function spawnGroup(t) {
+  const c = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  t.after(() => { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } });
+  return c;
+}
+
+// Pins: a live group is reported not-gone once the bound passes (the caller can
+// then refuse), rather than waiting forever or claiming it is gone.
+test('waitGone reports a live process group as not gone when the timeout passes', async (t) => {
+  const c = spawnGroup(t);
+  assert.equal(await runner.waitGone(c.pid, 50), false);
+});
+
+// Pins: waitGone resolves true once the group has exited, so restart proceeds.
+test('waitGone resolves true once the process group has exited', async (t) => {
+  const c = spawnGroup(t);
+  process.kill(-c.pid, 'SIGTERM');
+  assert.equal(await runner.waitGone(c.pid, runner.STOP_WAIT_MS), true);
+});
+
+// Pins: the group is probed, not just the leader — a group whose leader has
+// exited but whose member lives on is not gone.
+test('waitGone stays false while only a non-leader member of the group lives', async (t) => {
+  const leader = spawn('sh', ['-c', 'sleep 30 & echo $!; exit 0'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  const member = Number(await new Promise((r) => leader.stdout.once('data', (d) => r(String(d).trim()))));
+  t.after(() => { try { process.kill(-leader.pid, 'SIGKILL'); } catch { /* gone */ } });
+  await new Promise((r) => leader.once('exit', r));
+  assert.ok(pidAlive(member));
+  assert.equal(await runner.waitGone(leader.pid, 50), false);
+});
+
+// Pins: stop() SIGKILLs the group on the group's liveness, not the leader's — a
+// member that ignores SIGTERM outlives an already-exited leader unless it is
+// escalated, so the group is gone within the stop wait.
+test('stop escalates to SIGKILL for a group whose leader is gone but a member ignores SIGTERM', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', { start: fakeAppCmd('groupstubborn') });
+  const app = { id: 'app', path: dir, manifest: { start: fakeAppCmd('groupstubborn'), healthPath: null, readyWhen: null } };
+  const rec = await runner.start(app, await allocatePort());
+  t.after(() => { try { process.kill(-rec.pgid, 'SIGKILL'); } catch { /* gone */ } });
+  await rec.settled;
+  runner.stop({ id: 'app', pgid: rec.pgid });
+  // Not killed at once: the escalation waits out the grace for the member.
+  assert.equal(runner.groupAlive(rec.pgid), true);
+  assert.equal(await runner.waitGone(rec.pgid, runner.STOP_WAIT_MS), true);
+});
+
+// Pins: a missing or non-positive pgid is never a group (kill(-0, 0) would probe
+// this process's own group), so it can neither be reported alive nor escalated.
+test('groupAlive is false for a missing or non-positive pgid', () => {
+  for (const pgid of [0, null, undefined, -1, NaN, '123']) assert.equal(runner.groupAlive(pgid), false, String(pgid));
+});
+
+// Pins: stop() with no pgid signals and schedules nothing instead of throwing.
+test('stop with an undefined pgid does not throw', () => {
+  assert.doesNotThrow(() => runner.stop({ id: 'ghost', pgid: undefined }));
+});

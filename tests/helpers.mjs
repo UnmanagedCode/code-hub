@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { WORKTREES_DIRNAME, storeRoot } from '../src/projects.js';
+import { WORKTREES_DIRNAME, MIN_FIXED_PORT, storeRoot } from '../src/projects.js';
 import * as conductorProjects from '../src/conductorProjects.js';
 import * as appSettings from '../src/appSettings.js';
 import * as hubSettings from '../src/hubSettings.js';
@@ -510,4 +510,61 @@ export function openFdsOf(file, { writable = false } = {}) {
       return (parseInt(flags, 8) & 3) !== 0;
     } catch { return false; }
   });
+}
+
+// A fixed port for the code under test to bind. The kernel's automatic
+// allocator (bind/listen to 0, connect autobind) only hands out ports inside
+// `ip_local_port_range`, so a port strictly below it can only be taken by an
+// explicit bind — which the per-port claim file (other callers of this helper,
+// including sibling checkouts' test runs) and the selection probe (services
+// already listening) cover. Never `listen(0)`-then-close: a released ephemeral
+// port can be re-allocated before the code under test binds it.
+export const PORT_CLAIM_DIR = path.join(os.tmpdir(), `codehub-test-port-claims-${process.getuid?.() ?? 'nouid'}`);
+export const PORT_RANGE_FILE = '/proc/sys/net/ipv4/ip_local_port_range';
+// `skip` value for a test that calls nonEphemeralPort: the band is read from /proc.
+export const FIXED_PORT_SKIP = process.platform !== 'linux' && `${PORT_RANGE_FILE} is Linux-only`;
+const PORT_PICK_ATTEMPTS = 50;
+let fixedPortBand;
+function fixedPortBandOrThrow() {
+  if (fixedPortBand) return fixedPortBand;
+  let raw;
+  try { raw = readFileSync(PORT_RANGE_FILE, 'utf8'); } catch (e) {
+    throw new Error(`nonEphemeralPort: cannot read ${PORT_RANGE_FILE}: ${e.message}`);
+  }
+  const lo = Number.parseInt(raw.trim().split(/\s+/)[0], 10);
+  if (!Number.isInteger(lo) || lo - 1 < MIN_FIXED_PORT) {
+    throw new Error(`nonEphemeralPort: no fixed-port band below the ephemeral range (${PORT_RANGE_FILE} = ${JSON.stringify(raw.trim())}, min fixed port ${MIN_FIXED_PORT})`);
+  }
+  return (fixedPortBand = { min: MIN_FIXED_PORT, max: lo - 1 });
+}
+
+// Selection probe only (same bind semantics as `isPortFree` in src/net.js):
+// skips ports a running service already holds. Nothing asserts on it.
+function portBindable(port) {
+  return new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once('error', (e) => (e.code === 'EADDRINUSE' || e.code === 'EACCES' ? resolve(false) : reject(e)));
+    s.listen(port, '0.0.0.0', () => s.close(() => resolve(true)));
+  });
+}
+
+export async function nonEphemeralPort(t) {
+  const { min, max } = fixedPortBandOrThrow();
+  await fs.mkdir(PORT_CLAIM_DIR, { recursive: true });
+  for (let attempt = 0; attempt < PORT_PICK_ATTEMPTS; attempt++) {
+    const port = min + crypto.randomInt(max - min + 1);
+    const claim = path.join(PORT_CLAIM_DIR, String(port));
+    try { await fs.writeFile(claim, String(process.pid), { flag: 'wx' }); } catch (e) {
+      if (e.code === 'EEXIST') continue;
+      throw e;
+    }
+    // Only ever remove a claim this call created.
+    const release = () => fs.rm(claim, { force: true });
+    let ok;
+    try { ok = await portBindable(port); } catch (e) { await release(); throw e; }
+    if (!ok) { await release(); continue; }
+    t.after(release);
+    return port;
+  }
+  throw new Error(`nonEphemeralPort: no free port found in ${PORT_PICK_ATTEMPTS} attempts`);
 }

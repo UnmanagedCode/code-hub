@@ -7,7 +7,7 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import { localIPv4s } from '../src/net.js';
-import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, writeRegistrations, ALT_LOOPBACK, altLoopbackBindable } from './helpers.mjs';
+import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, writeRegistrations, ALT_LOOPBACK, altLoopbackBindable, nonEphemeralPort, FIXED_PORT_SKIP } from './helpers.mjs';
 
 // The app's Settings `port` as the fixed port: Settings beats the manifest, a
 // blank falls back, and every fixed-port rule (busy refusal, no fallback, LAN
@@ -15,15 +15,10 @@ import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudfl
 
 const HAS_LAN = localIPv4s({ lanFallback: true }).length > 0;
 
-// Allocate then release, so the number is real and currently free.
-const freePort = () => new Promise((r) => {
-  const s = net.createServer();
-  s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)); });
-});
-
 // Hold a port, as an unrelated process would.
-const hold = (port) => new Promise((resolve) => {
+const hold = (port) => new Promise((resolve, reject) => {
   const s = net.createServer();
+  s.once('error', reject);
   s.listen(port, '127.0.0.1', () => resolve(s));
 });
 
@@ -58,8 +53,8 @@ const setPort = (base, port, id = 'app') => j(base, 'PUT', `/api/apps/${encodeUR
 const up = (base, id = 'app') => waitFor(async () => ['ready', 'running'].includes((await getApp(base, id)).status));
 
 // Invariant: the Settings port beats the manifest's, and survives a restart.
-test('a Settings port beats the manifest port, on start and on restart', async (t) => {
-  const [a, b] = [await freePort(), await freePort()];
+test('a Settings port beats the manifest port, on start and on restart', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   assert.equal((await setPort(base, b)).status, 200);
   const started = await j(base, 'POST', '/api/apps/app/start');
@@ -73,9 +68,55 @@ test('a Settings port beats the manifest port, on start and on restart', async (
   assert.equal(restarted.body.fixedPort, b);
 });
 
+// Invariant: a restart of a fixed-port app takes the same port back even when the
+// old process holds it past SIGTERM (a slow shutdown); the start never 409s on
+// the process it just stopped.
+test('restart of a fixed-port app whose old process exits slowly returns 200 on the same port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('slowexit'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
+  assert.equal(restarted.body.fixedPort, a);
+});
+
+// Invariant: the restart waits for the whole old process group, not just its
+// leader: a wrapper that exits at once while its child still holds the port must
+// not make the restart 409.
+test('restart of a fixed-port app whose leader exits at once but a group child holds the port returns 200', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('groupchild'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
+});
+
+// Invariant: a same-group member that ignores SIGTERM is SIGKILLed after the
+// grace even though the leader is already gone, so the restart still gets its
+// fixed port back and the new instance serves on it.
+test('restart of a fixed-port app whose group child ignores SIGTERM returns 200 and serves on the same port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const a = await nonEphemeralPort(t);
+  const { base } = await boot(t, [['app', { start: fakeAppCmd('groupstubborn'), port: a }]]);
+  assert.equal((await j(base, 'POST', '/api/apps/app/start')).status, 200);
+  await up(base);
+  const restarted = await j(base, 'POST', '/api/apps/app/restart');
+  assert.equal(restarted.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.port, a);
+  await up(base);
+  assert.equal((await getApp(base)).port, a);
+});
+
 // Invariant: clearing the Settings port falls back to the manifest's.
-test('a blank Settings port falls back to the manifest port', async (t) => {
-  const [a, b] = [await freePort(), await freePort()];
+test('a blank Settings port falls back to the manifest port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   await setPort(base, b);
   await setPort(base, null);
@@ -87,8 +128,8 @@ test('a blank Settings port falls back to the manifest port', async (t) => {
 
 // Invariant: a Settings port pins an app that has no manifest port, and
 // clearing it returns the app to a free port.
-test('a Settings port pins an app with no manifest port; clearing returns to a free port', async (t) => {
-  const b = await freePort();
+test('a Settings port pins an app with no manifest port; clearing returns to a free port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await setPort(base, b);
   const pinned = await j(base, 'POST', '/api/apps/app/start');
@@ -104,8 +145,8 @@ test('a Settings port pins an app with no manifest port; clearing returns to a f
 });
 
 // Invariant: a change made while the app runs applies only on the next start.
-test('a Settings port changed while running applies on the next restart only', async (t) => {
-  const [a, b] = [await freePort(), await freePort()];
+test('a Settings port changed while running applies on the next restart only', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const [a, b] = [await nonEphemeralPort(t), await nonEphemeralPort(t)];
   const { base } = await boot(t, [['app', { start: fakeAppCmd(), port: a }]]);
   await j(base, 'POST', '/api/apps/app/start');
   await up(base);
@@ -117,8 +158,8 @@ test('a Settings port changed while running applies on the next restart only', a
 
 // Invariant: a busy Settings port refuses the start (never falls back to a free
 // port), whether an unrelated process or another app's record holds it.
-test('a busy Settings port refuses the start and never falls back', async (t) => {
-  const b = await freePort();
+test('a busy Settings port refuses the start and never falls back', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }], ['other', { start: fakeAppCmd() }]]);
   await setPort(base, b);
   const holder = await hold(b);
@@ -132,7 +173,7 @@ test('a busy Settings port refuses the start and never falls back', async (t) =>
   await new Promise((r) => holder.close(r));
 
   // Another app's live record on the port is named in the refusal.
-  const c = await freePort();
+  const c = await nonEphemeralPort(t);
   await setPort(base, c, 'other');
   assert.equal((await j(base, 'POST', '/api/apps/other/start')).status, 200);
   await setPort(base, c);
@@ -143,8 +184,8 @@ test('a busy Settings port refuses the start and never falls back', async (t) =>
 
 // Invariant: a worktree never takes a Settings port, even one written by hand
 // past the API guard.
-test('a worktree ignores a hand-written Settings port', async (t) => {
-  const b = await freePort();
+test('a worktree ignores a hand-written Settings port', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const b = await nonEphemeralPort(t);
   const { root, base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await mkWorktree(root, 'app', 'feat', { start: fakeAppCmd() }, { git: true });
   await appSettings.update('app:feat', { port: b });
@@ -156,9 +197,9 @@ test('a worktree ignores a hand-written Settings port', async (t) => {
 
 // Invariant: a LAN share reuses a Settings fixed port exactly as it does a
 // manifest one.
-test('the LAN share reuses a Settings fixed port', async (t) => {
+test('the LAN share reuses a Settings fixed port', { skip: FIXED_PORT_SKIP }, async (t) => {
   if (!HAS_LAN) return t.skip('no LAN interface on this host');
-  const b = await freePort();
+  const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await setPort(base, b);
   await j(base, 'POST', '/api/apps/app/start');
@@ -171,8 +212,8 @@ test('the LAN share reuses a Settings fixed port', async (t) => {
 
 // Invariant: a Settings port that is busy at boot fails the auto-start, and the
 // failure shows on the card.
-test('a Settings port busy at boot fails the auto-start on the card', async (t) => {
-  const b = await freePort();
+test('a Settings port busy at boot fails the auto-start on the card', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await appSettings.update('app', { autoStart: true, port: b });
   const holder = await hold(b);
@@ -191,11 +232,11 @@ test('a Settings port busy at boot fails the auto-start on the card', async (t) 
 // Invariant: the availability pre-check applies to a Settings port too — one held
 // only on another local address (which the app, binding loopback, could still
 // start beside) is refused, so the check can't be gated on the manifest's port.
-test('a Settings port held only on another local address is refused', async (t) => {
+test('a Settings port held only on another local address is refused', { skip: FIXED_PORT_SKIP }, async (t) => {
   const lanIp = localIPv4s({ lanFallback: true })[0];
   const host = (await altLoopbackBindable()) ? ALT_LOOPBACK : lanIp;
   if (!host) return t.skip('no alternate local address on this host');
-  const b = await freePort();
+  const b = await nonEphemeralPort(t);
   const { base } = await boot(t, [['app', { start: fakeAppCmd() }]]);
   await setPort(base, b);
   const blocker = net.createServer();
@@ -210,8 +251,8 @@ test('a Settings port held only on another local address is refused', async (t) 
 // Invariant: a Settings-port child that hits EADDRINUSE after a clean pre-check is
 // refused and never retried onto another port, so the runner's `fixed` flag
 // can't be derived from the manifest's port.
-test('a Settings-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', async (t) => {
-  const b = await freePort();
+test('a Settings-port child that hits EADDRINUSE after a clean pre-check still 409s, and never moves', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const b = await nonEphemeralPort(t);
   const root0 = await mkRoot();
   const marker = path.join(root0, 'flaky-marker');
   t.after(() => rmRoot(root0));

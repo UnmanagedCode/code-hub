@@ -662,8 +662,17 @@ export async function stop(id) {
   return { id, status: 'stopped' };
 }
 
+// Stops, waits for the old process group to be gone (so a fixed port it held is
+// free again), then starts. stop() alone only signals the group and returns.
 export async function restart(id) {
-  if (store.apps[id]) await stop(id);
+  const rec = store.apps[id];
+  if (rec) {
+    await stop(id);
+    if (!(await runner.waitGone(rec.pgid, runner.STOP_WAIT_MS))) {
+      const e = new Error(`'${id}' is now stopped, but its old process group ${rec.pgid} is still alive after ${runner.STOP_WAIT_MS}ms, so it was not started again`);
+      e.statusCode = 409; throw e;
+    }
+  }
   return start(id);
 }
 
