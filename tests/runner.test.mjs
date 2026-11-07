@@ -459,3 +459,27 @@ test('groupAlive is false for a missing or non-positive pgid', () => {
 test('stop with an undefined pgid does not throw', () => {
   assert.doesNotThrow(() => runner.stop({ id: 'ghost', pgid: undefined }));
 });
+
+// Invariant: the runner reports a crash's reason line apart from its output
+// tail, and marks when the retained ring dropped older bytes, without changing
+// the `error` string REST and the UI read.
+test('a crashed child reports reason and outputTruncated; error keeps reason + tail', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const dir = await mkProject(root, 'app', null);
+  const crash = async (id, bytes) => {
+    const cmd = `FAKE_APP_CRASH_BYTES=${bytes} ${fakeAppCmd('crashloud')}`;
+    await runner.start({ id, path: dir, manifest: { start: cmd, healthPath: null, readyWhen: null } }, await allocatePort());
+    await waitFor(() => runner.runtime(id)?.status === 'crashed');
+    return runner.runtime(id);
+  };
+
+  const small = await crash('small', 5000);
+  assert.equal(small.reason, 'start command exited (code=1, signal=null)');
+  assert.equal(small.error, `${small.reason}\n${small.output.slice(-runner.CRASH_TAIL_CHARS)}`);
+  assert.equal(small.outputTruncated, false);
+
+  const big = await crash('big', runner.OUTPUT_CAP + 4096);
+  assert.equal(big.outputTruncated, true);
+  assert.ok(big.output.length <= runner.OUTPUT_CAP);
+});

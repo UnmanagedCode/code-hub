@@ -9,6 +9,7 @@ import * as appManager from '../src/appManager.js';
 import * as appSettings from '../src/appSettings.js';
 import * as autoRun from '../src/autoRun.js';
 import { storeRoot } from '../src/projects.js';
+import { callTool } from './mcpClient.mjs';
 import { mkRoot, rmRoot, mkProject, mkWorktree, waitFor, pidAlive, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin, tailscaleEvents, funnelEvents, holdShareAtSettingsRead } from './helpers.mjs';
 
 // End-to-end auto-share over HTTP: a fake app, fake cloudflared and fake
@@ -97,7 +98,7 @@ test('restarting a ticked, shared app shares it again', async (t) => {
 test('MCP start_app on a ticked app shares it', async (t) => {
   const { base } = await boot(t);
   await j(base, 'PUT', '/api/apps/app/settings', { autoShare: { mode: 'lan', tls: false } });
-  const res = await j(base, 'POST', '/api/mcp', { tool: 'start_app', arguments: { id: 'app' }, caller: { sessionId: 's', project: 'p' } });
+  const res = await callTool(base, 'start_app', { id: 'app' });
   assert.equal(res.status, 200);
   assert.equal(res.body.error, undefined);
   await settled(base);

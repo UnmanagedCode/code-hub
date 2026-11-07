@@ -40,7 +40,7 @@ Every file code-hub persists (logs, `registrations.json`, `app-settings.json`, `
 - Rotation: every `LOG_SWEEP_MS`, any log over `LOG_CAP_BYTES` has its last `LOG_CAP_BYTES` copied to `<id>.log.1` (one generation, overwriting the previous; older bytes are dropped, and since the cut is byte-based the kept text can begin mid-line or mid-character) and is then truncated. Skipped for an app whose start is in progress (any readiness kind: the file is claimed from the start until it settles).
 - Retention: the `.log`/`.log.1` of an id that is not running and not mid-start is deleted once its last write is older than `LOG_RETENTION_MS`; an orphan `.log.1` likewise. A running app's log is never deleted. Stopping an app keeps its log.
 - Limitations: lines written between the copy and the truncate are lost. Nothing rotates while no code-hub runs, so the log can grow far past `LOG_CAP_BYTES`; the first sweep at boot keeps only its last `LOG_CAP_BYTES` in `.log.1` and drops the rest of the backlog. That `.log.1` stays until the next rotation overwrites it, the app's next start deletes it, or — for an id that is not running — retention removes it after `LOG_RETENTION_MS`.
-- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
+- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail. MCP `list_apps` in json format carries a crashed app's whole retained output ring as `output` (`outputTruncated` when the ring dropped older bytes) and the file's path as `logFile`.
 
 ## Machine-local registration: `registrations.json` (`$CONDUCTOR_PLUGIN_DATA_DIR/registrations.json`)
 
@@ -334,25 +334,38 @@ Owned by `src/webui.js`; mounted after `/api` (so the API answers first).
 
 code-hub is a code-conductor plugin (see `conductor.plugin.json` at the repo root) and exposes its app-management operations as MCP tools over one endpoint, reusing the same `appManager` logic as the HTTP API above — no duplicated behavior.
 
-**Request:** `{ tool: string, arguments: object, caller: { sessionId, project } }`. `caller` is accepted but currently unused server-side — `appManager` has no per-project scoping, so `start_app`/`stop_app` are not restricted to the caller's own project.
+**Request:** `{ tool: string, arguments: object, caller: { sessionId, project }, format?: "json" | "text" }`. `caller` is accepted but currently unused server-side — `appManager` has no per-project scoping, so `start_app`/`stop_app` are not restricted to the caller's own project. A missing `format` is answered as text.
 
 **Response — status-code contract:**
 
 | Condition | Status | Body |
 |---|---|---|
 | Malformed JSON body | `400` | `{ error }` |
-| Missing/non-string/empty `tool` field | `400` | `{ error }` |
-| Well-formed call, tool succeeds | `200` | `{ result: <any> }` |
-| Well-formed call, tool fails (unknown tool, bad `arguments`, already-running, not-found, ...) | `200` | `{ error: string }` |
+| Missing/non-string/empty `tool` field | `400` | `{ error, code: "REQUEST_INVALID" }` |
+| `format` present but not `"json"`/`"text"` | `400` | `{ error, code: "FORMAT_INVALID", details: { format } }` |
+| `format: "json"`, tool succeeds | `200` | `{ structured: <object> }` |
+| `format: "text"` (or missing), tool succeeds | `200` | `{ text: <string> }` |
+| Well-formed call, tool refuses (unknown tool, bad `arguments`, already-running, not-found, ...) | `200` | `{ error: string, code: string, details?: object }` — the same body in both formats |
 
 The split is deliberate: only a malformed *request envelope* is a transport failure. An unknown tool name, invalid arguments, or a tool throwing (e.g. "already running") are normal MCP outcomes for the calling LLM, so they stay `200` — the conductor can treat any non-200 as a hard transport error without special-casing tool-level failures.
 
-**Tools** (declared in `conductor.plugin.json`'s `mcp.tools`, shallow JSON-Schema `inputSchema`s — no `$ref`/`oneOf`/`anyOf`/nested objects):
+**Tools** (declared in `conductor.plugin.json`'s `mcp.tools`: shallow JSON-Schema `inputSchema`s — no `$ref`/`oneOf`/`anyOf`/nested objects — and an `outputSchema` each). The json result is the object the tool's `outputSchema` declares; the text result is a prose view (`src/mcpText.js`) of that same object.
 
-| Tool | Arguments | Result |
+| Tool | Arguments | json result (beyond its `outputSchema`) |
 |---|---|---|
-| `list_apps` | none | same as `GET /api/apps` |
-| `start_app` | `{ id: string }` | same as `POST /api/apps/:id/start` |
-| `stop_app` | `{ id: string }` | same as `POST /api/apps/:id/stop` |
-| `register_app` | `{ id: string, start: string, name?, healthPath?, readyWhen?, port? }` | the registered app, in the same shape as an entry in `list_apps`'s `apps` (`source: "registry"`). `400` if `id` isn't an existing dir under the projects root, `409` if that dir already has a `.hub.json`, `400` on a schema violation (e.g. empty `start`, or a `port` outside `1024`–`65535`). An app's Settings `port` overrides the registration's. `routes` isn't in this tool's declared schema (array-of-object properties aren't expressible in the shallow-JSON-Schema `pluginApi` v1 constraint) but is still accepted/validated if passed in `arguments` — the schema simply doesn't advertise it; hand-edit `registrations.json` for multi-route registrations. |
-| `unregister_app` | `{ id: string }` | `{ id, registered: false }`. `404` if `id` has no registry entry. No effect on a project with its own `.hub.json` (it was never in the registry). |
+| `list_apps` | none | `GET /api/apps` plus, per app, `logFile`, `output` and `outputTruncated`; a crashed app's `error` is its reason line only (REST's `error` embeds a short output tail). Text omits `qrSvg` and shows only the last `CRASH_TAIL_CHARS` (`src/runner.js`) of a crashed app's output, and says so in-line. |
+| `start_app` | `{ id: string }` | the `POST /api/apps/:id/start` response |
+| `stop_app` | `{ id: string }` | the `POST /api/apps/:id/stop` response |
+| `register_app` | `{ id: string, start: string, name?, healthPath?, readyWhen?, port? }` | the registered app's discovery record `{ id, project, path, isWorktree, branch, manifest, manifestError, source }` (`source: "registry"`) — not a `list_apps` entry. An app's Settings `port` overrides the registration's. `routes` isn't in this tool's declared schema (array-of-object properties aren't expressible in the shallow-JSON-Schema `pluginApi` v1 constraint) but is still accepted/validated if passed in `arguments` — the schema simply doesn't advertise it; hand-edit `registrations.json` for multi-route registrations. |
+| `unregister_app` | `{ id: string }` | `{ id, registered: false }`. No effect on a project with its own `.hub.json` (it was never in the registry). |
+
+**Refusal codes.** Set where `appManager` throws (`src/httpError.js`); REST ignores them. An error without a code from `httpError` is `INTERNAL`. Messages are unchanged from REST.
+
+| Tool | Codes |
+|---|---|
+| any | `TOOL_UNKNOWN`, `INTERNAL`; envelope `400`s: `REQUEST_INVALID`, `FORMAT_INVALID` |
+| `list_apps` | `INTERNAL` |
+| `start_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `ALREADY_RUNNING`, `APP_UNKNOWN`, `MANIFEST_INVALID`, `PORT_IN_USE` (`details: { port, holder? }`) |
+| `stop_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `NOT_RUNNING` |
+| `register_app` | `ARGS_INVALID`, `DIR_NOT_FOUND` (not an existing dir under the projects root), `MANIFEST_EXISTS` (the dir already has a `.hub.json`), `MANIFEST_INVALID` (schema violation, e.g. empty `start` or a `port` outside `1024`–`65535`) |
+| `unregister_app` | `ARGS_INVALID`, `NOT_REGISTERED` |

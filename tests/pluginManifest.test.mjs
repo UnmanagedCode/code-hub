@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkSchema } from './jsonSchemaSubset.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -59,4 +60,17 @@ test('conductor.plugin.json: mcp.tools declare the 5 expected tools with shallow
   assert.deepEqual(registerTool.inputSchema.required, ['id', 'start']);
   const unregisterTool = manifest.mcp.tools.find((t) => t.name === 'unregister_app');
   assert.deepEqual(unregisterTool.inputSchema.required, ['id']);
+});
+
+// Invariant: every tool is typed (so it is served in json) with a schema cc
+// accepts at manifest load, and no description pins a rendering.
+test('conductor.plugin.json: every tool declares an outputSchema inside cc\'s subset, with format-neutral descriptions', async () => {
+  const manifest = await readJson('conductor.plugin.json');
+  for (const tool of manifest.mcp.tools) {
+    assert.ok(tool.outputSchema, `${tool.name} needs an outputSchema`);
+    assert.equal(tool.outputSchema.type, 'object', `${tool.name} outputSchema root type`);
+    assert.doesNotThrow(() => checkSchema(tool.outputSchema), `${tool.name} outputSchema`);
+    const prose = tool.description.replace(/[\w.-]*\.json\b/g, '');
+    assert.doesNotMatch(prose, /\b(json|text|prose)\b/i, `${tool.name} description names a format`);
+  }
 });

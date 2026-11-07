@@ -24,6 +24,7 @@ import { isEmbedded, isHostConductorId, hostConductorPort, hostConductorDir, HOS
 import * as conductorProjects from './conductorProjects.js';
 import * as appSettings from './appSettings.js';
 import * as autoRun from './autoRun.js';
+import { httpError } from './httpError.js';
 import { validateShareOptions, FUNNEL_PORTS } from './shareOptions.js';
 
 // In-memory mirror of the persisted state, loaded once at init and kept in
@@ -538,18 +539,18 @@ export async function list() {
 
 async function findDiscovered(id) {
   const app = (await discoverApps()).find((a) => a.id === id);
-  if (!app) { const e = new Error(`unknown app '${id}'`); e.statusCode = 404; throw e; }
-  if (!app.manifest) { const e = new Error(app.manifestError || 'no valid .hub.json'); e.statusCode = 400; throw e; }
+  if (!app) throw httpError(404, 'APP_UNKNOWN', `unknown app '${id}'`);
+  if (!app.manifest) throw httpError(400, 'MANIFEST_INVALID', app.manifestError || 'no valid .hub.json');
   return app;
 }
 
 export async function start(id) {
   if (isHostConductorId(id)) {
-    const e = new Error(`'${id}' is the host code-conductor and cannot be started`); e.statusCode = 409; throw e;
+    throw httpError(409, 'APP_ALWAYS_ON', `'${id}' is the host code-conductor and cannot be started`);
   }
   const existing = store.apps[id];
   if (existing && state.pidAlive(existing.pid)) {
-    const e = new Error(`'${id}' is already running`); e.statusCode = 409; throw e;
+    throw httpError(409, 'ALREADY_RUNNING', `'${id}' is already running`);
   }
   // Past that guard the app's pid is dead, but its SHARE child may not be:
   // the record below is overwritten wholesale with `tunnel: null`, which would
@@ -570,8 +571,8 @@ export async function start(id) {
   const busy = `port ${fixedPort} is already in use — '${id}' declares a fixed port and will not fall back to a free one`;
   if (fixedPort !== null) {
     const holder = Object.values(store.apps).find((r) => r.port === fixedPort && state.pidAlive(r.pid));
-    if (holder) { const e = new Error(`${busy} (held by '${holder.id}')`); e.statusCode = 409; throw e; }
-    if (!(await isPortFree(fixedPort))) { const e = new Error(busy); e.statusCode = 409; throw e; }
+    if (holder) throw httpError(409, 'PORT_IN_USE', `${busy} (held by '${holder.id}')`, { port: fixedPort, holder: holder.id });
+    if (!(await isPortFree(fixedPort))) throw httpError(409, 'PORT_IN_USE', busy, { port: fixedPort });
   }
   let port = fixedPort ?? await allocatePort();
   const proc = await runner.start(app, port, { fixed: fixedPort !== null });
@@ -584,7 +585,7 @@ export async function start(id) {
     const rt = runner.runtime(id);
     if (rt?.status === 'crashed' && /EADDRINUSE/.test(rt.error ?? '')) {
       runner.stop({ id, pgid: proc.pgid });
-      const e = new Error(busy); e.statusCode = 409; throw e;
+      throw httpError(409, 'PORT_IN_USE', busy, { port: fixedPort });
     }
   }
   // The run re-reads its config once ready, and reports a failed read on the card.
@@ -650,10 +651,10 @@ export async function autoShareAlwaysOn() {
 
 export async function stop(id) {
   if (isHostConductorId(id)) {
-    const e = new Error(`'${id}' is managed by the host code-conductor and cannot be stopped`); e.statusCode = 409; throw e;
+    throw httpError(409, 'APP_ALWAYS_ON', `'${id}' is managed by the host code-conductor and cannot be stopped`);
   }
   const rec = store.apps[id];
-  if (!rec) { const e = new Error(`'${id}' is not running`); e.statusCode = 404; throw e; }
+  if (!rec) throw httpError(404, 'NOT_RUNNING', `'${id}' is not running`);
   teardownShare(id, rec);
   runner.stop({ id, pgid: rec.pgid });
   autoRun.forget(id);
@@ -1201,7 +1202,7 @@ async function hasManifestFile(dir) {
 // registry entry.
 export async function registerApp({ id, start, name, healthPath, readyWhen, port, routes } = {}) {
   if (typeof id !== 'string' || id.length === 0 || id.startsWith('.') || path.basename(id) !== id) {
-    const e = new Error('id is required and must be a plain, non-dot-prefixed directory basename (no path separators)'); e.statusCode = 400; throw e;
+    throw httpError(400, 'ARGS_INVALID', 'id is required and must be a plain, non-dot-prefixed directory basename (no path separators)');
   }
   const dir = await appDir(id);
   if (!dir) {
@@ -1210,25 +1211,40 @@ export async function registerApp({ id, start, name, healthPath, readyWhen, port
     // that exact name sits there. Saying "not an existing directory" would be
     // false in that case, so name the rule instead; deciding it from the id's
     // shape alone also keeps a `:`-bearing id off every filesystem path.
-    const e = new Error(isWorktreeId(id)
+    throw httpError(400, 'DIR_NOT_FOUND', isWorktreeId(id)
       ? `'${id}' matches no worktree under the projects root — '${WORKTREE_ID_QUALIFIER}' is reserved for worktree ids (<project>:<key>), so an id containing one never names a project directory`
       : `'${id}' is not an existing directory under the projects root`);
-    e.statusCode = 400; throw e;
   }
   if (await hasManifestFile(dir)) {
-    const e = new Error(`'${id}' already has a .hub.json — no registration needed`); e.statusCode = 409; throw e;
+    throw httpError(409, 'MANIFEST_EXISTS', `'${id}' already has a .hub.json — no registration needed`);
   }
-  const manifest = validateManifestObject({ start, name, healthPath, readyWhen, port, routes }, `register_app:${id}`);
+  let manifest;
+  try { manifest = validateManifestObject({ start, name, healthPath, readyWhen, port, routes }, `register_app:${id}`); }
+  catch (e) { throw httpError(400, 'MANIFEST_INVALID', e.message); }
   const registry = await readRegistry();
   registry[id] = manifest;
   await writeRegistry(registry);
-  return (await discoverApps()).find((a) => a.id === id);
+  const found = (await discoverApps()).find((a) => a.id === id);
+  if (!found) throw new Error(`'${id}' was written to registrations.json but discovery does not list it`);
+  return found;
 }
 
 export async function unregisterApp(id) {
   const registry = await readRegistry();
-  if (!(id in registry)) { const e = new Error(`'${id}' is not registered`); e.statusCode = 404; throw e; }
+  if (!(id in registry)) throw httpError(404, 'NOT_REGISTERED', `'${id}' is not registered`);
   delete registry[id];
   await writeRegistry(registry);
   return { id, registered: false };
+}
+
+// What the MCP list_apps adds for an app: where its output goes, and (from this
+// process's runtime, when it has one) the crash reason and retained output.
+export function runDetail(id) {
+  const rt = runner.runtime(id);
+  return {
+    logFile: appLog.logFile(id),
+    reason: rt?.reason ?? null,
+    output: rt ? rt.output : null,
+    outputTruncated: rt ? rt.outputTruncated : null,
+  };
 }

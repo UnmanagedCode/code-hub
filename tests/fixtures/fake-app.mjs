@@ -42,6 +42,8 @@
 //                 child holding $PORT (the `npm` → `node` wrapper shape).
 //   groupstubborn → like groupchild, but the same-group child ignores SIGTERM (only
 //                 SIGKILL ends it) while the leader exits at once.
+//   crashloud   → prints a HEAD-MARK line, FAKE_APP_CRASH_BYTES (default 5000) filler
+//                 chars and a TAIL-MARK line, then exits 1 without binding.
 //   ignoreterm  → same as default, but SIGTERM is ignored; the child of groupstubborn.
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -57,6 +59,13 @@ if (process.env.FAKE_APP_MODE === 'groupchild' || process.env.FAKE_APP_MODE === 
 
 if (process.env.FAKE_APP_MODE === 'crash') {
   console.error('boom: could not start');
+  process.exit(1);
+}
+
+if (process.env.FAKE_APP_MODE === 'crashloud') {
+  console.error('HEAD-MARK');
+  console.error('x'.repeat(Number(process.env.FAKE_APP_CRASH_BYTES ?? 5000)));
+  console.error('TAIL-MARK');
   process.exit(1);
 }
 
