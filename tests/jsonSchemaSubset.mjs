@@ -3,8 +3,8 @@
 // The subset: type (incl. unions), properties, required, additionalProperties
 // (boolean | schema), items, enum, const, anyOf, description.
 
-const KEYWORDS = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const', 'anyOf', 'description']);
-const TYPES = new Set(['object', 'array', 'string', 'integer', 'number', 'boolean', 'null']);
+export const KEYWORDS = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const', 'anyOf', 'description']);
+export const TYPES = new Set(['object', 'array', 'string', 'integer', 'number', 'boolean', 'null']);
 
 function isSchema(v) {
   return !!v && typeof v === 'object' && !Array.isArray(v);

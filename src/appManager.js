@@ -3,7 +3,7 @@ import path from 'node:path';
 import {
   discoverApps, projectsRoot, MANIFEST_FILENAME, appDir, listWorktreeDirs, isWorktreeId,
   WORKTREE_ID_QUALIFIER,
-  validateManifestObject, readRegistry, writeRegistry, registerInMemory,
+  validateManifestObject, MIN_FIXED_PORT, MAX_FIXED_PORT, readRegistry, writeRegistry, registerInMemory,
 } from './projects.js';
 import * as state from './state.js';
 import * as runner from './runner.js';
@@ -565,6 +565,11 @@ export async function start(id) {
   // silently move it. A missing, corrupt or non-object file reads as empty
   // (readAll()).
   const settings = await appSettings.get(id);
+  if (!app.isWorktree && settings.port != null && !Number.isInteger(settings.port)) {
+    throw httpError(400, 'SETTINGS_INVALID',
+      `'${id}' has an invalid stored port ${JSON.stringify(settings.port)} in app-settings.json — it must be an integer between ${MIN_FIXED_PORT} and ${MAX_FIXED_PORT}`,
+      { field: 'port', value: settings.port });
+  }
   // The app's Settings port beats its manifest's; a worktree never has one (its
   // manifest port is stripped in discovery, and a hand-written settings port is ignored).
   const fixedPort = app.isWorktree ? null : (settings.port ?? app.manifest.port ?? null);

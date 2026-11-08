@@ -105,6 +105,14 @@ export function migrateLegacyFile() {
   });
 }
 
+// The stored port as start() uses it: an integer as-is, a canonical in-range
+// integer string (hand-edited file) as that integer, null when unset. Anything
+// else comes back verbatim, never nulled, so start() can refuse it by name.
+function readPort(v) {
+  if (typeof v === 'string' && /^\d+$/.test(v) && isValidFixedPort(Number(v))) return Number(v);
+  return v ?? null;
+}
+
 export async function get(id) {
   const entry = (await readAll())[id];
   return {
@@ -112,7 +120,7 @@ export async function get(id) {
     password: entry?.password ?? null,
     autoStart: entry?.autoStart === true,
     autoShare: entry?.autoShare ?? null,
-    port: entry?.port ?? null,
+    port: readPort(entry?.port),
   };
 }
 

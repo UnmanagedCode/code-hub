@@ -206,7 +206,7 @@
                     ],
                     "properties": {
                       "username": {
-                        "description": "Stored default share username; read as-is from the hand-editable app-settings.json (a string or null when code-hub wrote it)."
+                        "description": "Stored default share username. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear."
                       },
                       "hasPassword": {
                         "type": "boolean"
@@ -215,10 +215,10 @@
                         "type": "boolean"
                       },
                       "autoShare": {
-                        "description": "Stored auto-share options {mode, auth, tls?, funnelPort?} or null; read as-is from app-settings.json."
+                        "description": "Stored auto-share options ({mode, auth, tls?, funnelPort?}; a tailscale entry always carries funnelPort, defaulted when unset) or null. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear."
                       },
                       "port": {
-                        "description": "Stored fixed port (integer) or null; read as-is from app-settings.json."
+                        "description": "Stored fixed port or null. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear; start_app reads an integer, or a canonical integer string as that integer, and refuses anything else with SETTINGS_INVALID."
                       }
                     }
                   },
@@ -321,6 +321,30 @@
                         "properties": {
                           "state": {
                             "type": "string"
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "port": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "requestedPort": {
+                            "type": "integer"
+                          },
+                          "portFallback": {
+                            "type": "boolean"
+                          },
+                          "recovery": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
                           }
                         },
                         "description": "Host-relay forward of a LAN share, as reported by the relay; null when none."
@@ -362,7 +386,7 @@
                       "string",
                       "null"
                     ],
-                    "description": "Why the app is not running: the crash reason line, else its manifestError."
+                    "description": "Why the app is not running: a crashed app's reason line (null when it reached ready and then exited on its own, which leaves no reason), else a stopped app's manifestError."
                   },
                   "manifestError": {
                     "type": [
@@ -396,7 +420,7 @@
                       "boolean",
                       "null"
                     ],
-                    "description": "True when older output was dropped from the ring before `output`; the rest is in logFile. Null when output is null."
+                    "description": "True when older output was dropped from the in-memory ring before `output`; that older output may still be in logFile, subject to its rotation cap. Null when output is null."
                   }
                 }
               }
@@ -406,7 +430,7 @@
       },
       {
         "name": "start_app",
-        "description": "Start an app by id. Answers once the process is spawned, before readiness is confirmed (status `starting`), with its pid, port and URLs.",
+        "description": "Start an app by id. Answers once the process is spawned, with its pid, port and URLs. Readiness is not confirmed: the app may already have crashed, and list_apps reports the settled status.",
         "inputSchema": {
           "type": "object",
           "properties": {

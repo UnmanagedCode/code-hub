@@ -7,6 +7,7 @@ import { createServer } from '../server.js';
 import * as appManager from '../src/appManager.js';
 import { OUTPUT_CAP, CRASH_TAIL_CHARS } from '../src/runner.js';
 import { appSettingsFile } from '../src/appSettings.js';
+import { unregisterInMemory } from '../src/projects.js';
 import { callTool } from './mcpClient.mjs';
 import {
   mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin,
@@ -39,6 +40,20 @@ const prose = (base, tool, args) => callTool(base, tool, args, { format: 'text' 
 const listJson = async (base) => (await json(base, 'list_apps', {})).body.structured;
 const appOf = (list, id) => list.apps.find((a) => a.id === id);
 const isReady = (base, id) => async () => ['ready', 'running'].includes(appOf(await listJson(base), id)?.status);
+// Every non-null string/number leaf of `value` must appear in `text`, and the
+// key of every true boolean leaf too; `skip` names leaf keys the text
+// deliberately omits or cuts.
+function assertTextCovers(value, text, label, skip = []) {
+  const walk = (v, key, at) => {
+    if (v === null || v === undefined || skip.includes(key)) return;
+    if (Array.isArray(v)) return v.forEach((x, i) => walk(x, key, `${at}[${i}]`));
+    if (typeof v === 'object') return Object.entries(v).forEach(([k, x]) => walk(x, k, `${at}.${k}`));
+    if (typeof v === 'boolean') return v && assert.ok(text.includes(key), `${label}: text drops ${at}`);
+    assert.ok(text.includes(String(v)), `${label}: text drops ${at} (${String(v).slice(0, 60)})`);
+  };
+  walk(value, '', label);
+}
+const blockOf = (text, id) => text.split('\n\n').find((b) => b.startsWith(`${id} (`));
 const quiet = (t) => {
   const real = console.error;
   console.error = () => {};
@@ -46,9 +61,10 @@ const quiet = (t) => {
 };
 
 // Invariant: list_apps' json validates against the declared schema on a
-// realistic store: every share kind (lan, cloudflared tunnel with auth on and
-// off, tailscale), a crash, a worktree, a registry app, a broken manifest, a
-// stale record whose source is gone, and hand-edited off-type settings.
+// realistic store: every share kind (LAN with auth on and off, a cloudflared
+// tunnel, which is always gated, and tailscale), a crash, a worktree, a registry app, a broken manifest, a
+// stale record whose source is gone, hand-edited off-type settings and a
+// relay-info object on LAN shares. Its text view renders every field.
 test('list_apps json validates on a realistic store covering every share kind and app state', async (t) => {
   const cmd = { start: fakeAppCmd() };
   const { root, base } = await boot(t, async (r) => {
@@ -76,8 +92,23 @@ test('list_apps json validates on a realistic store covering every share kind an
   await appManager.share('lan-open', { mode: 'lan', auth: false, tls: false });
   await appManager.share('ts', { mode: 'tailscale' });
   await fs.rm(path.join(root, 'gone'), { recursive: true, force: true });
+  // Relay info as hostRelay's infoFor() builds it, seeded onto the live LAN records (no relay runs here).
+  const relayUp = { state: 'up', error: null, port: 41500, requestedPort: appManager._record('lan').tunnel.proxyPort, portFallback: false, recovery: null };
+  const relayDown = { state: 'down', error: 'connection to the relay lost: reset', port: null, requestedPort: appManager._record('lan-open').tunnel.proxyPort, portFallback: false, recovery: 'retrying' };
+  appManager._record('lan').tunnel.relay = relayUp;
+  appManager._record('lan-open').tunnel.relay = relayDown;
 
   const list = await listJson(base); // callTool validated it against the manifest schema
+  assert.deepEqual(appOf(list, 'lan').tunnel.relay, relayUp);
+  assert.deepEqual(appOf(list, 'lan-open').tunnel.relay, relayDown);
+  // output/outputTruncated belong to a crashed app only; a stopped one carries its manifestError as error.
+  for (const a of list.apps.filter((x) => x.status !== 'crashed')) {
+    assert.equal(a.output, null, `${a.id} output`);
+    assert.equal(a.outputTruncated, null, `${a.id} outputTruncated`);
+  }
+  assert.equal(appOf(list, 'broken').error, appOf(list, 'broken').manifestError);
+  const text = (await prose(base, 'list_apps', {})).body.text;
+  for (const a of list.apps) assertTextCovers(a, blockOf(text, a.id) ?? assert.fail(`no text block for ${a.id}`), a.id, ['qrSvg', 'output']);
   assert.equal(appOf(list, 'lan').tunnel.kind, 'lan');
   assert.equal(appOf(list, 'tun-auth').tunnel.kind, 'tunnel');
   assert.equal(appOf(list, 'tun-auth').tunnel.auth, true);
@@ -109,8 +140,9 @@ const crashed = async (base) => {
   await waitFor(async () => appOf(await listJson(base), 'crashy').status === 'crashed');
 };
 
-// Invariant: the 2000-char crash cut lives only in text, which says so and
+// Invariant: the CRASH_TAIL_CHARS cut lives only in text, which says so and
 // names the log; json carries the reason alone plus the whole retained output.
+// (REST's `error` still embeds the tail: see the REST test below.)
 test('a crashed app: json has the full output, text a labelled tail', async (t) => {
   const { base, root } = await boot(t, (r) => mkProject(r, 'crashy', crashApp()));
   quiet(t);
@@ -120,6 +152,7 @@ test('a crashed app: json has the full output, text a labelled tail', async (t) 
   assert.equal(app.error, 'start command exited (code=1, signal=null)');
   assert.ok(app.output.includes('HEAD-MARK') && app.output.includes('TAIL-MARK'));
   assert.equal(app.outputTruncated, false);
+  assert.equal(app.output, await fs.readFile(app.logFile, 'utf8'));
   assert.equal(app.logFile, path.join(dataDirIn(root), 'logs', 'crashy.log'));
   await fs.access(app.logFile);
 
@@ -130,14 +163,17 @@ test('a crashed app: json has the full output, text a labelled tail', async (t) 
   assert.ok(!text.includes('HEAD-MARK'));
 });
 
-// Invariant: the memory bound on the retained ring is never silent.
+// Invariant: the json output is exactly the retained ring (the log's last
+// OUTPUT_CAP chars), so any smaller cap on the json path is detectable, and the
+// ring's own memory bound is never silent.
 test('output beyond the retained ring is flagged outputTruncated', async (t) => {
   const { base } = await boot(t, (r) => mkProject(r, 'crashy', crashApp(OUTPUT_CAP + 4096)));
   quiet(t);
   await crashed(base);
   const app = appOf(await listJson(base), 'crashy');
   assert.equal(app.outputTruncated, true);
-  assert.ok(app.output.length <= OUTPUT_CAP);
+  assert.equal(app.output.length, OUTPUT_CAP);
+  assert.equal(app.output, (await fs.readFile(app.logFile, 'utf8')).slice(-OUTPUT_CAP));
 });
 
 // Invariant: REST and the UI receive exactly today's crash shape: `error`
@@ -189,6 +225,7 @@ test('start_app and stop_app answer the live record in json and text', async (t)
   assert.equal(appManager._record('app'), undefined);
 
   res = await prose(base, 'start_app', { id: 'app2' });
+  assertTextCovers(appManager._record('app2'), res.body.text, 'start_app'); // the record is the json reply minus urls
   assert.ok(res.body.text.includes("'app2'") && res.body.text.includes(String(appManager._record('app2').port)));
   assert.throws(() => JSON.parse(res.body.text));
   res = await prose(base, 'stop_app', { id: 'app2' });
@@ -209,8 +246,11 @@ test('register_app and unregister_app answer the registry state in json and text
   assert.deepEqual(res.body.structured, { id: 'tool', registered: false });
   assert.ok(!('tool' in await registry()));
 
-  res = await prose(base, 'register_app', { id: 'tool2', start: 'npm start' });
-  assert.ok(res.body.text.includes("'tool2'"));
+  const args2 = { id: 'tool2', start: 'npm start', name: 'Two', port: 3200 };
+  const rec2 = (await json(base, 'register_app', args2)).body.structured;
+  await json(base, 'unregister_app', { id: 'tool2' });
+  res = await prose(base, 'register_app', args2);
+  assertTextCovers(rec2, res.body.text, 'register_app');
   assert.throws(() => JSON.parse(res.body.text));
   assert.ok('tool2' in await registry());
   res = await prose(base, 'unregister_app', { id: 'tool2' });
@@ -292,7 +332,7 @@ test('the embedded host conductor: start and stop are APP_ALWAYS_ON, list_apps v
     process.env.CONDUCTOR_PROJECT_DIR = path.join(r, 'code-conductor');
     await useConductorOverlay([]);
   });
-  t.after(() => { resetConductorOverlay(); delete process.env.CONDUCTOR_PROJECT_DIR; });
+  t.after(() => { resetConductorOverlay(); unregisterInMemory('code-conductor'); delete process.env.CONDUCTOR_PROJECT_DIR; });
 
   for (const tool of ['start_app', 'stop_app']) {
     const res = await json(base, tool, { id: 'code-conductor' });
@@ -319,4 +359,46 @@ test('envelope: format defaults to text, bad format and missing tool are 400s', 
   const raw = await fetch(base + '/api/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{not valid json' });
   assert.equal(raw.status, 400);
   assert.ok((await raw.json()).error);
+});
+
+// Invariant: a hand-edited integer-string port starts the app on that integer
+// (so the reply validates), and any other stored non-integer refuses before a
+// spawn with SETTINGS_INVALID, identically in both formats.
+test('start_app reads a stored port string as an integer and refuses garbage', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const { base } = await boot(t, async (r) => { await mkProject(r, 'app', { start: fakeAppCmd() }); });
+  const port = await nonEphemeralPort(t);
+  const setPort = (v) => fs.writeFile(appSettingsFile(), JSON.stringify({ app: { port: v } }));
+
+  await setPort(String(port));
+  const res = await json(base, 'start_app', { id: 'app' }); // callTool validated the reply against the schema
+  assert.equal(res.body.structured.port, port);
+  assert.equal(res.body.structured.fixedPort, port);
+  assert.equal(appManager._record('app').port, port);
+  await json(base, 'stop_app', { id: 'app' });
+
+  await setPort('abc');
+  const [j, x] = [await json(base, 'start_app', { id: 'app' }), await prose(base, 'start_app', { id: 'app' })];
+  assert.deepEqual(j.body, x.body);
+  assert.equal(j.body.code, 'SETTINGS_INVALID');
+  assert.deepEqual(j.body.details, { field: 'port', value: 'abc' });
+  assert.match(j.body.error, /'app'.*"abc"/);
+  assert.equal(appManager._record('app'), undefined, 'refused before any spawn');
+});
+
+// Invariant: the post-spawn EADDRINUSE refusal (a child that loses the bind
+// race after a clean pre-check) is PORT_IN_USE with details {port}, in both formats.
+test('a fixed-port child that hits EADDRINUSE after a clean pre-check is PORT_IN_USE', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const port = await nonEphemeralPort(t);
+  const { base } = await boot(t, async (r) => {
+    // `flaky` fails once with EADDRINUSE; the marker is per attempt, so each call below is a first run.
+    await mkProject(r, 'app', { start: fakeAppCmd('flaky', path.join(r, 'flaky-marker')), port });
+  });
+  quiet(t);
+  const j = await json(base, 'start_app', { id: 'app' });
+  await fs.rm(path.join(process.env.PROJECTS_ROOT, 'flaky-marker'), { force: true });
+  const x = await prose(base, 'start_app', { id: 'app' });
+  assert.deepEqual(j.body, x.body);
+  assert.equal(j.body.code, 'PORT_IN_USE');
+  assert.deepEqual(j.body.details, { port });
+  assert.equal(appManager._record('app'), undefined);
 });

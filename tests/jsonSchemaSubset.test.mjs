@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkSchema, validate } from './jsonSchemaSubset.mjs';
+import { checkSchema, validate, KEYWORDS, TYPES } from './jsonSchemaSubset.mjs';
 
 // Invariant: the test-only copy enforces the same schema subset cc does, so a
 // manifest it accepts is one cc loads and a drifted copy fails here.
@@ -28,4 +28,14 @@ test('validate flags mismatches and accepts conforming values', () => {
   assert.match(validate(schema, { a: 1, c: 2 })[0], /expected const/);
   assert.match(validate(schema, {})[0], /missing required 'a'/);
   assert.match(validate(schema, { a: 1, u: 5 })[0], /no anyOf branch/);
+});
+
+// Invariant: the copy's vocabulary is exactly cc's, so adding or dropping a
+// keyword or type in the copy (drift) fails here, and every keyword cc refuses is refused.
+test('the vocabulary is exactly the one cc accepts', () => {
+  assert.deepEqual([...KEYWORDS].sort(), ['additionalProperties', 'anyOf', 'const', 'description', 'enum', 'items', 'properties', 'required', 'type']);
+  assert.deepEqual([...TYPES].sort(), ['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']);
+  for (const k of ['minLength', 'maxLength', 'minimum', 'maximum', 'pattern', 'format', 'oneOf', 'allOf', 'not', '$ref', 'default', 'title', 'minItems']) {
+    assert.throws(() => checkSchema({ type: 'string', [k]: 1 }), new RegExp(`'?${k.replace('$', '\\$')}'?`), k);
+  }
 });
