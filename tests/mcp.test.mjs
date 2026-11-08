@@ -9,10 +9,11 @@ import { OUTPUT_CAP, CRASH_TAIL_CHARS } from '../src/runner.js';
 import { appSettingsFile } from '../src/appSettings.js';
 import { unregisterInMemory } from '../src/projects.js';
 import { callTool } from './mcpClient.mjs';
-import { assertTextCovers, assertListText } from './textCover.mjs';
+import { localIPv4s } from '../src/net.js';
+import { assertTextCovers, assertListText, blockOf } from './textCover.mjs';
 import {
   mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin,
-  dataDirIn, writeRegistrations, useConductorOverlay, resetConductorOverlay, nonEphemeralPort, FIXED_PORT_SKIP,
+  dataDirIn, gitCommit, altLoopbackBindable, writeRegistrations, useConductorOverlay, resetConductorOverlay, nonEphemeralPort, FIXED_PORT_SKIP,
 } from './helpers.mjs';
 
 // Boots a server over a fresh scratch root. `setup(root)` creates projects
@@ -63,7 +64,7 @@ test('list_apps json validates on a realistic store covering every share kind an
     await mkProject(r, 'broken', null);
     await fs.writeFile(path.join(r, 'broken', '.hub.json'), '{ not json');
     await mkWorktree(r, 'plain', 'k1', cmd, { git: true });
-    for (const id of ['lan', 'tun-auth', 'lan-open', 'ts', 'gone']) await mkProject(r, id, cmd, { git: true });
+    for (const id of ['lan', 'tun-auth', 'lan-open', 'ts', 'gone', 'stale', 'tls-lan']) await mkProject(r, id, cmd, { git: true });
     await mkProject(r, 'crashy', { start: fakeAppCmd('crashloud') });
     await mkProject(r, 'autofail', cmd);
     await mkProject(r, 'edited', cmd);
@@ -77,7 +78,7 @@ test('list_apps json validates on a realistic store covering every share kind an
   await appManager.autoStartAll();
   await appManager.setAppSettings('lan', { username: 'hubuser', password: 'hubpass' });
 
-  const running = ['lan', 'tun-auth', 'lan-open', 'ts', 'gone', 'crashy'];
+  const running = ['lan', 'tun-auth', 'lan-open', 'ts', 'gone', 'stale', 'tls-lan', 'crashy'];
   for (const id of running) assert.equal((await json(base, 'start_app', { id })).status, 200);
   for (const id of running.filter((i) => i !== 'crashy')) await waitFor(isReady(base, id));
   await waitFor(async () => appOf(await listJson(base), 'crashy').status === 'crashed');
@@ -85,6 +86,8 @@ test('list_apps json validates on a realistic store covering every share kind an
   await appManager.share('lan', { mode: 'lan', tls: false });
   await appManager.share('tun-auth', { mode: 'tunnel' });
   await appManager.share('lan-open', { mode: 'lan', auth: false, tls: false });
+  await appManager.share('tls-lan', { mode: 'lan' }); // tls defaults to on
+  gitCommit(path.join(root, 'stale')); // a commit after the start: outOfDate
   await appManager.share('ts', { mode: 'tailscale' });
   // A failed auto-share: the app starts, its tunnel cannot come up.
   process.env.FAKE_CLOUDFLARED_MODE = 'fail';
@@ -96,10 +99,16 @@ test('list_apps json validates on a realistic store covering every share kind an
   // Relay info as hostRelay's infoFor() builds it, seeded onto the live LAN records (no relay runs here).
   const relayUp = { state: 'up', error: null, port: 41500, requestedPort: appManager._record('lan').tunnel.proxyPort, portFallback: false, recovery: null };
   const relayDown = { state: 'down', error: 'connection to the relay lost: reset', port: null, requestedPort: appManager._record('lan-open').tunnel.proxyPort, portFallback: false, recovery: 'retrying' };
+  // A second, distinct address on a LAN share's urls (an interface the relay advertises), so element coverage is real.
+  const lanTunnel = appManager._record('lan').tunnel;
+  lanTunnel.urls = [lanTunnel.url, 'http://10.9.8.7:41501'];
   appManager._record('lan').tunnel.relay = relayUp;
   appManager._record('lan-open').tunnel.relay = relayDown;
 
   const list = await listJson(base); // callTool validated it against the manifest schema
+  assert.ok(appOf(list, 'lan').tunnel.urls.length > 1);
+  assert.equal(appOf(list, 'stale').outOfDate, true);
+  assert.equal(appOf(list, 'tls-lan').tunnel.tls, true);
   assert.deepEqual(appOf(list, 'lan').tunnel.relay, relayUp);
   assert.deepEqual(appOf(list, 'lan-open').tunnel.relay, relayDown);
   // output/outputTruncated belong to a crashed app only; a stopped one carries its manifestError as error.
@@ -182,6 +191,13 @@ test('output beyond the retained ring is flagged outputTruncated', async (t) => 
   assert.equal(app.outputTruncated, true);
   assert.equal(app.output.length, OUTPUT_CAP);
   assert.equal(app.output, (await fs.readFile(app.logFile, 'utf8')).slice(-OUTPUT_CAP));
+
+  // The text view discloses both cuts: the tail and the ring's own dropped bytes.
+  const { text } = (await prose(base, 'list_apps', {})).body;
+  const block = blockOf(text, 'crashy');
+  assert.ok(block.includes('older output was also dropped'));
+  assert.ok(block.includes(`last ${CRASH_TAIL_CHARS}`));
+  assertTextCovers('list', app, block, 'crashy');
 });
 
 // Invariant: REST and the UI receive exactly today's crash shape: `error`
@@ -244,7 +260,7 @@ test('start_app and stop_app answer the live record in json and text', async (t)
 
 // Invariant: typed write acks match the on-disk registry.
 test('register_app and unregister_app answer the registry state in json and text', async (t) => {
-  const { base, root } = await boot(t, async (r) => { await mkProject(r, 'tool', null); await mkProject(r, 'tool2', null); });
+  const { base, root } = await boot(t, async (r) => { await mkProject(r, 'tool', null); await mkProject(r, 'tool2', null); await mkProject(r, 'tool3', null); });
   const registry = async () => JSON.parse(await fs.readFile(path.join(dataDirIn(root), 'registrations.json'), 'utf8'));
 
   let res = await json(base, 'register_app', { id: 'tool', start: 'npm start', name: 'Tool', port: 3100 });
@@ -265,6 +281,14 @@ test('register_app and unregister_app answer the registry state in json and text
   res = await prose(base, 'unregister_app', { id: 'tool2' });
   assertTextCovers('unregister', { id: 'tool2', registered: false }, res.body.text);
   assert.ok(!('tool2' in await registry()));
+
+  // healthPath and readyWhen set: both reach the text.
+  const args3 = { id: 'tool3', start: 'npm start', healthPath: '/health', readyWhen: 'listening on' };
+  const rec3 = (await json(base, 'register_app', args3)).body.structured;
+  assert.equal(rec3.manifest.healthPath, '/health');
+  assert.equal(rec3.manifest.readyWhen, 'listening on');
+  await json(base, 'unregister_app', { id: 'tool3' });
+  assertTextCovers('register', rec3, (await prose(base, 'register_app', args3)).body.text);
 });
 
 // Invariant: every refusal path maps to {error, code, details?} with a stable
@@ -413,4 +437,45 @@ test('a fixed-port child that hits EADDRINUSE after a clean pre-check is PORT_IN
   assert.equal(j.body.code, 'PORT_IN_USE');
   assert.deepEqual(j.body.details, { port });
   assert.equal(appManager._record('app'), undefined);
+});
+
+// Invariant: start_app's text covers a worktree start (project differs from id,
+// branch set) and a fixed-port start (fixedPort non-null), by label.
+test('start_app text covers a worktree start and a fixed-port start', { skip: FIXED_PORT_SKIP }, async (t) => {
+  const port = await nonEphemeralPort(t);
+  const { base } = await boot(t, async (r) => {
+    await mkProject(r, 'plain', { start: fakeAppCmd() }, { git: true });
+    await mkWorktree(r, 'plain', 'k1', { start: fakeAppCmd() }, { git: true });
+    await mkProject(r, 'fixed', { start: fakeAppCmd(), port });
+  });
+  for (const id of ['plain:k1', 'fixed']) {
+    const text = (await prose(base, 'start_app', { id })).body.text;
+    const rec = appManager._record(id);
+    const urls = (await appManager.list()).apps.find((a) => a.id === id).urls;
+    assertTextCovers('start', { ...rec, urls }, text, id);
+  }
+  const wt = appManager._record('plain:k1');
+  assert.equal(wt.isWorktree, true);
+  assert.notEqual(wt.project, wt.id);
+  assert.ok(wt.branch);
+  assert.equal(appManager._record('fixed').fixedPort, port);
+});
+
+// Invariant: a fixed-port LAN share whose port a wildcard-binding app holds
+// falls back to a free port; listing it validates and its text carries both
+// fixedPortFallback and fixedPortHolder. Needs a LAN interface and a bindable
+// loopback alias (the holder probe), else it is skipped, not faked.
+test('list_apps text covers a fixed-port LAN share that fell back', { skip: FIXED_PORT_SKIP }, async (t) => {
+  if (localIPv4s({ lanFallback: true }).length === 0) return t.skip('no LAN interface on this host');
+  if (!(await altLoopbackBindable())) return t.skip('the loopback alias is not bindable on this host');
+  const port = await nonEphemeralPort(t);
+  const { base } = await boot(t, (r) => mkProject(r, 'fixed', { start: fakeAppCmd('wildcard'), port }));
+  assert.equal((await json(base, 'start_app', { id: 'fixed' })).status, 200);
+  await waitFor(isReady(base, 'fixed'));
+  await appManager.share('fixed', { mode: 'lan', tls: false });
+  const list = await listJson(base);
+  const tunnel = appOf(list, 'fixed').tunnel;
+  assert.equal(tunnel.fixedPortFallback, true);
+  assert.equal(tunnel.fixedPortHolder, 'app');
+  assertListText(list, (await prose(base, 'list_apps', {})).body.text);
 });

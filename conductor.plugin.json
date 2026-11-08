@@ -218,7 +218,7 @@
                         "description": "Stored auto-share options ({mode, auth, tls?, funnelPort?}; a tailscale entry always carries funnelPort, defaulted when unset) or null. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear."
                       },
                       "port": {
-                        "description": "Stored fixed port or null. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear. start_app on a main checkout uses an integer in the fixed-port range, or a canonical integer string (String(Number(v)) === v) in it as that integer, and refuses anything else with SETTINGS_INVALID; a worktree ignores the stored port."
+                        "description": "Stored fixed port or null. Taken from the hand-editable app-settings.json without validation, so any JSON value can appear. start_app on a main checkout uses an integer in the fixed-port range, or a canonical integer string (see readPort in src/appSettings.js) in it as that integer, and refuses anything else with SETTINGS_INVALID; a worktree ignores the stored port."
                       }
                     }
                   },

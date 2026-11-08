@@ -4,8 +4,12 @@ import assert from 'node:assert/strict';
 // object needs a rule naming the line prefix and the label+value the renderer
 // prints for it, so a dropped label fails even when the value shows up
 // elsewhere in the text (an id inside a project name, a url echoed by routes).
-// A leaf with no rule fails, so a new schema field must be given one. A true
-// boolean without a rule must appear as its key; a false one is skipped.
+// The rule: a non-boolean leaf that carries a value must have a rule (a leaf
+// with none fails, so a new schema field must be given one). Null leaves are
+// skipped. A true boolean without a rule falls back to its key; a false one
+// without a rule is skipped. SKIP is the explicit exemption list: the declared
+// cuts (qrSvg, output, outputTruncated) and a leaf another rule already covers
+// (tunnel.kind, rendered with tunnel.url).
 
 const E = (prefix, substr) => [prefix, substr];
 const hasLine = (text, [prefix, substr]) => text.split('\n').some((l) => l.trim().startsWith(prefix) && l.includes(substr));
