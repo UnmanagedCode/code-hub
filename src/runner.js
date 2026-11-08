@@ -13,7 +13,9 @@ const STOP_WAIT_MARGIN_MS = 1000;
 export const STOP_WAIT_MS = GRACE_MS + STOP_WAIT_MARGIN_MS;
 const GONE_POLL_MS = 20;
 const READY_TIMEOUT_MS = 30000;
-const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring, fed from the log file; also caps each read
+export const OUTPUT_CAP = 16 * 1024; // per-app crash-tail ring, fed from the log file; also caps each read
+// Chars of a crashed app's output kept in `error` (the REST/UI crash message).
+export const CRASH_TAIL_CHARS = 2000;
 const EADDRINUSE_RETRIES = 3;
 const SPAWN_SETTLE_MS = 400; // window to catch a fast EADDRINUSE crash before committing to this attempt's port
 
@@ -32,7 +34,7 @@ export function onExit(listener) {
 export function runtime(id) {
   const c = children.get(id);
   if (!c) return null;
-  return { status: c.status, error: c.error, output: c.output };
+  return { status: c.status, error: c.error, reason: c.reason, output: c.output, outputTruncated: c.total > c.output.length };
 }
 
 function appendOutput(c, chunk, skipped = 0) {
@@ -50,10 +52,12 @@ function pump(c) {
 // The single exit from 'starting': resolves the child's `settled` promise
 // with the status it settled to, whichever path (readiness, an early exit,
 // a spawn error) got there first.
-function settle(c, status, error = null) {
+// `reason` is `error` without any output tail.
+function settle(c, status, error = null, reason = error) {
   if (c.status !== 'starting') return;
   c.status = status;
   c.error = error;
+  c.reason = reason;
   c.resolveSettled(status);
   try { c.tail.close(); } finally { c.release(); } // the sweep may rotate this log again
 }
@@ -79,14 +83,15 @@ function spawnChild(app, port) {
   } finally {
     closeSync(fd);
   }
-  const c = { proc, pgid: proc.pid, status: 'starting', error: null, output: '', total: 0, tail, release };
+  const c = { proc, pgid: proc.pid, status: 'starting', error: null, reason: null, output: '', total: 0, tail, release };
   c.settled = new Promise((resolve) => { c.resolveSettled = resolve; });
 
   proc.on('exit', (code, signal) => {
     // Exit before readiness = crash; after = the app stopped on its own.
     if (c.status === 'starting') {
       pump(c); // drain the log first so the tail (and raceSettle's EADDRINUSE check) sees the app's last output
-      settle(c, 'crashed', `start command exited (code=${code}, signal=${signal})\n${c.output.slice(-2000)}`);
+      const reason = `start command exited (code=${code}, signal=${signal})`;
+      settle(c, 'crashed', `${reason}\n${c.output.slice(-CRASH_TAIL_CHARS)}`, reason);
     } else if (c.status === 'ready') c.status = 'exited';
     for (const listener of exitListeners) {
       try { listener(app.id); } catch (e) { console.error(`[runner] exit listener failed: ${e.message}`); }

@@ -40,7 +40,7 @@ Every file code-hub persists (logs, `registrations.json`, `app-settings.json`, `
 - Rotation: every `LOG_SWEEP_MS`, any log over `LOG_CAP_BYTES` has its last `LOG_CAP_BYTES` copied to `<id>.log.1` (one generation, overwriting the previous; older bytes are dropped, and since the cut is byte-based the kept text can begin mid-line or mid-character) and is then truncated. Skipped for an app whose start is in progress (any readiness kind: the file is claimed from the start until it settles).
 - Retention: the `.log`/`.log.1` of an id that is not running and not mid-start is deleted once its last write is older than `LOG_RETENTION_MS`; an orphan `.log.1` likewise. A running app's log is never deleted. Stopping an app keeps its log.
 - Limitations: lines written between the copy and the truncate are lost. Nothing rotates while no code-hub runs, so the log can grow far past `LOG_CAP_BYTES`; the first sweep at boot keeps only its last `LOG_CAP_BYTES` in `.log.1` and drops the rest of the backlog. That `.log.1` stays until the next rotation overwrites it, the app's next start deletes it, or — for an id that is not running — retention removes it after `LOG_RETENTION_MS`.
-- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail.
+- Constants live in `src/appLog.js`. No API endpoint serves these files; `App.error` carries the crash tail. MCP `list_apps` in json format carries a crashed app's whole retained output ring as `output` (`outputTruncated` when the ring dropped older bytes) and the file's path as `logFile`.
 
 ## Machine-local registration: `registrations.json` (`$CONDUCTOR_PLUGIN_DATA_DIR/registrations.json`)
 
@@ -60,7 +60,7 @@ Per-app settings (`src/appSettings.js`): the default login a **new** share of th
   | `username` | `hub` | every new share's Basic-Auth username |
   | `password` | a CSPRNG password per share | every new share's password (masked in the UI, `passwordIsDefault: true`) |
   | `autoStart` | off (stored only as `true`) | `appManager.autoStartAll()` starts the app at boot when it isn't already running |
-  | `port` | the manifest's `port`, else a free port | the fixed port of every start of the app, overriding the manifest's; an integer `1024`–`65535` |
+  | `port` | the manifest's `port`, else a free port | the fixed port of every start of the app, overriding the manifest's; an integer in the fixed-port range (`isValidFixedPort`, `MIN_FIXED_PORT`–`MAX_FIXED_PORT` in `src/projects.js`). `start` normalises the stored value: a hand-edited canonical integer string (see `readPort` in `src/appSettings.js`) in range is read as the integer; any other stored value, an out-of-range integer or a zero-padded string included, makes `start` refuse a main checkout with `400` (MCP code `SETTINGS_INVALID`). A worktree ignores the stored port, so it never refuses. The settings API and the listing's `settings.port` report the stored value as-is |
   | `autoShare` | off | every start of the app (`start`, `restart`, MCP `start_app`, boot auto-start) shares it with these options once readiness settles to `ready`, with the default login above. For the always-on host code-conductor (never started by code-hub): `appManager.autoShareAlwaysOn()` shares it at every code-hub boot, unless it already has a share |
 
   An entry with none of the five is deleted, never kept. `autoShare` is stored **normalised** by the same validation `POST …/share` uses (`validateShareOptions` in `src/shareOptions.js`): `auth` defaults to `true`, `tls` is kept for `lan` only and defaults to `true`, `funnelPort` is kept for `tailscale` only and defaults to `443`, any other key is dropped. A stored `tailscale` `autoShare` with no `funnelPort` is read — and reported by `GET …/settings` and the listing's `settings.autoShare` — as `funnelPort: 443`; the file itself is not rewritten.
@@ -239,7 +239,7 @@ A failed bind never fails or delays a start, and is **never retried** while the 
 
 ### Errors
 
-Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot start — its manifest source failed to parse or validate, and the reason is the app's `manifestError`; an invalid `share` `mode`/`auth`/`tls`/`funnelPort`; `auth:false` with `mode:"tunnel"` or `mode:"tailscale"`; a credentials-edit body that's empty/non-string, or targets a no-auth share; a settings `PUT` refused as described above; a non-boolean `enabled` on an auth-toggle, or one targeting a `mode:"tunnel"`/`mode:"tailscale"` share), `404` (unknown/not-running app), `409` (already running / a declared fixed port already in use / not running for share / the requested Funnel port is already held by another app's tailscale share / a share of the same running app already in flight / an app stopped, restarted or unshared while its share was coming up, in any mode / no active share for a credentials edit or auth toggle), `501` (`tunnel`-mode share when cloudflared is absent, `tailscale`-mode share when tailscale is unavailable — reported in preference to the tailscale `409` when both apply, since it is the more actionable of the two), `500` (unexpected, or a funnel tailscale refused — see `mode: "tailscale"`). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
+Non-2xx responses are `{ error: string }`. Status codes: `400` (the app cannot start — its manifest source failed to parse or validate, and the reason is the app's `manifestError`; a main checkout's stored Settings `port` is not a valid fixed port (start/restart); an invalid `share` `mode`/`auth`/`tls`/`funnelPort`; `auth:false` with `mode:"tunnel"` or `mode:"tailscale"`; a credentials-edit body that's empty/non-string, or targets a no-auth share; a settings `PUT` refused as described above; a non-boolean `enabled` on an auth-toggle, or one targeting a `mode:"tunnel"`/`mode:"tailscale"` share), `404` (unknown/not-running app), `409` (already running / a declared fixed port already in use / not running for share / the requested Funnel port is already held by another app's tailscale share / a share of the same running app already in flight / an app stopped, restarted or unshared while its share was coming up, in any mode / no active share for a credentials edit or auth toggle), `501` (`tunnel`-mode share when cloudflared is absent, `tailscale`-mode share when tailscale is unavailable — reported in preference to the tailscale `409` when both apply, since it is the more actionable of the two), `500` (unexpected, or a funnel tailscale refused — see `mode: "tailscale"`). **Exception: `POST /api/mcp`** replies `200` for every well-formed tool call, including tool-level failures — see below.
 
 ## Host relay protocol (`relay/protocol.json`)
 
@@ -334,25 +334,38 @@ Owned by `src/webui.js`; mounted after `/api` (so the API answers first).
 
 code-hub is a code-conductor plugin (see `conductor.plugin.json` at the repo root) and exposes its app-management operations as MCP tools over one endpoint, reusing the same `appManager` logic as the HTTP API above — no duplicated behavior.
 
-**Request:** `{ tool: string, arguments: object, caller: { sessionId, project } }`. `caller` is accepted but currently unused server-side — `appManager` has no per-project scoping, so `start_app`/`stop_app` are not restricted to the caller's own project.
+**Request:** `{ tool: string, arguments: object, caller: { sessionId, project }, format?: "json" | "text" }`. `caller` is accepted but currently unused server-side — `appManager` has no per-project scoping, so `start_app`/`stop_app` are not restricted to the caller's own project. A missing `format` is answered as text.
 
 **Response — status-code contract:**
 
 | Condition | Status | Body |
 |---|---|---|
 | Malformed JSON body | `400` | `{ error }` |
-| Missing/non-string/empty `tool` field | `400` | `{ error }` |
-| Well-formed call, tool succeeds | `200` | `{ result: <any> }` |
-| Well-formed call, tool fails (unknown tool, bad `arguments`, already-running, not-found, ...) | `200` | `{ error: string }` |
+| Missing/non-string/empty `tool` field | `400` | `{ error, code: "REQUEST_INVALID" }` |
+| `format` present but not `"json"`/`"text"` | `400` | `{ error, code: "FORMAT_INVALID", details: { format } }` |
+| `format: "json"`, tool succeeds | `200` | `{ structured: <object> }` |
+| `format: "text"` (or missing), tool succeeds | `200` | `{ text: <string> }` |
+| Well-formed call, tool refuses (unknown tool, bad `arguments`, already-running, not-found, ...) | `200` | `{ error: string, code: string, details?: object }` — the same body in both formats |
 
 The split is deliberate: only a malformed *request envelope* is a transport failure. An unknown tool name, invalid arguments, or a tool throwing (e.g. "already running") are normal MCP outcomes for the calling LLM, so they stay `200` — the conductor can treat any non-200 as a hard transport error without special-casing tool-level failures.
 
-**Tools** (declared in `conductor.plugin.json`'s `mcp.tools`, shallow JSON-Schema `inputSchema`s — no `$ref`/`oneOf`/`anyOf`/nested objects):
+**Tools** (declared in `conductor.plugin.json`'s `mcp.tools`: shallow JSON-Schema `inputSchema`s — no `$ref`/`oneOf`/`anyOf`/nested objects — and an `outputSchema` each). The json result is the object the tool's `outputSchema` declares; the text result is a prose view (`src/mcpText.js`) of that same object.
 
-| Tool | Arguments | Result |
+| Tool | Arguments | json result (beyond its `outputSchema`) |
 |---|---|---|
-| `list_apps` | none | same as `GET /api/apps` |
-| `start_app` | `{ id: string }` | same as `POST /api/apps/:id/start` |
-| `stop_app` | `{ id: string }` | same as `POST /api/apps/:id/stop` |
-| `register_app` | `{ id: string, start: string, name?, healthPath?, readyWhen?, port? }` | the registered app, in the same shape as an entry in `list_apps`'s `apps` (`source: "registry"`). `400` if `id` isn't an existing dir under the projects root, `409` if that dir already has a `.hub.json`, `400` on a schema violation (e.g. empty `start`, or a `port` outside `1024`–`65535`). An app's Settings `port` overrides the registration's. `routes` isn't in this tool's declared schema (array-of-object properties aren't expressible in the shallow-JSON-Schema `pluginApi` v1 constraint) but is still accepted/validated if passed in `arguments` — the schema simply doesn't advertise it; hand-edit `registrations.json` for multi-route registrations. |
-| `unregister_app` | `{ id: string }` | `{ id, registered: false }`. `404` if `id` has no registry entry. No effect on a project with its own `.hub.json` (it was never in the registry). |
+| `list_apps` | none | `GET /api/apps` plus, per app, `logFile`, `output` and `outputTruncated`; a crashed app's `error` is its reason line only (REST's `error` embeds a short output tail); `error` is null for an app that reached ready and then exited on its own, which has no reason line. Text omits `qrSvg` and shows only the last `CRASH_TAIL_CHARS` (`src/runner.js`) of a crashed app's output, and says so in-line. |
+| `start_app` | `{ id: string }` | the `POST /api/apps/:id/start` response; the reply is sent once the process is spawned, so the app may already have crashed — `list_apps` reports the settled status. A stored port that is a canonical integer string is read as that integer; see the settings `port` row for what is refused (main checkouts only: a worktree ignores the stored port). |
+| `stop_app` | `{ id: string }` | the `POST /api/apps/:id/stop` response |
+| `register_app` | `{ id: string, start: string, name?, healthPath?, readyWhen?, port? }` | the registered app's discovery record `{ id, project, path, isWorktree, branch, manifest, manifestError, source }` (`source: "registry"`) — not a `list_apps` entry. An app's Settings `port` overrides the registration's. `routes` isn't in this tool's declared schema (array-of-object properties aren't expressible in the shallow-JSON-Schema `pluginApi` v1 constraint) but is still accepted/validated if passed in `arguments` — the schema simply doesn't advertise it; hand-edit `registrations.json` for multi-route registrations. |
+| `unregister_app` | `{ id: string }` | `{ id, registered: false }`. No effect on a project with its own `.hub.json` (it was never in the registry). |
+
+**Refusal codes.** Two homes: `src/mcp.js` sets `TOOL_UNKNOWN`, `INTERNAL` (any throw not tagged by `httpError`), `REQUEST_INVALID`, `FORMAT_INVALID`, and `ARGS_INVALID` for a missing `id` (`requireId`); `appManager` tags every other code at its throw site via `src/httpError.js`, including `ARGS_INVALID` from `register_app`'s id check. REST ignores the codes. Messages are unchanged from REST.
+
+| Tool | Codes |
+|---|---|
+| any | `TOOL_UNKNOWN`, `INTERNAL`; envelope `400`s: `REQUEST_INVALID`, `FORMAT_INVALID` |
+| `list_apps` | `INTERNAL` |
+| `start_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `SETTINGS_INVALID` (the app's stored port in `app-settings.json` is not an integer in the fixed-port range, nor a canonical integer string in it (main checkouts only: a worktree ignores the stored port); `details: { field: "port", value }`), `ALREADY_RUNNING`, `APP_UNKNOWN`, `MANIFEST_INVALID`, `PORT_IN_USE` (`details: { port, holder? }`) |
+| `stop_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `NOT_RUNNING` |
+| `register_app` | `ARGS_INVALID`, `DIR_NOT_FOUND` (not an existing dir under the projects root), `MANIFEST_EXISTS` (the dir already has a `.hub.json`), `MANIFEST_INVALID` (schema violation, e.g. empty `start` or a `port` outside the fixed-port range, `isValidFixedPort` in `src/projects.js`) |
+| `unregister_app` | `ARGS_INVALID`, `NOT_REGISTERED` |
