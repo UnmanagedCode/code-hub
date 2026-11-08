@@ -346,3 +346,17 @@ test('invalid ports are refused before any write', async (t) => {
   }
   assert.equal(await fs.readFile(file(), 'utf8'), before);
 });
+
+// Invariant: get() normalises a hand-edited stored port only when it is a
+// canonical integer string inside the fixed-port range; everything else comes
+// back verbatim (never nulled), so start() can refuse it. No app is started.
+test('get() normalises a stored port string at the range edges and leaves the rest verbatim', async (t) => {
+  const root = await mkRoot();
+  t.after(() => rmRoot(root));
+  const stored = { a: '1024', b: '65535', c: '1023', d: '65536', e: '041500', f: 5000, g: 99999, h: 'abc', i: ' 5000', j: '1e3', k: null };
+  await fs.mkdir(storeRoot(), { recursive: true });
+  await fs.writeFile(file(), JSON.stringify(Object.fromEntries(Object.entries(stored).map(([id, port]) => [id, { port }]))));
+  const got = {};
+  for (const id of Object.keys(stored)) got[id] = (await appSettings.get(id)).port;
+  assert.deepEqual(got, { a: 1024, b: 65535, c: '1023', d: '65536', e: '041500', f: 5000, g: 99999, h: 'abc', i: ' 5000', j: '1e3', k: null });
+});

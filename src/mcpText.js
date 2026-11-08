@@ -1,8 +1,9 @@
 import { CRASH_TAIL_CHARS } from './runner.js';
 
 // Prose renderers for the MCP text format. Each takes the same complete object
-// the json format carries for that tool and renders every field of it. The only
-// cuts are a crashed app's output tail and the share QR, and the text says so.
+// the json format carries for that tool and renders every non-null field of it (a
+// true boolean as its flag; a false one as its off/no label where it is shown).
+// The only cuts are a crashed app's output tail and the share QR, and the text says so.
 
 const list = (xs) => (xs && xs.length ? xs.join(', ') : 'none');
 const orNone = (v) => (v === null || v === undefined || v === '' ? 'none' : v);

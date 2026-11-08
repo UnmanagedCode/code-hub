@@ -9,6 +9,7 @@ import { OUTPUT_CAP, CRASH_TAIL_CHARS } from '../src/runner.js';
 import { appSettingsFile } from '../src/appSettings.js';
 import { unregisterInMemory } from '../src/projects.js';
 import { callTool } from './mcpClient.mjs';
+import { assertTextCovers, assertListText } from './textCover.mjs';
 import {
   mkRoot, rmRoot, mkProject, mkWorktree, waitFor, fakeAppCmd, fakeCloudflaredBin, fakeTailscaleBin,
   dataDirIn, writeRegistrations, useConductorOverlay, resetConductorOverlay, nonEphemeralPort, FIXED_PORT_SKIP,
@@ -40,20 +41,6 @@ const prose = (base, tool, args) => callTool(base, tool, args, { format: 'text' 
 const listJson = async (base) => (await json(base, 'list_apps', {})).body.structured;
 const appOf = (list, id) => list.apps.find((a) => a.id === id);
 const isReady = (base, id) => async () => ['ready', 'running'].includes(appOf(await listJson(base), id)?.status);
-// Every non-null string/number leaf of `value` must appear in `text`, and the
-// key of every true boolean leaf too; `skip` names leaf keys the text
-// deliberately omits or cuts.
-function assertTextCovers(value, text, label, skip = []) {
-  const walk = (v, key, at) => {
-    if (v === null || v === undefined || skip.includes(key)) return;
-    if (Array.isArray(v)) return v.forEach((x, i) => walk(x, key, `${at}[${i}]`));
-    if (typeof v === 'object') return Object.entries(v).forEach(([k, x]) => walk(x, k, `${at}.${k}`));
-    if (typeof v === 'boolean') return v && assert.ok(text.includes(key), `${label}: text drops ${at}`);
-    assert.ok(text.includes(String(v)), `${label}: text drops ${at} (${String(v).slice(0, 60)})`);
-  };
-  walk(value, '', label);
-}
-const blockOf = (text, id) => text.split('\n\n').find((b) => b.startsWith(`${id} (`));
 const quiet = (t) => {
   const real = console.error;
   console.error = () => {};
@@ -64,7 +51,8 @@ const quiet = (t) => {
 // realistic store: every share kind (LAN with auth on and off, a cloudflared
 // tunnel, which is always gated, and tailscale), a crash, a worktree, a registry app, a broken manifest, a
 // stale record whose source is gone, hand-edited off-type settings and a
-// relay-info object on LAN shares. Its text view renders every field.
+// relay-info object on LAN shares, a failed auto-share, a failed auto-start and a
+// default-login share. Its text view covers every field by label.
 test('list_apps json validates on a realistic store covering every share kind and app state', async (t) => {
   const cmd = { start: fakeAppCmd() };
   const { root, base } = await boot(t, async (r) => {
@@ -77,10 +65,17 @@ test('list_apps json validates on a realistic store covering every share kind an
     await mkWorktree(r, 'plain', 'k1', cmd, { git: true });
     for (const id of ['lan', 'tun-auth', 'lan-open', 'ts', 'gone']) await mkProject(r, id, cmd, { git: true });
     await mkProject(r, 'crashy', { start: fakeAppCmd('crashloud') });
+    await mkProject(r, 'autofail', cmd);
     await mkProject(r, 'edited', cmd);
     await fs.writeFile(appSettingsFile(), JSON.stringify({ edited: { username: 7, autoShare: 'lan', port: '80' } }));
   });
   quiet(t);
+  t.after(() => { delete process.env.FAKE_CLOUDFLARED_MODE; });
+
+  // A failed auto-start (the broken manifest refuses) and a stored default login for 'lan'.
+  await appManager.setAppSettings('broken', { autoStart: true });
+  await appManager.autoStartAll();
+  await appManager.setAppSettings('lan', { username: 'hubuser', password: 'hubpass' });
 
   const running = ['lan', 'tun-auth', 'lan-open', 'ts', 'gone', 'crashy'];
   for (const id of running) assert.equal((await json(base, 'start_app', { id })).status, 200);
@@ -91,6 +86,12 @@ test('list_apps json validates on a realistic store covering every share kind an
   await appManager.share('tun-auth', { mode: 'tunnel' });
   await appManager.share('lan-open', { mode: 'lan', auth: false, tls: false });
   await appManager.share('ts', { mode: 'tailscale' });
+  // A failed auto-share: the app starts, its tunnel cannot come up.
+  process.env.FAKE_CLOUDFLARED_MODE = 'fail';
+  await appManager.setAppSettings('autofail', { autoShare: { mode: 'tunnel' } });
+  assert.equal((await json(base, 'start_app', { id: 'autofail' })).status, 200);
+  await waitFor(async () => appOf(await listJson(base), 'autofail').autoShareStatus === 'failed');
+  delete process.env.FAKE_CLOUDFLARED_MODE;
   await fs.rm(path.join(root, 'gone'), { recursive: true, force: true });
   // Relay info as hostRelay's infoFor() builds it, seeded onto the live LAN records (no relay runs here).
   const relayUp = { state: 'up', error: null, port: 41500, requestedPort: appManager._record('lan').tunnel.proxyPort, portFallback: false, recovery: null };
@@ -108,7 +109,14 @@ test('list_apps json validates on a realistic store covering every share kind an
   }
   assert.equal(appOf(list, 'broken').error, appOf(list, 'broken').manifestError);
   const text = (await prose(base, 'list_apps', {})).body.text;
-  for (const a of list.apps) assertTextCovers(a, blockOf(text, a.id) ?? assert.fail(`no text block for ${a.id}`), a.id, ['qrSvg', 'output']);
+  // The states the coverage check must reach, so no rule is vacuous.
+  assert.equal(appOf(list, 'autofail').autoShareStatus, 'failed');
+  assert.ok(appOf(list, 'autofail').autoShareError);
+  assert.ok(appOf(list, 'broken').autoStartError);
+  assert.equal(appOf(list, 'lan').tunnel.passwordIsDefault, true);
+  assert.equal(appOf(list, 'lan').settings.hasPassword, true);
+  assert.deepEqual(list.funnelPorts.filter((f) => f.holder).map((f) => f.holder), ['ts']);
+  assertListText(list, text);
   assert.equal(appOf(list, 'lan').tunnel.kind, 'lan');
   assert.equal(appOf(list, 'tun-auth').tunnel.kind, 'tunnel');
   assert.equal(appOf(list, 'tun-auth').tunnel.auth, true);
@@ -225,11 +233,12 @@ test('start_app and stop_app answer the live record in json and text', async (t)
   assert.equal(appManager._record('app'), undefined);
 
   res = await prose(base, 'start_app', { id: 'app2' });
-  assertTextCovers(appManager._record('app2'), res.body.text, 'start_app'); // the record is the json reply minus urls
+  const urls = (await appManager.list()).apps.find((a) => a.id === 'app2').urls; // the reply's urls come from the same urlsFor()
+  assertTextCovers('start', { ...appManager._record('app2'), urls }, res.body.text);
   assert.ok(res.body.text.includes("'app2'") && res.body.text.includes(String(appManager._record('app2').port)));
   assert.throws(() => JSON.parse(res.body.text));
   res = await prose(base, 'stop_app', { id: 'app2' });
-  assert.ok(res.body.text.includes("'app2'") && res.body.text.includes('stopped'));
+  assertTextCovers('stop', { id: 'app2', status: 'stopped' }, res.body.text);
   assert.equal(appManager._record('app2'), undefined);
 });
 
@@ -250,11 +259,11 @@ test('register_app and unregister_app answer the registry state in json and text
   const rec2 = (await json(base, 'register_app', args2)).body.structured;
   await json(base, 'unregister_app', { id: 'tool2' });
   res = await prose(base, 'register_app', args2);
-  assertTextCovers(rec2, res.body.text, 'register_app');
+  assertTextCovers('register', rec2, res.body.text);
   assert.throws(() => JSON.parse(res.body.text));
   assert.ok('tool2' in await registry());
   res = await prose(base, 'unregister_app', { id: 'tool2' });
-  assert.ok(res.body.text.includes("'tool2'"));
+  assertTextCovers('unregister', { id: 'tool2', registered: false }, res.body.text);
   assert.ok(!('tool2' in await registry()));
 });
 
@@ -341,6 +350,7 @@ test('the embedded host conductor: start and stop are APP_ALWAYS_ON, list_apps v
   const app = appOf(await listJson(base), 'code-conductor');
   assert.equal(app.alwaysOn, true);
   assert.equal(app.status, 'running');
+  assertListText(await listJson(base), (await prose(base, 'list_apps', {})).body.text); // the alwaysOn row, in text
 });
 
 // Invariant: a missing format is answered as text (old cc); an unknown one is
@@ -376,7 +386,7 @@ test('start_app reads a stored port string as an integer and refuses garbage', {
   assert.equal(appManager._record('app').port, port);
   await json(base, 'stop_app', { id: 'app' });
 
-  for (const bad of ['abc', 99999, '99999']) {
+  for (const bad of ['abc', 99999, '99999', '041500']) {
     await setPort(bad);
     const [j, x] = [await json(base, 'start_app', { id: 'app' }), await prose(base, 'start_app', { id: 'app' })];
     assert.deepEqual(j.body, x.body);

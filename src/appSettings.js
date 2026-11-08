@@ -105,11 +105,14 @@ export function migrateLegacyFile() {
   });
 }
 
-// The stored port as start() reads it: an integer as-is (start() range-checks it), a canonical in-range
-// integer string (hand-edited file) as that integer, null when unset. Anything
-// else comes back verbatim, never nulled, so start() can refuse it by name.
+// The stored port as start() reads it. app-settings.json is deliberately
+// hand-editable, so a canonical integer string (String(Number(v)) === v, in the
+// fixed-port range) is accepted as that integer; an integer is returned as-is
+// (start() range-checks it); null when unset. Anything else, a zero-padded
+// string included, comes back verbatim and is refused by start() rather than
+// guessed at or nulled.
 function readPort(v) {
-  if (typeof v === 'string' && /^\d+$/.test(v) && isValidFixedPort(Number(v))) return Number(v);
+  if (typeof v === 'string' && String(Number(v)) === v && isValidFixedPort(Number(v))) return Number(v);
   return v ?? null;
 }
 
