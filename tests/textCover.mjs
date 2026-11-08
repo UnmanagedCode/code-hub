@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 
-// Label-based completeness of a text view. Every non-null leaf of a tool's json
-// object needs a rule naming the line prefix and the label+value the renderer
+// Label-based completeness of a text view. Every non-null, non-boolean leaf of a tool's json
+// object needs a rule (or a SKIP entry) naming the line prefix and the label+value the renderer
 // prints for it, so a dropped label fails even when the value shows up
 // elsewhere in the text (an id inside a project name, a url echoed by routes).
 // The rule: a non-boolean leaf that carries a value must have a rule (a leaf
 // with none fails, so a new schema field must be given one). Null leaves are
 // skipped. A true boolean without a rule falls back to its key; a false one
-// without a rule is skipped. SKIP is the explicit exemption list: the declared
-// cuts (qrSvg, output, outputTruncated) and a leaf another rule already covers
-// (tunnel.kind, rendered with tunnel.url).
+// without a rule is skipped. SKIP exempts the declared cuts (`qrSvg`, `output`)
+// and `outputTruncated`, which renders as the dropped-bytes sentence rather than
+// a label, plus a leaf another rule already covers (tunnel.kind, rendered with
+// tunnel.url). Rules pin the renderer's delimiter after a value, so an id that
+// contains the project name cannot satisfy a project rule.
 
 const E = (prefix, substr) => [prefix, substr];
 const hasLine = (text, [prefix, substr]) => text.split('\n').some((l) => l.trim().startsWith(prefix) && l.includes(substr));
@@ -23,7 +25,7 @@ const line = (prefix, text) => (v) => [E(prefix, text(v))];
 const LIST_APP = {
   id: line('', (v) => `${v} (`), name: line('', (v) => `("${v}")`), status: line('', (v) => `— ${v}`),
   port: line('', (v) => `on port ${v}`), branch: line('', (v) => `branch ${v}`),
-  project: kv('project', 'project'), path: kv('project', 'path'), source: kv('project', 'source'),
+  project: line('project', (v) => `project ${v} ·`), path: kv('project', 'path'), source: kv('project', 'source'),
   manifestPort: kv('project', 'manifestPort'), startedSha: kv('project', 'startedSha'),
   currentSha: kv('project', 'currentSha'), lastCommitAt: kv('project', 'lastCommitAt'), logFile: kv('project', 'logFile'),
   urls: urlsOf('urls:', 'urls: '),
@@ -49,14 +51,14 @@ const LIST_APP = {
 };
 
 const START = {
-  id: line('', (v) => `Started '${v}'`), project: kv('', 'project'), pid: kv('', 'pid'), pgid: kv('', 'pgid'),
+  id: line('', (v) => `Started '${v}'`), project: line('', (v) => `project ${v},`), pid: kv('', 'pid'), pgid: kv('', 'pgid'),
   port: line('', (v) => `on port ${v}`), fixedPort: line('', (v) => `fixed port ${v}`), startedAt: line('', (v) => `at ${v}`),
   path: kv('', 'path'), isWorktree: line('', (v) => `isWorktree ${v}`), branch: kv('', 'branch'), startedSha: kv('', 'startedSha'),
   urls: urlsOf('', 'urls: '),
 };
 
 const REGISTER = {
-  id: line('', (v) => `Registered '${v}'`), project: kv('', 'project'), path: line('', (v) => ` at ${v}`),
+  id: line('', (v) => `Registered '${v}'`), project: line('', (v) => `project ${v},`), path: line('', (v) => ` at ${v}`),
   source: line('', (v) => `source: ${v}`), isWorktree: line('', (v) => `isWorktree ${v}`),
   'manifest.start': line('', (v) => `start "${v}"`), 'manifest.name': kv('', 'name'), 'manifest.port': kv('', 'port'),
   'manifest.healthPath': kv('', 'healthPath'), 'manifest.readyWhen': kv('', 'readyWhen'),
