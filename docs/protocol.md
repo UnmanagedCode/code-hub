@@ -60,7 +60,7 @@ Per-app settings (`src/appSettings.js`): the default login a **new** share of th
   | `username` | `hub` | every new share's Basic-Auth username |
   | `password` | a CSPRNG password per share | every new share's password (masked in the UI, `passwordIsDefault: true`) |
   | `autoStart` | off (stored only as `true`) | `appManager.autoStartAll()` starts the app at boot when it isn't already running |
-  | `port` | the manifest's `port`, else a free port | the fixed port of every start of the app, overriding the manifest's; an integer `1024`–`65535`. A hand-edited canonical integer string in that range is read as the integer; any other stored value makes `start` refuse (MCP code `SETTINGS_INVALID`) |
+  | `port` | the manifest's `port`, else a free port | the fixed port of every start of the app, overriding the manifest's; an integer `1024`–`65535`. A hand-edited canonical integer string in that range is read as the integer; any other stored value, an out-of-range integer included, makes `start` refuse (MCP code `SETTINGS_INVALID`) |
   | `autoShare` | off | every start of the app (`start`, `restart`, MCP `start_app`, boot auto-start) shares it with these options once readiness settles to `ready`, with the default login above. For the always-on host code-conductor (never started by code-hub): `appManager.autoShareAlwaysOn()` shares it at every code-hub boot, unless it already has a share |
 
   An entry with none of the five is deleted, never kept. `autoShare` is stored **normalised** by the same validation `POST …/share` uses (`validateShareOptions` in `src/shareOptions.js`): `auth` defaults to `true`, `tls` is kept for `lan` only and defaults to `true`, `funnelPort` is kept for `tailscale` only and defaults to `443`, any other key is dropped. A stored `tailscale` `autoShare` with no `funnelPort` is read — and reported by `GET …/settings` and the listing's `settings.autoShare` — as `funnelPort: 443`; the file itself is not rewritten.
@@ -365,7 +365,7 @@ The split is deliberate: only a malformed *request envelope* is a transport fail
 |---|---|
 | any | `TOOL_UNKNOWN`, `INTERNAL`; envelope `400`s: `REQUEST_INVALID`, `FORMAT_INVALID` |
 | `list_apps` | `INTERNAL` |
-| `start_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `SETTINGS_INVALID` (the app's stored port in `app-settings.json` is not an integer or a canonical integer string in range; `details: { field: "port", value }`), `ALREADY_RUNNING`, `APP_UNKNOWN`, `MANIFEST_INVALID`, `PORT_IN_USE` (`details: { port, holder? }`) |
+| `start_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `SETTINGS_INVALID` (the app's stored port in `app-settings.json` is not an integer in the fixed-port range, nor a canonical integer string in it; `details: { field: "port", value }`), `ALREADY_RUNNING`, `APP_UNKNOWN`, `MANIFEST_INVALID`, `PORT_IN_USE` (`details: { port, holder? }`) |
 | `stop_app` | `ARGS_INVALID`, `APP_ALWAYS_ON`, `NOT_RUNNING` |
 | `register_app` | `ARGS_INVALID`, `DIR_NOT_FOUND` (not an existing dir under the projects root), `MANIFEST_EXISTS` (the dir already has a `.hub.json`), `MANIFEST_INVALID` (schema violation, e.g. empty `start` or a `port` outside `1024`–`65535`) |
 | `unregister_app` | `ARGS_INVALID`, `NOT_REGISTERED` |

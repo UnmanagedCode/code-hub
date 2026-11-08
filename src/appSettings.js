@@ -105,7 +105,7 @@ export function migrateLegacyFile() {
   });
 }
 
-// The stored port as start() uses it: an integer as-is, a canonical in-range
+// The stored port as start() reads it: an integer as-is (start() range-checks it), a canonical in-range
 // integer string (hand-edited file) as that integer, null when unset. Anything
 // else comes back verbatim, never nulled, so start() can refuse it by name.
 function readPort(v) {

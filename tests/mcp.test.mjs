@@ -362,8 +362,8 @@ test('envelope: format defaults to text, bad format and missing tool are 400s', 
 });
 
 // Invariant: a hand-edited integer-string port starts the app on that integer
-// (so the reply validates), and any other stored non-integer refuses before a
-// spawn with SETTINGS_INVALID, identically in both formats.
+// (so the reply validates), and any other stored value, an out-of-range integer
+// included, refuses before a spawn with SETTINGS_INVALID, identically in both formats.
 test('start_app reads a stored port string as an integer and refuses garbage', { skip: FIXED_PORT_SKIP }, async (t) => {
   const { base } = await boot(t, async (r) => { await mkProject(r, 'app', { start: fakeAppCmd() }); });
   const port = await nonEphemeralPort(t);
@@ -376,13 +376,15 @@ test('start_app reads a stored port string as an integer and refuses garbage', {
   assert.equal(appManager._record('app').port, port);
   await json(base, 'stop_app', { id: 'app' });
 
-  await setPort('abc');
-  const [j, x] = [await json(base, 'start_app', { id: 'app' }), await prose(base, 'start_app', { id: 'app' })];
-  assert.deepEqual(j.body, x.body);
-  assert.equal(j.body.code, 'SETTINGS_INVALID');
-  assert.deepEqual(j.body.details, { field: 'port', value: 'abc' });
-  assert.match(j.body.error, /'app'.*"abc"/);
-  assert.equal(appManager._record('app'), undefined, 'refused before any spawn');
+  for (const bad of ['abc', 99999, '99999']) {
+    await setPort(bad);
+    const [j, x] = [await json(base, 'start_app', { id: 'app' }), await prose(base, 'start_app', { id: 'app' })];
+    assert.deepEqual(j.body, x.body);
+    assert.equal(j.body.code, 'SETTINGS_INVALID', String(bad));
+    assert.deepEqual(j.body.details, { field: 'port', value: bad });
+    assert.ok(j.body.error.includes(`'app'`) && j.body.error.includes(JSON.stringify(bad)));
+    assert.equal(appManager._record('app'), undefined, 'refused before any spawn');
+  }
 });
 
 // Invariant: the post-spawn EADDRINUSE refusal (a child that loses the bind
