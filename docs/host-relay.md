@@ -29,7 +29,13 @@ Without a relay, a LAN share from such a container is flagged container-internal
 | Platform | Command |
 |---|---|
 | Linux / macOS | `python3 relay/relay.py` |
+| Linux / macOS, with make | `make relay` (from the checkout root, or `make -C <checkout> relay` from anywhere) |
 | Windows | `py -3 relay\relay.py` |
+
+`make relay` runs the same script in the foreground. Two variables pass through:
+
+- `ARGS` — appended verbatim to the script: `make relay ARGS="--advertise 192.168.1.10"`.
+- `PYTHON` — the interpreter: `make relay PYTHON=python3.11` (default: the `PYTHON ?=` line in the root `Makefile`).
 
 No flags are needed (the optional ones are under Configuration), and no environment variables are needed. Start the relay and code-hub in either order; they find each other.
 

@@ -110,6 +110,7 @@ In a **bridge-networked container**, a LAN share's URL is the container's bridge
 
 ```sh
 python3 relay/relay.py      # from the code-hub checkout, on the host (Windows: py -3 relay\relay.py)
+make relay                  # the same, via the checkout's Makefile (run `make help` for PYTHON / ARGS)
 ```
 
 No env and no flags: the relay finds code-hub's store by walking up from its own directory, and the two meet through `$CONDUCTOR_PLUGIN_DATA_DIR/relay/` (under code-conductor `<projectsRoot>/.code-conductor/plugins/data/code-hub/relay/`) — code-hub writes the shared secret there, the relay writes its listen address — whatever the start order. code-hub dials out and holds one mutually authenticated session (the secret never crosses the wire); the host listeners live exactly as long as that session. A relay problem never fails a share — it falls back to the container's own addresses and says why; without a relay, such a share is flagged container-internal: the panel warns and hides the QR.
