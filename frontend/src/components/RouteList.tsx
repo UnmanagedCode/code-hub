@@ -1,5 +1,3 @@
-import { ExternalLinkIcon } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { ExternalLink } from '@/components/ExternalLink';
 import { routeRows } from '@/lib/appView';
 import type { App } from '@/lib/types';
@@ -22,14 +20,6 @@ export function RouteList({ app }: { app: App }) {
               </div>
             )}
           </div>
-          {r.primary && (
-            <Button asChild variant="outline" size="sm">
-              <ExternalLink url={r.primary} fallback="none" aria-label={r.name ? `Open ${r.name}` : 'Open'}>
-                Open
-                <ExternalLinkIcon aria-hidden />
-              </ExternalLink>
-            </Button>
-          )}
         </li>
       ))}
     </ul>

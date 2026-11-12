@@ -1,11 +1,15 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
+import { EXPANDED_CARDS_KEY } from '@/lib/cardExpansion';
 import type { App as AppT, Tunnel } from '@/lib/types';
 import { app, json, listing, stubFetch } from '@/test/fixtures';
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); Reflect.deleteProperty(document, 'visibilityState'); });
+
+const seedExpanded = (...ids: string[]) => localStorage.setItem(EXPANDED_CARDS_KEY, JSON.stringify(ids));
+const storedExpanded = (): unknown => JSON.parse(localStorage.getItem(EXPANDED_CARDS_KEY) ?? 'null');
 
 // A tab-return refresh, as the browser signals it.
 const tabReturn = () => act(async () => {
@@ -158,13 +162,14 @@ describe('layout', () => {
     expect(main.classList.contains('max-w-2xl')).toBe(false);
   });
 
-  // Invariant: the cards sit in an auto-fill grid, and the stale alert spans every column.
+  // Invariant: the cards sit in an auto-fill grid with top-aligned items (expanding one card never changes its
+  // neighbours' height), and the stale alert spans every column.
   it('cards flow in an auto-fill grid; the stale alert spans all columns', async () => {
     const { routes } = stubFetch({ 'GET api/apps': listing([app({ id: 'web' })]) });
     render(<App />);
     const card = await screen.findByRole('article', { name: 'web' });
     const list = card.parentElement!;
-    for (const c of ['grid', 'grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))]', '[&>*]:min-w-0']) {
+    for (const c of ['grid', 'grid-cols-[repeat(auto-fill,minmax(min(22rem,100%),1fr))]', 'items-start', '[&>*]:min-w-0']) {
       expect(list.classList.contains(c), c).toBe(true);
     }
     routes['GET api/apps'] = () => json({ error: 'down' }, 502);
@@ -227,15 +232,40 @@ describe('actions', () => {
       'POST api/apps/web%3Ak/share': shareResponse,
     });
     render(<App />);
-    await user.click(await screen.findByRole('button', { name: '1 worktree' }));
+    await user.click(await screen.findByRole('button', { name: 'web details' }));
+    await user.click(screen.getByRole('button', { name: '1 worktree' }));
     const card = screen.getByRole('article', { name: 'web — feat' });
+    const toggle = within(card).getByRole('button', { name: 'web — feat details' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
     await user.click(within(card).getByRole('button', { name: 'Share' }));
+    // The picker shows in the collapsed card's summary.
     const tailscale = within(card).getByRole('button', { name: 'tailscale' }) as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(tailscale.disabled).toBe(true);
     expect(document.getElementById(tailscale.getAttribute('aria-describedby')!)?.textContent).toBe('tailscale not available');
     await user.click(within(card).getByRole('button', { name: 'LAN' }));
     expect(await within(card).findByText('https://192.0.2.1:5001')).toBeTruthy();
+    // A successful share expands the card, persisted.
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(within(card).getByRole('region', { name: 'Share' })).toBeTruthy();
+    expect(storedExpanded()).toStrictEqual(['web', 'web:k']);
     expect(writes(calls)).toStrictEqual([{ method: 'POST', url: 'api/apps/web%3Ak/share', body: { mode: 'lan' } }]);
+  });
+
+  // Invariant: a failed share leaves the card collapsed, with the error visible in its summary.
+  it('a failed share stays collapsed and shows the error', async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      'GET api/apps': listing([running()]),
+      'POST api/apps/web/share': () => json({ error: 'share boom' }, 500),
+    });
+    render(<App />);
+    const card = await screen.findByRole('article', { name: 'web' });
+    await user.click(within(card).getByRole('button', { name: 'Share' }));
+    await user.click(within(card).getByRole('button', { name: 'LAN' }));
+    expect((await within(card).findByRole('alert')).textContent).toContain('share boom');
+    expect(within(card).getByRole('button', { name: 'web details' }).getAttribute('aria-expanded')).toBe('false');
+    expect(storedExpanded()).toBeNull();
   });
 
   // Invariant: tailscale asks for a Funnel port before sharing; a port another app holds is disabled saying who
@@ -318,6 +348,9 @@ describe('actions', () => {
 });
 
 describe('edit form', () => {
+  // The Edit form lives in the share panel, which is in the card's body.
+  beforeEach(() => seedExpanded('web'));
+
   // Invariant: a refresh does not disturb an open Edit form: the typed value and the focus survive it.
   it('typing in the Edit form keeps its value and focus across a tab-return refresh', async () => {
     const user = userEvent.setup();
@@ -549,6 +582,8 @@ describe('share lifecycle', () => {
 });
 
 describe('edit form details', () => {
+  beforeEach(() => seedExpanded('web'));
+
   // Invariant: Cancel discards typed changes without submitting the form.
   it('Cancel after typing sends nothing and closes the form', async () => {
     const user = userEvent.setup();

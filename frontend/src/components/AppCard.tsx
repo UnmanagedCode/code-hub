@@ -10,7 +10,9 @@ import { RouteList } from '@/components/RouteList';
 import { SharePanel } from '@/components/SharePanel';
 import { useHub } from '@/hub';
 import { accentClass } from '@/lib/accent';
-import { autoStartNotice, cardLabel, metaItems, statusTone, statusWord, type MetaItem, type StatusTone } from '@/lib/appView';
+import { cardSections } from '@/lib/cardExpansion';
+import { sharePanelView } from '@/lib/shareState';
+import { autoStartNotice, cardLabel, metaItems, routeRows, statusTone, statusWord, type MetaItem, type StatusTone } from '@/lib/appView';
 import { cn } from '@/lib/utils';
 import type { App } from '@/lib/types';
 
@@ -62,7 +64,7 @@ function Worktrees({ project, worktrees }: { project: string; worktrees: App[] }
   if (!worktrees.length) return null;
   const n = worktrees.length;
   return (
-    <Collapsible open={hub.expanded.has(project)} onOpenChange={() => hub.toggleExpanded(project)} className="flex flex-col gap-2">
+    <Collapsible open={hub.worktreesOpen.has(project)} onOpenChange={() => hub.toggleWorktrees(project)} className="flex flex-col gap-2">
       <CollapsibleTrigger asChild>
         <Button variant="ghost" size="sm" className="group w-fit text-muted-foreground">
           {n} worktree{n > 1 ? 's' : ''}
@@ -83,13 +85,30 @@ export function AppCard({ app, worktrees = [], subcard = false }: { app: App; wo
   const meta = metaItems(app, Date.now());
   const actionError = hub.actionError[app.id];
   const startNotice = autoStartNotice(app);
+  const shareView = sharePanelView(hub.share[app.id], app, !!hub.credEdit[app.id]);
+  const sections = cardSections({
+    expanded: hub.expandedCards.has(app.id),
+    hasRoutes: !!routeRows(app),
+    shareView: shareView.view,
+    worktreeCount: worktrees.length,
+  });
+  // Every body section is empty when `toggle` is false, so a stored-open card whose body has emptied renders collapsed.
+  const open = sections.toggle && hub.expandedCards.has(app.id);
   return (
     <CardShell id={app.id} subcard={subcard} label={cardLabel(app)}>
+      <Collapsible open={open} onOpenChange={() => hub.toggleCard(app.id)} className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
         <span className={cn('size-2.5 shrink-0 rounded-full', DOT[tone])} aria-hidden />
         <h2 className="min-w-0 flex-1 truncate font-semibold">{app.name}</h2>
         <span className={cn('text-sm', WORD[tone])}>{statusWord(app.status)}</span>
         {app.port ? <span className="font-mono text-xs text-muted-foreground">:{app.port}</span> : null}
+        {sections.toggle && (
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="icon-sm" className="group" aria-label={`${cardLabel(app)} details`}>
+              <ChevronDownIcon className="transition-transform group-data-[state=open]:rotate-180 motion-reduce:transition-none" aria-hidden />
+            </Button>
+          </CollapsibleTrigger>
+        )}
       </div>
       {meta.length > 0 && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -113,9 +132,13 @@ export function AppCard({ app, worktrees = [], subcard = false }: { app: App; wo
         </Alert>
       )}
       <AppControls app={app} />
-      <RouteList app={app} />
-      <SharePanel app={app} />
-      <Worktrees project={app.project} worktrees={worktrees} />
+      {sections.share === 'summary' && <SharePanel app={app} view={shareView} />}
+      <CollapsibleContent className="flex flex-col gap-3">
+        {sections.routes && <RouteList app={app} />}
+        {sections.share === 'body' && <SharePanel app={app} view={shareView} />}
+        {sections.worktrees && <Worktrees project={app.project} worktrees={worktrees} />}
+      </CollapsibleContent>
+      </Collapsible>
     </CardShell>
   );
 }

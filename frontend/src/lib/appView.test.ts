@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { autoStartNotice, controlsFor, groupApps, listView, metaItems, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
+import { autoStartNotice, controlsFor, groupApps, listView, metaItems, openActions, relativeTime, routeRows, shortSha, sortApps, statusTone, statusWord } from './appView';
 import { app } from '@/test/fixtures';
 
 const ids = (list: { id: string }[]) => list.map((a) => a.id);
@@ -225,4 +225,35 @@ it('listView: loading, error, empty, list and stale', () => {
   expect(listView({ loaded: true, error: null, apps: [app()] })).toStrictEqual({ state: 'list', stale: false });
   expect(listView({ loaded: true, error: 'down', apps: [app()] })).toStrictEqual({ state: 'list', stale: true });
   expect(listView({ loaded: true, error: 'down', apps: [] })).toStrictEqual({ state: 'empty', stale: true });
+});
+
+describe('openActions', () => {
+  const urls = (...u: string[]) => u;
+  // Invariant: an app that is not serving offers no Open.
+  it('is empty unless the app is running', () => {
+    const routes = [{ name: 'Main', path: '/', urls: urls('http://127.0.0.1:5000/') }];
+    for (const status of ['stopped', 'starting', 'crashed'] as const) expect(openActions(app({ status, routes }))).toStrictEqual([]);
+  });
+  // Invariant: a single route is a plain "Open" to its first URL.
+  it('one route is "Open" to the first URL', () => {
+    const [a] = openActions(app({ status: 'ready', routes: [{ name: 'Main', path: '/', urls: urls('http://172.17.0.2:5000/', 'http://10.0.0.5:5000/') }] }));
+    expect(a).toMatchObject({ label: 'Open', url: 'http://172.17.0.2:5000/' });
+  });
+  // Invariant: several routes each get an Open named for the route, with distinct keys.
+  it('several routes are named, with distinct keys', () => {
+    const acts = openActions(app({ status: 'running', routes: [
+      { name: 'Main', path: '/', urls: urls('http://127.0.0.1:5000/') },
+      { name: 'Editor', path: '/editor.html', urls: urls('http://127.0.0.1:5000/editor.html') },
+    ] }));
+    expect(acts.map((a) => a.label)).toStrictEqual(['Open Main', 'Open Editor']);
+    expect(new Set(acts.map((a) => a.key)).size).toBe(2);
+  });
+  // Invariant: a route with no URL has no Open.
+  it('skips a route with no URLs', () => {
+    const acts = openActions(app({ status: 'running', routes: [
+      { name: 'Main', path: '/', urls: urls() },
+      { name: 'Editor', path: '/e', urls: urls('http://127.0.0.1:5000/e') },
+    ] }));
+    expect(acts.map((a) => a.label)).toStrictEqual(['Open Editor']);
+  });
 });
