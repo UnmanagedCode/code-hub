@@ -370,8 +370,8 @@ describe('collapsible card', () => {
     expect(screen.getByRole('list', { name: 'Routes' })).toBeTruthy();
   });
 
-  // Invariant: corrupt stored data renders collapsed and is reported once, never thrown.
-  it('corrupt storage renders collapsed and warns once', () => {
+  // Invariant: corrupt stored data renders collapsed and is reported with a warning, never thrown.
+  it('corrupt storage renders collapsed and warns without throwing', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     localStorage.setItem(EXPANDED_CARDS_KEY, '{bad');
     renderCard(sharedWeb());
@@ -453,8 +453,8 @@ describe('collapsible card', () => {
     expect(screen.queryByRole('button', { name: 'web details' })).toBeNull();
   });
 
-  // Invariant: route definitions with no URLs (the backend's shape for a non-running app) are not body content.
-  it.each(['stopped', 'starting'] as const)('a %s app with URL-less routes has no details toggle', (status) => {
+  // Invariant: routeRows() is gated on status, so a stopped or starting app has no route rows and no toggle, even with route definitions (the backend's shape for a non-running app).
+  it.each(['stopped', 'starting'] as const)('a %s app with route definitions has no details toggle', (status) => {
     renderCard(app({ id: 'web', status, routes: [{ name: 'Main', path: '/', urls: [] }] }));
     expect(screen.queryByRole('button', { name: 'web details' })).toBeNull();
   });

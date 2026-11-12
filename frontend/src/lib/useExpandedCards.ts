@@ -13,7 +13,7 @@ function safeLocalStorage(): Storage | null {
 
 /** Which cards are expanded, remembered in localStorage. Writes keep only ids in `listedIds`. */
 export function useExpandedCards(listedIds: string[]) {
-  // Resolved once, so an inaccessible storage warns once.
+  // Resolved once per mount so writes reuse it; dev StrictMode runs the initializer twice.
   const storage = useRef<Storage | null | undefined>(undefined);
   const [expandedCards, setExpanded] = useState<ReadonlySet<string>>(() => {
     storage.current = safeLocalStorage();
