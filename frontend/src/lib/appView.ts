@@ -130,6 +130,21 @@ export function routeRows(app: App): RouteRow[] | null {
   });
 }
 
+export interface OpenAction {
+  key: string;
+  label: string;
+  url: string;
+}
+
+/** One Open button per route that has a primary URL; none unless the app is running. */
+export function openActions(app: App): OpenAction[] {
+  const rows = routeRows(app);
+  if (!rows) return [];
+  return rows.flatMap((r) => (r.primary
+    ? [{ key: `${r.name}\u0000${r.path}`, label: r.name === null ? 'Open' : `Open ${r.name}`, url: r.primary }]
+    : []));
+}
+
 export type MetaKind = 'branch' | 'alwaysOn' | 'id' | 'sha' | 'outdated' | 'edited' | 'sourceMissing';
 export interface MetaItem {
   kind: MetaKind;

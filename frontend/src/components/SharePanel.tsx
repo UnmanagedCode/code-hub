@@ -8,7 +8,7 @@ import { ExternalLink } from '@/components/ExternalLink';
 import { QrDialog } from '@/components/QrDialog';
 import { useHub } from '@/hub';
 import { funnelPortChoices } from '@/lib/funnelPorts';
-import { credRowValues, qrImageSrc, shareChooserModes, sharePanelView } from '@/lib/shareState';
+import { credRowValues, qrImageSrc, shareChooserModes, type SharePanelView } from '@/lib/shareState';
 import type { App } from '@/lib/types';
 
 function ShareChooser({ app, funnel }: { app: App; funnel: boolean }) {
@@ -74,11 +74,10 @@ function CredRow({ label, value, display }: { label: string; value: string; disp
   );
 }
 
-export function SharePanel({ app }: { app: App }) {
+export function SharePanel({ app, view: v }: { app: App; view: SharePanelView }) {
   const hub = useHub();
   const [qrOpen, setQrOpen] = useState(false);
   const draft = hub.credEdit[app.id];
-  const v = sharePanelView(hub.share[app.id], app, !!draft);
 
   if (v.view === 'none') return null;
   if (v.view === 'choosing') return <ShareChooser app={app} funnel={v.funnel} />;

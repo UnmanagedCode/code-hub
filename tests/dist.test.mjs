@@ -78,7 +78,7 @@ test('built CSS holds the session-width cap and the card grid columns', () => {
   const css = files.filter((f) => /^assets\/index-.*\.css$/.test(f))
     .map((f) => read(f).replace(/\/\*[\s\S]*?\*\//g, '')).join('\n');
   assert.match(css, /max-width:\s*var\(--cc-session-width,\s*42rem\)/);
-  assert.match(css, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(36rem,\s*100%\),\s*1fr\)\)/);
+  assert.match(css, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(22rem,\s*100%\),\s*1fr\)\)/);
 });
 
 // Invariant: the backend serves the real build: / and every local file it references, with type and CSP.

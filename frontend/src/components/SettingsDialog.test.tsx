@@ -42,7 +42,8 @@ describe('Settings dialog', () => {
     const user = userEvent.setup();
     stubFetch({ 'GET api/apps': listing([app({ id: 'web' }), app({ id: 'web:k', project: 'web', name: 'web', isWorktree: true, branch: 'feat' })]) });
     render(<App />);
-    await user.click(await screen.findByRole('button', { name: '1 worktree' }));
+    await user.click(await screen.findByRole('button', { name: 'web details' }));
+    await user.click(screen.getByRole('button', { name: '1 worktree' }));
     const card = screen.getByRole('article', { name: 'web — feat' });
     await user.click(within(card).getByRole('button', { name: 'Settings' }));
     const dialog = await screen.findByRole('dialog', { name: 'Settings — web — feat' });
@@ -137,7 +138,8 @@ describe('Settings dialog', () => {
       'PUT api/apps/web%3Ak/settings': { id: 'web:k' },
     });
     render(<App />);
-    await user.click(await screen.findByRole('button', { name: '1 worktree' }));
+    await user.click(await screen.findByRole('button', { name: 'web details' }));
+    await user.click(screen.getByRole('button', { name: '1 worktree' }));
     await user.click(within(screen.getByRole('article', { name: 'web — feat' })).getByRole('button', { name: 'Settings' }));
     const dialog = await screen.findByRole('dialog', { name: 'Settings — web — feat' });
     await user.type(within(dialog).getByLabelText('user'), 'alice');

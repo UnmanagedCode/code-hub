@@ -33,7 +33,7 @@ export function AppList({ sort }: { sort: SortKey }) {
     );
   }
   return (
-    <div className="grid grid-cols-[repeat(auto-fill,minmax(min(36rem,100%),1fr))] items-start gap-3 [&>*]:min-w-0">
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(min(22rem,100%),1fr))] items-start gap-3 [&>*]:min-w-0">
       {stale && (
         <Alert variant="warning" className="col-span-full">
           <AlertDescription>

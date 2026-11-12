@@ -1,5 +1,5 @@
 // App-level UI state and the actions that change it. Every map is keyed by app
-// id (expansion by project), at this level so it survives refreshes,
+// id (worktree lists by project), at this level so it survives refreshes,
 // re-sorting and a collapsed worktree list.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '@/lib/api';
@@ -8,6 +8,7 @@ import { credDraftFor, pruneDrafts } from '@/lib/shareState';
 import type { HubSettingsPatch } from '@/lib/hubSettingsForm';
 import type { SettingsPatch } from '@/lib/settingsForm';
 import { useApps, type AppsFeed } from '@/lib/useApps';
+import { useExpandedCards } from '@/lib/useExpandedCards';
 import type { CredDraft, ShareKind, ShareState, Tunnel } from '@/lib/types';
 
 /** The control an app's in-flight action belongs to (its button shows the spinner). */
@@ -16,7 +17,10 @@ export type BusyAction = 'start' | 'stop' | 'restart' | 'unshare' | 'save';
 export interface Hub extends AppsFeed {
   share: Record<string, ShareState>;
   credEdit: Record<string, CredDraft>;
-  expanded: ReadonlySet<string>;
+  /** Worktree lists that are open, keyed by project. */
+  worktreesOpen: ReadonlySet<string>;
+  /** The stored per-app expansion preference, keyed by app id; persisted in localStorage. */
+  expandedCards: ReadonlySet<string>;
   busy: Record<string, BusyAction>;
   actionError: Record<string, string>;
   start: (id: string) => Promise<void>;
@@ -38,7 +42,9 @@ export interface Hub extends AppsFeed {
   /** PUTs the hub-wide settings, then reloads the listing. Throws to its caller, like `saveSettings`. */
   saveHubSettings: (body: HubSettingsPatch) => Promise<void>;
   dismissError: (id: string) => void;
-  toggleExpanded: (project: string) => void;
+  toggleWorktrees: (project: string) => void;
+  toggleCard: (id: string) => void;
+  expandCard: (id: string) => void;
 }
 
 const HubContext = createContext<Hub | null>(null);
@@ -65,7 +71,8 @@ export function HubProvider({ children }: { children: ReactNode }) {
   const { data, refresh } = feed;
   const [share, setShare] = useState<Record<string, ShareState>>({});
   const [credEdit, setCredEdit] = useState<Record<string, CredDraft>>({});
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  const [worktreesOpen, setWorktreesOpen] = useState<ReadonlySet<string>>(new Set());
+  const { expandedCards, toggleCard, expandCard } = useExpandedCards(data?.apps.map((a) => a.id) ?? []);
   const [busy, setBusy] = useState<Record<string, BusyAction>>({});
   const [actionError, setActionError] = useState<Record<string, string>>({});
   // The share state and drafts as of the last render, for Save to start from.
@@ -129,6 +136,7 @@ export function HubProvider({ children }: { children: ReactNode }) {
       setShareFor(id, 'loading');
       try {
         setShareFor(id, await api<Tunnel>(appPath(id, 'share'), json('POST', { mode, ...(funnelPort ? { funnelPort } : {}) })));
+        expandCard(id);
       } catch (e) {
         setShareFor(id, { error: message(e) });
       }
@@ -163,13 +171,13 @@ export function HubProvider({ children }: { children: ReactNode }) {
       await refresh();
     },
     dismissError: (id: string) => setActionError((m) => omit(m, id)),
-    toggleExpanded: (project: string) => setExpanded((s) => {
+    toggleWorktrees: (project: string) => setWorktreesOpen((s) => {
       const next = new Set(s);
       if (!next.delete(project)) next.add(project);
       return next;
     }),
-  }), [action, clearShare, refresh, setShareFor]);
+  }), [action, clearShare, expandCard, refresh, setShareFor]);
 
-  const hub: Hub = { ...feed, share, credEdit, expanded, busy, actionError, ...actions };
+  const hub: Hub = { ...feed, share, credEdit, worktreesOpen, expandedCards, busy, actionError, toggleCard, expandCard, ...actions };
   return <HubContext.Provider value={hub}>{children}</HubContext.Provider>;
 }

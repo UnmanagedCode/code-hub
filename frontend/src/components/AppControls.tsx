@@ -1,8 +1,9 @@
-import { LoaderCircleIcon } from 'lucide-react';
+import { ExternalLinkIcon, LoaderCircleIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { ExternalLink } from '@/components/ExternalLink';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import { useHub, type BusyAction } from '@/hub';
-import { controlsFor } from '@/lib/appView';
+import { controlsFor, openActions } from '@/lib/appView';
 import type { App } from '@/lib/types';
 
 const Spinner = ({ on }: { on: boolean }) => (on ? <LoaderCircleIcon className="animate-spin" aria-hidden /> : null);
@@ -31,6 +32,14 @@ export function AppControls({ app }: { app: App }) {
           Restart
         </Button>
       )}
+      {openActions(app).map((o) => (
+        <Button key={o.key} asChild variant="outline" size="sm">
+          <ExternalLink url={o.url} fallback="none">
+            {o.label}
+            <ExternalLinkIcon aria-hidden />
+          </ExternalLink>
+        </Button>
+      ))}
       {c.share && (
         <Button size="sm" variant={app.tunnel ? 'secondary' : 'outline'} disabled={c.share.disabled} onClick={() => hub.chooseShare(app.id)}>
           {c.share.label}
