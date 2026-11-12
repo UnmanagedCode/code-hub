@@ -188,15 +188,27 @@ function expectOnlyRealButtons(scope: Element) {
 }
 
 describe('refused URLs', () => {
-  // Invariant: a route whose URL is refused gets no Open control of any kind.
-  it('RouteList renders no Open control for a refused route URL', () => {
+  // Invariant: a route whose URL is refused gets no Open control (controls row included) and shows only as text.
+  it('the controls row renders no Open control for a refused route URL', () => {
+    renderCard(app({ id: 'x', status: 'running', routes: [{ name: 'Main', path: '/', urls: ['javascript:alert(1)'] }] }));
+    const c = card('x');
+    expect(within(c).queryByText(/^Open/)).toBeNull();
+    expect(within(c).queryByRole('button', { name: /open/i })).toBeNull();
+    expect(within(c).queryByRole('link', { name: /open/i })).toBeNull();
+    expect(c.querySelectorAll('a')).toHaveLength(0);
+    expect(within(c).queryByText('javascript:alert(1)')).toBeNull();
+    expectOnlyRealButtons(c);
+  });
+
+  // Invariant: expanded, the refused URL is listed as plain text once, still with no Open control.
+  it('an expanded card shows a refused route URL as text with no Open control', () => {
     renderCard(app({ id: 'x', status: 'running', routes: [{ name: 'Main', path: '/', urls: ['javascript:alert(1)'] }] }), [], ['x']);
-    const routes = screen.getByRole('list', { name: 'Routes' });
-    expect(within(routes).queryByText(/^Open/)).toBeNull();
-    expect(within(routes).queryByRole('button', { name: /open/i })).toBeNull();
-    expect(within(routes).queryByRole('link', { name: /open/i })).toBeNull();
+    const c = card('x');
+    const routes = within(c).getByRole('list', { name: 'Routes' });
     expect(within(routes).getAllByText('javascript:alert(1)')).toHaveLength(1);
-    expectOnlyRealButtons(routes);
+    expect(within(c).queryByText(/^Open/)).toBeNull();
+    expect(within(c).queryByRole('link', { name: /open/i })).toBeNull();
+    expectOnlyRealButtons(c);
   });
 
   // Invariant: when the share's Open URL is refused, neither the panel nor the QR dialog offers Open.
@@ -424,5 +436,45 @@ describe('collapsible card', () => {
     ] }));
     expect(screen.getByRole('link', { name: 'Open Main' }).getAttribute('href')).toBe('http://127.0.0.1:5000/');
     expect(screen.getByRole('link', { name: 'Open Editor' }).getAttribute('href')).toBe('http://127.0.0.1:5000/editor.html');
+  });
+
+  // Invariant: an expanded LAN share with auth off offers Edit, and Edit opens the login form (the only way to turn auth back on).
+  it('Edit on an auth-off LAN share opens the Edit share login form', async () => {
+    const user = userEvent.setup();
+    renderCard(app({ id: 'web', status: 'running', tunnel: { kind: 'lan', url: 'http://192.0.2.1:5001', auth: false } }), [], ['web']);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    expect(screen.getByRole('form', { name: 'Edit share login' })).toBeTruthy();
+  });
+
+  // Invariant: a failed auto-share with no routes or worktrees shows its alert but gives no chevron.
+  it('a transient share view alone gives no details toggle', () => {
+    renderCard(app({ id: 'web', status: 'running', autoShareStatus: 'failed', autoShareError: 'boom', routes: [] }));
+    expect(screen.getByText(/Auto-share failed/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'web details' })).toBeNull();
+  });
+
+  // Invariant: route definitions with no URLs (the backend's shape for a non-running app) are not body content.
+  it.each(['stopped', 'starting'] as const)('a %s app with URL-less routes has no details toggle', (status) => {
+    renderCard(app({ id: 'web', status, routes: [{ name: 'Main', path: '/', urls: [] }] }));
+    expect(screen.queryByRole('button', { name: 'web details' })).toBeNull();
+  });
+
+  // Invariant: a localStorage whose access throws still renders collapsed, toggles in memory, and warns naming the key.
+  it('an inaccessible localStorage renders collapsed, toggles, and warns naming the key', async () => {
+    const user = userEvent.setup();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const desc = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    Object.defineProperty(window, 'localStorage', { configurable: true, get: () => { throw new Error('sandboxed'); } });
+    try {
+      renderCard(sharedWeb());
+      const toggle = screen.getByRole('button', { name: 'web details' });
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      await user.click(toggle);
+      expect(toggle.getAttribute('aria-expanded')).toBe('true');
+      expect(warn.mock.calls.some((c) => String(c[0]).includes(EXPANDED_CARDS_KEY))).toBe(true);
+    } finally {
+      if (desc) Object.defineProperty(window, 'localStorage', desc);
+      warn.mockRestore();
+    }
   });
 });

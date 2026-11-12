@@ -19,7 +19,7 @@ export interface Hub extends AppsFeed {
   credEdit: Record<string, CredDraft>;
   /** Worktree lists that are open, keyed by project. */
   worktreesOpen: ReadonlySet<string>;
-  /** Cards showing their body, keyed by app id; persisted in localStorage. */
+  /** The stored per-app expansion preference, keyed by app id; persisted in localStorage. */
   expandedCards: ReadonlySet<string>;
   busy: Record<string, BusyAction>;
   actionError: Record<string, string>;

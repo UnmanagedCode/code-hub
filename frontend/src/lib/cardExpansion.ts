@@ -66,7 +66,7 @@ export interface CardSections {
   worktrees: boolean;
 }
 
-/** Every visibility decision for one card. `expanded` is the stored state ANDed with `toggle` by the caller. */
+/** Every visibility decision for one card. `expanded` is the stored expansion preference; the caller ANDs `toggle` into the Collapsible's `open`. */
 export function cardSections(input: {
   expanded: boolean;
   hasRoutes: boolean;

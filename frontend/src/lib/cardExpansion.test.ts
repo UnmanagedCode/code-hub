@@ -109,9 +109,10 @@ describe('cardSections', () => {
     expect(cardSections({ ...base, shareView: 'active', expanded: true })).toMatchObject({ toggle: true, share: 'body' });
   });
   // Invariant: transient share views show in the summary in both states.
-  it.each(['choosing', 'loading', 'error', 'autoPending', 'autoFailed'] as const)('%s is in the summary either way', (shareView) => {
-    expect(cardSections({ ...base, shareView }).share).toBe('summary');
-    expect(cardSections({ ...base, shareView, expanded: true }).share).toBe('summary');
+  // With no routes and no worktrees they give no toggle, so no chevron.
+  it.each(['choosing', 'loading', 'error', 'autoPending', 'autoFailed'] as const)('%s is in the summary either way, with no toggle', (shareView) => {
+    expect(cardSections({ ...base, shareView })).toMatchObject({ share: 'summary', toggle: false });
+    expect(cardSections({ ...base, shareView, expanded: true })).toMatchObject({ share: 'summary', toggle: false });
   });
   // Invariant: a stored-expanded card whose body is empty shows nothing and offers no toggle.
   it('expanded with an empty body has no toggle and nothing', () => {
